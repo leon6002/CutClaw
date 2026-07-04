@@ -1169,11 +1169,14 @@ class EditorCoreAgent:
         # dominant failure mode with small budgets), force a commit instead of
         # failing the shot. tool_choice is locked to `commit` so it cannot wander.
         grace_iter = False
+        self._grace_commit = False
         for i in range(max_iterations + 1):
             if i == max_iterations:
                 if section_completed or should_restart or not self.attempted_time_ranges:
                     break
                 grace_iter = True
+                # lenient review: duration shortfall alone won't reject the commit
+                self._grace_commit = True
                 print(f"⚠️  [{tag}] budget exhausted with footage inspected but no commit — forcing commit now")
                 msgs.append({"role": "user", "content": EDITOR_FORCED_COMMIT_PROMPT})
             self._cur_iter = i + 1
@@ -1635,7 +1638,8 @@ class EditorCoreAgent:
                 review_result = self.reviewer.review(
                     shot_proposal=shot_proposal,
                     context=self.current_shot_context,
-                    used_time_ranges=self.used_time_ranges
+                    used_time_ranges=self.used_time_ranges,
+                    lenient=getattr(self, "_grace_commit", False),
                 )
 
                 self.current_shot_context["review_result"] = review_result

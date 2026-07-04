@@ -897,7 +897,8 @@ class ReviewerAgent:
             gc.collect()
 
 
-    def review(self, shot_proposal: dict, context: dict, used_time_ranges: list = None) -> dict:
+    def review(self, shot_proposal: dict, context: dict, used_time_ranges: list = None,
+               lenient: bool = False) -> dict:
         """
         Review whether the shot selection meets requirements.
 
@@ -948,6 +949,34 @@ class ReviewerAgent:
         # - Whether the selected clip matches target content/emotion
         # - Visual quality checks
         # - Narrative coherence
+
+        # Lenient mode (used on the forced final commit): the agent has no budget
+        # left to adjust, so a duration shortfall alone must not fail the shot —
+        # a shorter clip in the timeline beats a dropped shot (a hole). Overlap
+        # issues are NEVER waived (duplicated footage is worse than a hole).
+        if lenient and issues:
+            only_duration = all("Duration mismatch" in str(i) for i in issues)
+            if only_duration:
+                dur = None
+                m_dur = re.search(r'total duration is ([\d.]+)s', str(issues[0]))
+                if m_dur:
+                    try:
+                        dur = float(m_dur.group(1))
+                    except ValueError:
+                        pass
+                min_ok = getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)
+                if dur is not None and dur >= min_ok:
+                    print(f"⚠️ [Reviewer] lenient commit: accepting {dur:.2f}s vs target "
+                          f"{target_length_sec:.2f}s (duration-only issue on final attempt)")
+                    return {
+                        "approved": True,
+                        "feedback": (f"✅ Review passed (lenient): duration {dur:.2f}s deviates from "
+                                     f"target {target_length_sec:.2f}s but is above the {min_ok:.1f}s floor. "
+                                     f"Accepted on final attempt."),
+                        "issues": [],
+                        "suggestions": [],
+                        "lenient_accept": True,
+                    }
 
         # Build feedback
         if issues:
