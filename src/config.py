@@ -19,7 +19,7 @@ import os
 
 VIDEO_PATH = "E:\\apps\\CutClaw\\resource/imports/DJI_20260615120557_0642_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260619162056_0786_D.MP4"
 AUDIO_PATH = "E:\\apps\\CutClaw\\resource/imports/JINBAO - Long Journey.mp3"
-INSTRUCTION = "遵循长途旅行视角，从宏大航拍切换到女孩嬉戏的纪实瞬间，记录一场逃离城市的山海之旅。"
+INSTRUCTION = "以日记视角编排，航拍山川田野衔接女孩们奔跑嬉戏，记录一段穿越风景的自由之旅。"
 SRT_PATH = ""
 
 
@@ -182,7 +182,7 @@ VIDEO_ANALYSIS_MODEL = "openai/[L]gemini-3-flash-preview"
 VIDEO_ANALYSIS_ENDPOINT = "https://bboluo.com/v1"
 # API base URL for the video analysis model.
 
-VIDEO_ANALYSIS_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
+VIDEO_ANALYSIS_API_KEY = "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL"
 # API key for the video analysis model.
 
 CAPTION_BATCH_SIZE = 64
@@ -196,13 +196,13 @@ SCENE_ANALYSIS_MIN_FRAMES = 6
 # ------------------ Audio Model ------------------ #
 # Analyzes musical beat/energy/structure and outputs editing keypoints.
 
-AUDIO_LITELLM_MODEL = "openai/[L]gemini-3-flash-preview"
+AUDIO_LITELLM_MODEL = "deepseek/deepseek-v4-pro"
 # Cloud model used for audio captioning and structure analysis.
 
-AUDIO_LITELLM_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
+AUDIO_LITELLM_API_KEY = "sk-11bedec4d36c44e6b374baa3c55a83dc"
 # API key for the audio model.
 
-AUDIO_LITELLM_BASE_URL = "https://bboluo.com/v1"
+AUDIO_LITELLM_BASE_URL = "https://api.deepseek.com/v1"
 # API base URL for the audio model.
 
 AUDIO_DETECTION_METHODS = ["downbeat", "pitch", "mel_energy"]
@@ -276,10 +276,10 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Segments below this level are treated as too quiet and filtered.
 
 # ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 3.0
+AUDIO_MIN_SEGMENT_DURATION = 3.44
 # Minimum segment duration (seconds). Smaller values create faster cuts.
 
-AUDIO_MAX_SEGMENT_DURATION = 5.0
+AUDIO_MAX_SEGMENT_DURATION = 5.44
 # Maximum segment duration (seconds). Larger values create slower pacing.
 
 # ----- Music structure analysis (Level-1) -----
@@ -336,8 +336,8 @@ AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 25.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 35.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 64.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 74.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3
@@ -352,13 +352,13 @@ ENABLE_TRIM_SHOT_CHARACTER_ANALYSIS = True
 CORE_MAX_FRAMES = 60
 # Maximum sampled frames per clip for core + reviewer analysis.
 
-AGENT_LITELLM_URL = "https://bboluo.com/v1"
+AGENT_LITELLM_URL = "https://api.deepseek.com/v1"
 # API base URL for the agent LLM.
 
-AGENT_LITELLM_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
+AGENT_LITELLM_API_KEY = "sk-11bedec4d36c44e6b374baa3c55a83dc"
 # API key for the agent LLM.
 
-AGENT_LITELLM_MODEL = "openai/[L]gemini-3-flash-preview"
+AGENT_LITELLM_MODEL = "deepseek/deepseek-v4-pro"
 # Primary model for the agent.
 
 PARALLEL_SHOT_ENABLED = True

@@ -210,6 +210,7 @@ def generate_audio_captions_batch(
     top_p: float = 0.95,
     max_tokens: int = 4096,
     max_workers: int = 5,
+    labels: List[str] = None,
 ) -> List[str]:
     """
     Generate audio captions for multiple audio files via concurrent cloud API calls.
@@ -221,6 +222,7 @@ def generate_audio_captions_batch(
         top_p: Top-p sampling parameter
         max_tokens: Maximum tokens to generate
         max_workers: Max concurrent API requests
+        labels: Optional per-segment display labels for the UI monitor
 
     Returns:
         List of generated caption strings
@@ -232,6 +234,7 @@ def generate_audio_captions_batch(
         top_p=top_p,
         max_tokens=max_tokens,
         max_workers=max_workers,
+        labels=labels,
     )
 
 
@@ -1241,6 +1244,16 @@ def caption_audio_with_madmom_segments(
     print(f"Processing {len(valid_segment_paths)} sub-segments concurrently (max_workers={max_workers})...")
     print(f"{'·'*80}")
 
+    # per-segment time-range labels for the UI execution monitor
+    seg_labels = []
+    for _path in valid_segment_paths:
+        _sec_i, _sub_i, _ss = path_to_info[_path]
+        try:
+            seg_labels.append(
+                f"{seconds_to_mmss(_ss['start_time'])}–{seconds_to_mmss(_ss['end_time'])}")
+        except Exception:
+            seg_labels.append(f"seg {_sub_i + 1}")
+
     caption_texts = generate_audio_captions_batch(
         audio_paths=valid_segment_paths,
         prompt=AUDIO_SEG_KEYPOINT_PROMPT,
@@ -1248,6 +1261,7 @@ def caption_audio_with_madmom_segments(
         top_p=top_p,
         max_tokens=max_tokens,
         max_workers=max_workers,
+        labels=seg_labels,
     )
 
     for path, caption_text in zip(valid_segment_paths, caption_texts):

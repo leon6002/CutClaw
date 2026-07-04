@@ -62,7 +62,10 @@ def save_config(key: str, value: str):
     except ValueError:
         new_val = json.dumps(value, ensure_ascii=False)
     pattern = rf'^({re.escape(key)}\s*=\s*).*'
-    content = re.sub(pattern, lambda m: f"{m.group(1)}{new_val}", content, flags=re.MULTILINE)
+    if re.search(pattern, content, flags=re.MULTILINE):
+        content = re.sub(pattern, lambda m: f"{m.group(1)}{new_val}", content, flags=re.MULTILINE)
+    else:
+        content = content.rstrip("\n") + f"\n\n{key} = {new_val}\n"
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -71,6 +74,26 @@ def _resolve(path: str) -> str:
     if not path:
         return ""
     return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
+
+def _reload_runtime_config():
+    """Reload config-derived modules so in-process jobs pick up model switches.
+
+    save_config() edits config.py on disk, but already-imported modules cache
+    values (src.config attributes, litellm_client's AUDIO_* constants). Reload
+    mutates the module objects in place, so every existing reference updates.
+    """
+    import importlib
+    try:
+        import src.config as _c
+        importlib.reload(_c)
+    except Exception:
+        pass
+    try:
+        import src.audio.litellm_client as _lc
+        importlib.reload(_lc)
+    except Exception:
+        pass
 
 
 # ── Job registry (annotate / pipeline / render run as jobs) ────────────────
@@ -93,9 +116,11 @@ class Job:
     def to_dict(self, since: int = 0):
         import copy
         with self.lock:
+            # traces (full agent step details) are fetched on demand, not polled
+            meta_light = {k: v for k, v in self.meta.items() if k != "traces"}
             return {
                 "id": self.id, "kind": self.kind, "status": self.status,
-                "returncode": self.returncode, "meta": copy.deepcopy(self.meta),
+                "returncode": self.returncode, "meta": copy.deepcopy(meta_light),
                 "lines": self.lines[since:], "total": len(self.lines),
             }
 
@@ -165,9 +190,31 @@ def get_job(job_id: str, since: int = 0):
     return job.to_dict(since)
 
 
+@app.get("/api/jobs/current/{kind}")
+def current_job_of_kind(kind: str):
+    """Latest running job of a kind — lets the UI reattach after a page refresh."""
+    for job in reversed(list(JOBS.values())):
+        if job.kind == kind and job.status == "running":
+            return {"job": {"id": job.id, "kind": job.kind, "status": job.status}}
+    return {"job": None}
+
+
+@app.get("/api/jobs/{job_id}/trace")
+def get_job_trace(job_id: str, task: str, idx: int):
+    """Full agent step trace for one work unit (model replies, tool args)."""
+    import copy
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    with job.lock:
+        steps = copy.deepcopy(job.meta.get("traces", {}).get(task, {}).get(str(idx), []))
+    return {"steps": steps}
+
+
 # ── Config endpoints ────────────────────────────────────────────────────────
 
 CONFIG_KEYS = [
+    "VISION_POOL_REF", "AUDIO_POOL_REF", "AGENT_POOL_REF",
     "VIDEO_PATH", "AUDIO_PATH", "INSTRUCTION", "SRT_PATH", "MAIN_CHARACTER_NAME",
     "ASSET_ROOT_DIR", "ASSET_IMAGE_DURATION_SEC",
     "AUDIO_SEGMENT_MIN_DURATION_SEC", "AUDIO_SEGMENT_MAX_DURATION_SEC",
@@ -205,6 +252,97 @@ def get_api_pool():
         except Exception:
             pass
     return []
+
+
+class PoolSave(BaseModel):
+    pool: list
+
+
+_ROLE_CONFIG_KEYS = [
+    ("VIDEO_ANALYSIS_MODEL", "VIDEO_ANALYSIS_ENDPOINT", "VIDEO_ANALYSIS_API_KEY"),
+    ("AUDIO_LITELLM_MODEL", "AUDIO_LITELLM_BASE_URL", "AUDIO_LITELLM_API_KEY"),
+    ("AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY"),
+]
+
+
+@app.put("/api/api-pool")
+def save_api_pool(body: PoolSave):
+    p = os.path.join(PROJECT_ROOT, "src", "api_pool.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(body.pool, f, ensure_ascii=False, indent=2)
+
+    # The role→entry REFERENCE is authoritative; the config triplets are just a
+    # materialized cache for subprocess/legacy readers. Re-materialize them from
+    # the (possibly edited) pool on every save so they can never drift.
+    _ROLE_REFS = [
+        ("VISION_POOL_REF", "VIDEO_ANALYSIS_MODEL", "VIDEO_ANALYSIS_ENDPOINT", "VIDEO_ANALYSIS_API_KEY"),
+        ("AUDIO_POOL_REF", "AUDIO_LITELLM_MODEL", "AUDIO_LITELLM_BASE_URL", "AUDIO_LITELLM_API_KEY"),
+        ("AGENT_POOL_REF", "AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY"),
+    ]
+    by_name = {(e.get("name") or e.get("model") or ""): e for e in body.pool}
+    synced = []
+    for rk, mk, ek, kk in _ROLE_REFS:
+        e = by_name.get(cfg(rk, ""))
+        if not e:
+            # legacy fallback: no ref stored yet — match by model+endpoint
+            cur_m, cur_e = cfg(mk, ""), cfg(ek, "")
+            e = next((x for x in body.pool
+                      if (x.get("model") or "") == cur_m
+                      and (x.get("endpoint") or x.get("api_base") or "") == cur_e), None)
+            if not e:
+                continue
+        vals = {
+            mk: e.get("model", "") or "",
+            ek: e.get("endpoint") or e.get("api_base") or "",
+            kk: e.get("api_key", "") or "",
+        }
+        for k, v in vals.items():
+            if cfg(k, "") != v:
+                save_config(k, v)
+                if rk not in synced:
+                    synced.append(rk)
+    return {"ok": True, "count": len(body.pool), "synced_roles": synced}
+
+
+class PoolTestRequest(BaseModel):
+    model: str
+    endpoint: str = ""
+    api_key: str = ""
+
+
+@app.post("/api/api-pool/test")
+def api_pool_test(body: PoolTestRequest):
+    """Fire a tiny completion at the given model config and report latency."""
+    import time as _t
+    import litellm
+
+    if not body.model.strip():
+        raise HTTPException(400, "model 不能为空")
+    kwargs: dict = dict(
+        model=body.model,
+        messages=[{"role": "user", "content": "Reply with exactly one word: pong"}],
+        max_tokens=1024,   # reasoning models need headroom for thought tokens
+        timeout=30,
+    )
+    if body.endpoint.strip():
+        kwargs["api_base"] = body.endpoint.strip()
+    if body.api_key.strip():
+        kwargs["api_key"] = body.api_key.strip()
+
+    t0 = _t.time()
+    try:
+        r = litellm.completion(**kwargs)
+        msg = r.choices[0].message
+        content = (msg.content or getattr(msg, "reasoning_content", None) or "").strip()
+        usage = getattr(r, "usage", None)
+        return {
+            "ok": True,
+            "latency_s": round(_t.time() - t0, 2),
+            "reply": content[:200],
+            "tokens": getattr(usage, "total_tokens", None) if usage else None,
+        }
+    except Exception as e:
+        return {"ok": False, "latency_s": round(_t.time() - t0, 2), "error": str(e)[:300]}
 
 
 # ── Resource file listing ───────────────────────────────────────────────────
@@ -336,6 +474,7 @@ def annotate(body: AnnotateRequest):
     JOBS[job.id] = job
 
     def _run():
+        _reload_runtime_config()
         # feed fine-grained segment events (e.g. audio captioning) into this job
         from src.utils import progress as _progress
         _progress.HOOK = lambda ev: _apply_progress_ev(job, ev)
@@ -403,6 +542,7 @@ def auto_select(body: SelectRequest):
         job.add(f"[{stage}] {status} {detail}".rstrip())
 
     def _run():
+        _reload_runtime_config()
         try:
             from src.asset_manager.selector import select_assets
             from src.utils.video_concat import create_slideshow_video
@@ -549,6 +689,122 @@ def instruction_suggestions(body: SuggestRequest):
             502,
             f"无法解析模型返回（finish_reason={finish_reason or '?'}，长度={len(content)}）：{content[:150]}")
     return {"suggestions": arr}
+
+
+@app.post("/api/params/suggestions")
+def params_suggestions(body: SuggestRequest):
+    """Suggest target_length + shot_length from the project's assets + instruction."""
+    import re as _re
+    import litellm
+    from src.asset_manager.index_store import load_index
+
+    _reload_runtime_config()
+    if not body.project_id:
+        raise HTTPException(400, "缺少 project_id")
+    p = _load_project(body.project_id)
+    instr = (p.get("instruction") or "").strip()
+
+    idx = load_index()
+    by_path: dict = {}
+    for ann in idx.values():
+        ap = getattr(ann.metadata, "absolute_path", "") or ""
+        if ap:
+            by_path[os.path.normcase(os.path.abspath(ap))] = ann
+            by_path[os.path.basename(ap)] = ann
+
+    def _find(path: str):
+        if not path:
+            return None
+        return (by_path.get(os.path.normcase(os.path.abspath(_resolve(path))))
+                or by_path.get(os.path.basename(path)))
+
+    video_lines = []
+    total_video_dur = 0.0
+    for v in p.get("videos", []):
+        a = _find(v)
+        d = float(getattr(a.metadata, "duration_sec", 0) or 0) if a else 0.0
+        total_video_dur += d
+        summ = str(getattr(a.annotation, "summary", "") or "")[:80] if a else ""
+        video_lines.append(f"- {os.path.basename(v)}（{d:.0f}s）{summ}")
+
+    audio_desc = "（未选择音乐）"
+    audio_dur = 0.0
+    aa = _find(p.get("audio", ""))
+    if aa:
+        audio_dur = float(getattr(aa.metadata, "duration_sec", 0) or 0)
+        bpm = getattr(aa.annotation, "bpm", None)
+        energy = getattr(aa.annotation, "energy_level", None)
+        genre = getattr(aa.annotation, "genre", None)
+        audio_desc = (f"时长 {audio_dur:.0f}s"
+                      + (f"，BPM {bpm}" if bpm else "")
+                      + (f"，能量 {energy}" if energy else "")
+                      + (f"，曲风 {genre}" if genre else ""))
+    elif p.get("audio"):
+        audio_desc = f"{os.path.basename(p['audio'])}（未标注，无节奏信息）"
+
+    prompt = (
+        "你是短视频混剪参数顾问。根据剪辑指令和素材情况，推荐两项参数：\n"
+        "1. target_length_sec：成片目标时长（秒，10~120 之间，不得超过音乐时长的 90%，"
+        "也要考虑视频素材总量是否足够填满）\n"
+        "2. shot_length_sec：单镜头平均长度（秒，0.5~8 之间。快节奏卡点应对齐节拍——"
+        "例如 1 拍 = 60/BPM 秒、1 小节 = 240/BPM 秒；情感叙事可以更长）\n\n"
+        f"剪辑指令：{instr or '（未填写）'}\n"
+        f"音乐：{audio_desc}\n"
+        f"视频素材（共 {total_video_dur:.0f}s）：\n" + ("\n".join(video_lines) or "（未选择视频）") + "\n\n"
+        '只返回 JSON，例如 {"target_length_sec": 35, "shot_length_sec": 2.0, "rationale": "一句话理由"}'
+    )
+
+    kwargs: dict = dict(
+        model=cfg("AGENT_LITELLM_MODEL", ""),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4, max_tokens=8192,
+    )
+    if cfg("AGENT_LITELLM_URL", ""):
+        kwargs["api_base"] = cfg("AGENT_LITELLM_URL", "")
+    if cfg("AGENT_LITELLM_API_KEY", ""):
+        kwargs["api_key"] = cfg("AGENT_LITELLM_API_KEY", "")
+
+    try:
+        raw = litellm.completion(**kwargs)
+        msg = raw.choices[0].message
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
+    except Exception as e:
+        raise HTTPException(502, f"LLM 调用失败：{str(e)[:200]}")
+
+    text = content.strip()
+    m = _re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, _re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        s, e2 = text.find("{"), text.rfind("}")
+        if s >= 0 and e2 > s:
+            try:
+                parsed = json.loads(text[s:e2 + 1])
+            except Exception:
+                parsed = None
+    if not isinstance(parsed, dict):
+        raise HTTPException(502, f"无法解析模型返回：{content[:150]}")
+
+    try:
+        target = float(parsed.get("target_length_sec", 30))
+        shot = float(parsed.get("shot_length_sec", 3))
+    except Exception:
+        raise HTTPException(502, f"模型返回的参数不是数字：{parsed}")
+
+    # clamp to sane / feasible bounds
+    target = max(10.0, min(300.0, target))
+    if audio_dur > 5:
+        target = min(target, round(audio_dur * 0.9, 1))
+    shot = max(0.3, min(15.0, round(shot, 2)))
+
+    return {
+        "target_length": round(target, 1),
+        "shot_length": shot,
+        "rationale": str(parsed.get("rationale", ""))[:300],
+    }
 
 
 # ── Analysis data (for chart visualizations) ───────────────────────────────
@@ -748,6 +1004,15 @@ def _apply_progress_ev(job: Job, ev: dict):
             t["total"] = total
         idx = ev.get("idx", -1)
         event = ev.get("event", "")
+        if event == "step" and isinstance(idx, int) and idx >= 0:
+            # detailed agent iteration step — stored in traces, fetched on demand
+            traces = job.meta.setdefault("traces", {}).setdefault(name, {})
+            lst = traces.setdefault(str(idx), [])
+            lst.append({k: ev[k] for k in ("phase", "iter", "max_iter", "elapsed", "tool", "args", "reply") if k in ev})
+            if len(lst) > 80:
+                del lst[:len(lst) - 80]
+            t.setdefault("iters", {})[str(idx)] = f"{ev.get('iter', '?')}/{ev.get('max_iter', '?')}"
+            return
         if event == "reset":
             t["states"] = {}
             t["labels"] = {}
@@ -1002,4 +1267,10 @@ if __name__ == "__main__":
     tools_ffmpeg = os.path.join(PROJECT_ROOT, "tools", "ffmpeg")
     if os.path.isdir(tools_ffmpeg):
         os.environ["PATH"] = tools_ffmpeg + os.pathsep + os.environ.get("PATH", "")
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+    if "--reload" in sys.argv:
+        # dev mode: auto-restart on backend code changes
+        # (in-memory jobs are lost on reload — don't use mid-pipeline)
+        uvicorn.run("server.main:app", host="127.0.0.1", port=8765,
+                    reload=True, reload_dirs=[os.path.join(PROJECT_ROOT, "server")])
+    else:
+        uvicorn.run(app, host="127.0.0.1", port=8765)

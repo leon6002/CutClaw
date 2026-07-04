@@ -55,6 +55,12 @@ export default function RenderView({
     }).catch(() => {});
   };
 
+  // reattach to a render still running server-side after a page refresh
+  useEffect(() => {
+    api<any>("/api/jobs/current/render")
+      .then((r) => { if (r.job) setJobId(r.job.id); }).catch(() => {});
+  }, []);
+
   useEffect(() => { refreshRecent(); }, [pipelineStatus]);
   useEffect(() => { refreshOutputs(shotPoint); }, [shotPoint]);
   useEffect(() => {

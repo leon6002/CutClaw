@@ -180,6 +180,26 @@ def commit(
         except Exception as e:
             return f"Error parsing shot {i+1} time range: {str(e)}"
 
+    # Clamp to the source video's real duration — analysis boundaries can
+    # round slightly past EOF, which breaks the reviewer and the renderer.
+    if video_path:
+        try:
+            _vr = _get_thread_video_reader(video_path)
+            if _vr is not None and len(_vr) > 1:
+                _dur = (len(_vr) - 1) / float(_vr.get_avg_fps() or 24)
+                for c in clips:
+                    if c['start_sec'] >= _dur:
+                        return (f"Error: shot starts at {c['start_time']} but the source video "
+                                f"ends at {seconds_to_hhmmss(_dur)}. Choose an earlier range.")
+                    if c['end_sec'] > _dur:
+                        print(f"✂️  [Clamp] Shot end {c['end_time']} beyond video end ({_dur:.2f}s) — clamped.")
+                        c['end_sec'] = round(_dur, 2)
+                        c['duration'] = c['end_sec'] - c['start_sec']
+                        c['end_time'] = seconds_to_hhmmss(c['end_sec'])
+                total_duration = sum(c['duration'] for c in clips)
+        except Exception:
+            pass
+
     # Validate time continuity and gaps for multi-shot stitching
     if len(clips) > 1:
         max_gap = getattr(config, 'MAX_STITCH_GAP_SEC', 2.0)
@@ -802,6 +822,51 @@ def fine_grained_shot_trimming(
         gc.collect()
 
 
+def _norm_range(item):
+    """Normalize (start, end) or (src, start, end) → (src, start, end)."""
+    if len(item) == 3:
+        return item
+    return ("", item[0], item[1])
+
+
+def _same_source(a: str, b: str) -> bool:
+    """Empty source = legacy/unknown → conservatively matches everything."""
+    return (not a) or (not b) or os.path.normcase(a) == os.path.normcase(b)
+
+
+def _build_scene_source_map(scene_folder_path):
+    """scene_idx → source video absolute path, resolved via each merged scene's
+    ``_source_hash`` (multi-source projects: scenes come from several videos,
+    frames/commits MUST use the scene's own source, not the primary video)."""
+    mapping = {}
+    if not scene_folder_path or not os.path.isdir(scene_folder_path):
+        return mapping
+    import glob as _glob
+    hash_to_path = {}
+    for f in _glob.glob(os.path.join(scene_folder_path, "scene_*.json")):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            h = d.get("_source_hash")
+            m = re.search(r"scene_(\d+)\.json$", os.path.basename(f))
+            if not h or not m:
+                continue
+            if h not in hash_to_path:
+                ap = ""
+                try:
+                    meta_fp = os.path.join(config.VIDEO_DATABASE_FOLDER, "analyzed", h, "metadata.json")
+                    with open(meta_fp, "r", encoding="utf-8") as mf:
+                        ap = json.load(mf).get("absolute_path", "") or ""
+                except Exception:
+                    ap = ""
+                hash_to_path[h] = ap if (ap and os.path.exists(ap)) else ""
+            if hash_to_path[h]:
+                mapping[int(m.group(1))] = hash_to_path[h]
+        except Exception:
+            continue
+    return mapping
+
+
 class EditorCoreAgent:
     def __init__(self, video_caption_path, video_scene_path, audio_caption_path, output_path, max_iterations, video_path=None, video_reader=None, frame_folder_path=None, transcript_path: str = None):
         self.tools = [semantic_neighborhood_retrieval, fine_grained_shot_trimming, review_clip, commit]
@@ -842,6 +907,8 @@ class EditorCoreAgent:
         self.guidance_text = None
         self.last_commit_result = None
         self.last_commit_raw = None
+        # Multi-source: which source video each merged scene belongs to
+        self.scene_source_map = _build_scene_source_map(video_scene_path)
 
         # Initialize ReviewerAgent for finish validation
         self.reviewer = ReviewerAgent(
@@ -850,6 +917,23 @@ class EditorCoreAgent:
         )
         # Current shot context for reviewer
         self.current_shot_context = {}
+
+    def _current_source_video(self):
+        """Source video for the shot being processed.
+
+        Resolved from the shot's related scenes (multi-source projects); falls
+        back to the primary video when unmapped (single-source / legacy).
+        """
+        for s in (self.current_related_scenes or []):
+            try:
+                p = self.scene_source_map.get(int(s))
+            except (TypeError, ValueError):
+                p = None
+            if p:
+                if p != self.video_path:
+                    print(f"🎯 [MultiSource] Shot uses scene {s} → {os.path.basename(p)}")
+                return p
+        return self.video_path
 
     def _load_progress(self):
         """
@@ -991,6 +1075,11 @@ class EditorCoreAgent:
                             f"(+{time.time() - loop_start:.0f}s)",
                             flush=True,
                         )
+                        _emit_shot_step(
+                            self.current_section_idx, self.current_shot_idx,
+                            phase="calling", iter=i + 1, max_iter=max_iterations,
+                            elapsed=round(time.time() - loop_start),
+                        )
                         raw = litellm.completion(**kwargs)
                         msg = raw.choices[0].message
                         tool_calls_raw = getattr(msg, "tool_calls", None)
@@ -1069,6 +1158,15 @@ class EditorCoreAgent:
                 print(
                     f"✅ [{tag}] iter {i + 1}/{max_iterations}{_tr} · +{time.time() - loop_start:.0f}s → {_action}",
                     flush=True,
+                )
+                _reply_parts = [response.get("reasoning_content") or "", response.get("content") or ""]
+                _emit_shot_step(
+                    self.current_section_idx, self.current_shot_idx,
+                    phase="action", iter=i + 1, max_iter=max_iterations,
+                    elapsed=round(time.time() - loop_start),
+                    tool=(_tcs[0]["function"]["name"] if _tcs else ""),
+                    args=((_tcs[0]["function"].get("arguments") or "")[:2000] if _tcs else ""),
+                    reply="\n".join(p for p in _reply_parts if p)[:2000],
                 )
 
                 tool_execution_failed = False
@@ -1191,8 +1289,9 @@ class EditorCoreAgent:
 
         # For fine_grained_shot_trimming, inject video/transcript parameters and check for duplicate calls
         if canonical_name == "fine_grained_shot_trimming":
-            if self.video_path:
-                args["frame_path"] = self.video_path
+            _src_video = self._current_source_video()
+            if _src_video:
+                args["frame_path"] = _src_video
             elif self.video_reader is None:
                 self._append_tool_msg(
                     tool_call["id"],
@@ -1234,14 +1333,24 @@ class EditorCoreAgent:
             # Record this time range as attempted
             self.attempted_time_ranges.add(normalized_range)
         
-        # For review_clip, inject used_time_ranges
+        # For review_clip, inject used_time_ranges (only those on THIS shot's source)
         if canonical_name == "review_clip":
-            args["used_time_ranges"] = self.used_time_ranges + (self.forbidden_time_ranges or [])
-            print(f"📍 Checking overlap against {len(self.used_time_ranges)} used clips")
+            _cur_src = self._current_source_video() or ""
+            _forb = []
+            for _f in (self.forbidden_time_ranges or []):
+                f_src, f_s, f_e = _norm_range(_f)
+                if _same_source(f_src, _cur_src):
+                    _forb.append((f_s, f_e))
+            args["used_time_ranges"] = self.used_time_ranges + _forb
+            print(f"📍 Checking overlap against {len(self.used_time_ranges)} used + {len(_forb)} forbidden (same-source) clips")
 
         # For commit, first call ReviewerAgent to validate
         if canonical_name == "commit":
-            args["video_path"] = self.video_path or ""
+            _src_video = self._current_source_video()
+            args["video_path"] = _src_video or ""
+            # reviewer (face check etc.) must read frames from the same source
+            if self.reviewer is not None:
+                self.reviewer.video_path = _src_video
             args["output_path"] = self.output_path or ""
             args["target_length_sec"] = self.current_target_length or 0.0
             args["section_idx"] = self.current_section_idx if self.current_section_idx is not None else -1
@@ -1259,8 +1368,12 @@ class EditorCoreAgent:
                         msgs
                     )
                     return False
+                _cur_src = _src_video or ""
                 for p_start, p_end in proposed_ranges:
-                    for f_start, f_end in self.forbidden_time_ranges:
+                    for _f in self.forbidden_time_ranges:
+                        f_src, f_start, f_end = _norm_range(_f)
+                        if not _same_source(f_src, _cur_src):
+                            continue
                         if _ranges_overlap(p_start, p_end, f_start, f_end):
                             self._append_tool_msg(
                                 tool_call["id"],
@@ -1572,6 +1685,25 @@ class EditorCoreAgent:
         gc.collect()
 
 
+# Module-level registry so _run_shot_loop (an agent method) can emit
+# fine-grained per-shot progress without threading callbacks through layers.
+_SHOT_PROG = {"map": None, "total": 0}
+
+
+def _emit_shot_step(sec_idx, shot_idx, **payload):
+    try:
+        m = _SHOT_PROG.get("map")
+        if not m:
+            return
+        key = ((sec_idx or 0), (shot_idx or 0))
+        if key not in m:
+            return
+        from src.utils.progress import emit_progress
+        emit_progress("editor_shots", _SHOT_PROG["total"], m[key], "step", **payload)
+    except Exception:
+        pass
+
+
 class ParallelShotOrchestrator:
     def __init__(self, video_caption_path, video_scene_path, audio_caption_path, output_path, max_iterations, video_path=None, frame_folder_path=None, transcript_path: str = None, max_workers: int = None, max_reruns: int = None):
         self.video_caption_path = video_caption_path
@@ -1601,18 +1733,24 @@ class ParallelShotOrchestrator:
             duration_score = 1.0 - min(1.0, abs(total_duration - target_duration) / max(target_duration, 1.0))
         return 0.6 * protagonist_ratio + 0.4 * duration_score
 
-    def _result_ranges(self, result_data: dict) -> list[tuple[float, float]]:
+    def _result_ranges(self, result_data: dict) -> list[tuple[str, float, float]]:
+        """(source_video, start_sec, end_sec) triples — ranges from different
+        source videos are on different timelines and must never be compared."""
         ranges = []
         if not result_data:
             return ranges
+        default_src = result_data.get("video_path", "") or ""
         clips = result_data.get("clips", [])
         for clip in clips:
             start = clip.get("start")
             end = clip.get("end")
             if start and end:
-                start_sec = _hhmmss_to_seconds(start, fps=getattr(config, 'VIDEO_FPS', 24) or 24)
-                end_sec = _hhmmss_to_seconds(end, fps=getattr(config, 'VIDEO_FPS', 24) or 24)
-                ranges.append((start_sec, end_sec))
+                fps = getattr(config, 'VIDEO_FPS', 24) or 24
+                ranges.append((
+                    clip.get("video_path") or default_src,
+                    _hhmmss_to_seconds(start, fps=fps),
+                    _hhmmss_to_seconds(end, fps=fps),
+                ))
         return ranges
 
     def _detect_conflicts(self, results: dict, keep_ranges: list) -> dict:
@@ -1623,8 +1761,11 @@ class ParallelShotOrchestrator:
         # Conflicts with already kept ranges (from prior sections or winners)
         for key, result in items:
             ranges = self._result_ranges(result)
-            for r_start, r_end in ranges:
-                for k_start, k_end in keep_ranges:
+            for r_src, r_start, r_end in ranges:
+                for k_item in keep_ranges:
+                    k_src, k_start, k_end = _norm_range(k_item)
+                    if not _same_source(r_src, k_src):
+                        continue
                     if _ranges_overlap(r_start, r_end, k_start, k_end):
                         losers[key] = "Overlap with already selected clips. Please choose a different time range."
                         break
@@ -1643,9 +1784,9 @@ class ParallelShotOrchestrator:
                     continue
                 ranges_j = self._result_ranges(res_j)
                 overlap = False
-                for a_start, a_end in ranges_i:
-                    for b_start, b_end in ranges_j:
-                        if _ranges_overlap(a_start, a_end, b_start, b_end):
+                for a_src, a_start, a_end in ranges_i:
+                    for b_src, b_start, b_end in ranges_j:
+                        if _same_source(a_src, b_src) and _ranges_overlap(a_start, a_end, b_start, b_end):
                             overlap = True
                             break
                     if overlap:
@@ -1737,22 +1878,34 @@ class ParallelShotOrchestrator:
         with open(shot_plan_path, 'r', encoding='utf-8') as f:
             structure_proposal = json.load(f)
 
-        # Flat index for every (section, shot) pair → fine-grained UI progress
+        # Flat index + human label for every (section, shot) pair → UI progress
         _flat_idx: dict = {}
+        _flat_label: dict = {}
         _n_total = 0
         for _si, _sec in enumerate(structure_proposal.get('video_structure', [])):
             _sp = _sec.get('shot_plan') or {}
-            for _hi in range(len(_sp.get('shots', []))):
+            for _hi, _shot in enumerate(_sp.get('shots', [])):
                 _flat_idx[(_si, _hi)] = _n_total
+                _desc = ""
+                if isinstance(_shot, dict):
+                    for _k in ("description", "shot_description", "content", "summary", "narrative", "name"):
+                        if _shot.get(_k):
+                            _desc = str(_shot[_k]).strip().replace("\n", " ")
+                            break
+                _flat_label[(_si, _hi)] = f"S{_si + 1}·Shot{_hi + 1}" + (f"｜{_desc[:42]}" if _desc else "")
                 _n_total += 1
 
         def _emit(key, event):
             try:
                 from src.utils.progress import emit_progress
                 if key in _flat_idx:
-                    emit_progress("editor_shots", _n_total, _flat_idx[key], event)
+                    emit_progress("editor_shots", _n_total, _flat_idx[key], event,
+                                  label=_flat_label.get(key, ""))
             except Exception:
                 pass
+
+        _SHOT_PROG["map"] = _flat_idx
+        _SHOT_PROG["total"] = _n_total
 
         global_keep_ranges = []
         final_results = {}
@@ -1774,8 +1927,8 @@ class ParallelShotOrchestrator:
             if sec_idx is None or shot_idx is None:
                 continue
             completed_shots.add((sec_idx, shot_idx))
-            for r_start, r_end in self._result_ranges(item):
-                global_keep_ranges.append((r_start, r_end))
+            for _r in self._result_ranges(item):
+                global_keep_ranges.append(_r)
 
         if completed_shots:
             print(f"📋 [Parallel] Found {len(completed_shots)} completed shots in existing output file")
@@ -1876,8 +2029,8 @@ class ParallelShotOrchestrator:
                     if result:
                         final_results[key] = result
                         round_has_updates = True
-                        for r_start, r_end in self._result_ranges(result):
-                            section_keep_ranges.append((r_start, r_end))
+                        for _r in self._result_ranges(result):
+                            section_keep_ranges.append(_r)
 
                 if round_has_updates:
                     self._save_checkpoint(existing, final_results)

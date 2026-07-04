@@ -140,6 +140,7 @@ def call_audio_api_batch(
     top_p: float = 0.95,
     max_tokens: int = 4096,
     max_workers: int = 5,
+    labels: List[str] = None,
 ) -> List[str]:
     """
     Concurrent batch captioning via ThreadPoolExecutor + sync litellm calls.
@@ -171,7 +172,8 @@ def call_audio_api_batch(
     def _worker(idx: int, path: str):
         nonlocal done_count
         ts = time.time()
-        emit_progress("audio_segments", total, idx, "start")
+        emit_progress("audio_segments", total, idx, "start",
+                      **({"label": labels[idx]} if labels and idx < len(labels) else {}))
         try:
             text = _call_audio_api_sync(path, prompt, temperature, top_p, max_tokens)
             ok = True

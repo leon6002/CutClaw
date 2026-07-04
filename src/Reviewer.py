@@ -263,12 +263,20 @@ class ReviewerAgent:
         _clear_thread_video_reader()
         gc.collect()
 
-    def _compute_frame_indices(self, start_sec: float, end_sec: float, fps: float, max_frames: Optional[int] = None) -> list:
-        """Compute frame indices for a time range using native fps with a hard cap."""
+    def _compute_frame_indices(self, start_sec: float, end_sec: float, fps: float, max_frames: Optional[int] = None, num_frames: Optional[int] = None) -> list:
+        """Compute frame indices for a time range using native fps with a hard cap.
+
+        ``num_frames`` clamps indices to the video's actual frame count —
+        analysis boundaries can round slightly past EOF (e.g. 11.4s on an
+        11.3s clip), which would make decord's get_batch raise IndexError.
+        """
         if fps <= 0:
             return []
         start_f = max(0, int(start_sec * fps))
         end_f = max(0, int(end_sec * fps))
+        if num_frames is not None and num_frames > 0:
+            start_f = min(start_f, num_frames - 1)
+            end_f = min(end_f, num_frames - 1)
         if end_f < start_f:
             return []
         indices = list(range(start_f, end_f + 1))
@@ -369,7 +377,7 @@ class ReviewerAgent:
             if vr is None:
                 return "❌ Error: Unable to initialize video reader."
             video_fps = float(vr.get_avg_fps())
-            frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames)
+            frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames, num_frames=len(vr))
             if not frame_indices:
                 return f"❌ Error: No frames to process in the specified time range."
 
@@ -671,7 +679,7 @@ class ReviewerAgent:
                 return []
             video_fps = float(vr.get_avg_fps())
             max_frames = int(getattr(config, "CORE_MAX_FRAMES", getattr(config, "TRIM_SHOT_MAX_FRAMES", 240)))
-            frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames)
+            frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames, num_frames=len(vr))
             if not frame_indices:
                 return []
 

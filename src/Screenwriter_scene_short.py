@@ -88,7 +88,9 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
         messages=messages,
         max_tokens=max_tokens or config.AGENT_MODEL_MAX_TOKEN,
         api_key=config.AGENT_LITELLM_API_KEY,
-        timeout=60,
+        # Shot-plan generation is a large prompt + long structured output;
+        # reasoning models routinely exceed 60s. Configurable via config.
+        timeout=getattr(config, "AGENT_LLM_TIMEOUT_SEC", 300),
     )
     if config.AGENT_LITELLM_URL:
         kwargs["api_base"] = config.AGENT_LITELLM_URL

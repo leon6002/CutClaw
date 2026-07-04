@@ -17,6 +17,7 @@ import {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { api, useJob, type JobState } from "./api";
+import { ModelConfigProvider } from "./components/ModelConfig";
 import AgentFlow from "./components/AgentFlow";
 import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
@@ -232,6 +233,7 @@ export default function App() {
 
   return (
     <TooltipProvider delayDuration={200}>
+      <ModelConfigProvider>
       <div className="flex min-h-screen flex-col">
         {/* ── glass header ── */}
         <header className="sticky top-0 z-40 border-b border-white/[0.07] bg-slate-950/60 backdrop-blur-xl">
@@ -353,6 +355,7 @@ export default function App() {
           </DialogContent>
         </Dialog>
       </div>
+      </ModelConfigProvider>
     </TooltipProvider>
   );
 }

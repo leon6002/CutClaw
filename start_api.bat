@@ -23,6 +23,11 @@ if errorlevel 1 (
   pip install fastapi "uvicorn[standard]"
 )
 
+REM Dev hot-reload:  start_api.bat reload   - auto-restarts on server code changes
 echo [*] API running at http://127.0.0.1:8765  -  frontend dev server: cd web ^&^& pnpm dev
-python server\main.py
+if /i "%~1"=="reload" (
+  python server\main.py --reload
+) else (
+  python server\main.py
+)
 pause

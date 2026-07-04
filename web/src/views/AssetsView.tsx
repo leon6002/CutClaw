@@ -18,6 +18,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
+import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
@@ -478,6 +479,14 @@ export default function AssetsView({
 
   const busy = annJob.status === "running";
 
+  // reattach to jobs still running server-side after a page refresh
+  useEffect(() => {
+    api<any>("/api/jobs/current/annotate")
+      .then((r) => { if (r.job) setAnnJobId(r.job.id); }).catch(() => {});
+    api<any>("/api/jobs/current/select")
+      .then((r) => { if (r.job) setSelJobId(r.job.id); }).catch(() => {});
+  }, []);
+
   const scan = async () => {
     setError(""); setScanning(true);
     try {
@@ -582,6 +591,14 @@ export default function AssetsView({
             </Button>
           </div>
 
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+            <span className="text-xs text-slate-500">使用模型：</span>
+            <RoleModelSelect role="vision" disabled={busy} />
+            <RoleModelSelect role="audio" disabled={busy} />
+            <RoleModelSelect role="agent" disabled={selecting} />
+            <span className="text-[11px] text-slate-600">视觉/音频用于标注 · Agent 用于智能选材</span>
+          </div>
+
           {error && (
             <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">{error}</div>
           )}
@@ -595,7 +612,7 @@ export default function AssetsView({
               <div className="mt-1 text-xs text-slate-400">
                 {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
               </div>
-              <TaskGrids tasks={annJob.meta.tasks ?? {}} />
+              <TaskGrids tasks={annJob.meta.tasks ?? {}} jobId={annJobId} />
               <JobLog lines={annJob.lines.slice(-80)} height={180} />
             </div>
           )}

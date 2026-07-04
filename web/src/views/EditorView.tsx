@@ -14,6 +14,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { api, fmtDuration, type JobState } from "../api";
+import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import TaskGrids from "../components/TaskGrids";
@@ -54,6 +55,9 @@ export default function EditorView({
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [sugError, setSugError] = useState("");
+  const [paramSug, setParamSug] = useState<{ target_length: number; shot_length: number; rationale: string } | null>(null);
+  const [paramSugLoading, setParamSugLoading] = useState(false);
+  const [paramSugError, setParamSugError] = useState("");
 
   const p = project;
   const job = pipelineJob;
@@ -63,13 +67,19 @@ export default function EditorView({
     api<string[]>("/api/files?kind=video").then(setVideoFiles).catch(() => {});
     api<string[]>("/api/files?kind=audio").then(setAudioFiles).catch(() => {});
     api<string[]>("/api/files?kind=srt").then(setSrtFiles).catch(() => {});
+    // Reattach to the latest pipeline job after a page refresh — running OR
+    // finished (its stages/grids/logs live in server memory until restart).
     api<any>("/api/pipeline/current").then((r) => {
-      if (r.job && r.job.status === "running") {
-        setPipelineJobId(r.job.id);
+      const j = r.job;
+      if (!j) return;
+      // don't show another project's run
+      if (j.meta?.project_id && j.meta.project_id !== project.id) return;
+      setPipelineJobId(j.id);
+      if (j.status === "running") {
         setProject((old) => ({
           ...old,
-          shotPoint: r.job.meta.shot_point || old.shotPoint,
-          effectiveVideo: r.job.meta.effective_video || old.effectiveVideo,
+          shotPoint: j.meta.shot_point || old.shotPoint,
+          effectiveVideo: j.meta.effective_video || old.effectiveVideo,
         }));
       }
     }).catch(() => {});
@@ -102,6 +112,18 @@ export default function EditorView({
 
   const stop = async () => {
     try { await api("/api/pipeline/stop", { method: "POST" }); } catch { /* ignore */ }
+  };
+
+  const fetchParamSug = async () => {
+    setParamSugError(""); setParamSugLoading(true);
+    try {
+      const r = await api<{ target_length: number; shot_length: number; rationale: string }>(
+        "/api/params/suggestions",
+        { method: "POST", body: JSON.stringify({ project_id: p.id }) },
+      );
+      setParamSug(r);
+    } catch (e: any) { setParamSugError(e.message); }
+    setParamSugLoading(false);
   };
 
   const fetchSuggestions = async () => {
@@ -253,7 +275,16 @@ export default function EditorView({
               </>
             )}
 
-            <div className="mb-4 flex items-center gap-3">
+            <div className="mb-4 rounded-xl border border-white/[0.07] bg-white/[0.02] p-2.5">
+              <div className="mb-2 text-xs text-slate-400">本次运行使用的模型（来自 API 池）</div>
+              <div className="space-y-1.5">
+                <RoleModelSelect role="vision" disabled={running} className="justify-between" />
+                <RoleModelSelect role="audio" disabled={running} className="justify-between" />
+                <RoleModelSelect role="agent" disabled={running} className="justify-between" />
+              </div>
+            </div>
+
+            <div className="mb-2 flex items-center gap-3">
               <span className="w-32 text-xs text-slate-400">目标时长（秒）</span>
               <Input
                 type="number" min={10} max={300} step={5} value={p.targetLength} disabled={running}
@@ -261,13 +292,44 @@ export default function EditorView({
                 onChange={(e) => set({ targetLength: parseFloat(e.target.value) || 30 })}
               />
             </div>
-            <div className="mb-5 flex items-center gap-3">
+            <div className="mb-2 flex items-center gap-3">
               <span className="w-32 text-xs text-slate-400">单镜头长度（秒）</span>
               <Input
                 type="number" min={0.2} max={30} step={0.1} value={p.shotLength} disabled={running}
                 className="h-8 w-24 border-white/10 bg-black/25"
                 onChange={(e) => set({ shotLength: parseFloat(e.target.value) || 4 })}
               />
+            </div>
+
+            <div className="mb-5">
+              <Button variant="outline" size="sm"
+                className="h-7 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+                disabled={running || paramSugLoading || (p.videos.length === 0 && !p.audio)}
+                onClick={fetchParamSug}>
+                {paramSugLoading
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : <Lightbulb className="h-3.5 w-3.5 text-amber-400" />}
+                AI 建议时长参数
+              </Button>
+              {paramSugError && <span className="ml-2 text-xs text-red-400">{paramSugError}</span>}
+              {paramSug && (
+                <div
+                  className={cn(
+                    "suggestion-chip",
+                    p.targetLength === paramSug.target_length && p.shotLength === paramSug.shot_length && "picked",
+                  )}
+                  onClick={() => !running && set({
+                    targetLength: paramSug.target_length,
+                    shotLength: paramSug.shot_length,
+                  })}
+                  title="点击应用建议参数"
+                >
+                  <Lightbulb className="mr-1.5 inline h-3.5 w-3.5 -translate-y-px text-amber-400" />
+                  目标 <span className="font-semibold text-cyan-300">{paramSug.target_length}s</span>
+                  {" · "}单镜头 <span className="font-semibold text-cyan-300">{paramSug.shot_length}s</span>
+                  {paramSug.rationale && <span className="text-slate-400"> — {paramSug.rationale}</span>}
+                </div>
+              )}
             </div>
 
             <div className="flex gap-2">
@@ -310,7 +372,10 @@ export default function EditorView({
           </CardHeader>
           <CardContent>
             <AgentFlow steps={PIPELINE_STEPS} stages={stagesView} />
-            <TaskGrids tasks={job.meta.tasks ?? {}} />
+            <TaskGrids
+              tasks={job.meta.tasks ?? {}} jobId={pipelineJobId} jobRunning={running}
+              onRetryFailed={(task) => { if (task === "editor_shots") start(); }}
+            />
             {job.status === "done" && (
               <div className="mb-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-400">
                 流水线完成！切换到「渲染导出」生成视频。

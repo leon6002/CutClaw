@@ -1,140 +1,199 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { AudioLines, Bot, Eye, Loader2, Settings2 } from "lucide-react";
+import {
+  CircleCheck, CircleX, FlaskConical, Loader2, Plus, Save, Settings2, Trash2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
-  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+  Dialog, DialogContent, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
-} from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 import { api } from "../api";
+import {
+  ROLES, RoleModelSelect, useModelConfig, type PoolEntry, type RoleKey,
+} from "../components/ModelConfig";
 
-interface PoolEntry {
-  name?: string;
-  model?: string;
-  endpoint?: string;
-  api_base?: string;
-  api_key?: string;
-  multimodal?: boolean;
-}
-
-const GROUPS: { title: ReactNode; mmOnly: boolean; keys: string[] }[] = [
-  {
-    title: <span className="flex items-center gap-1.5"><Eye className="h-3.5 w-3.5 text-sky-400" />Vision（视频/图片理解）</span>,
-    mmOnly: true,
-    keys: ["VIDEO_ANALYSIS_MODEL", "VIDEO_ANALYSIS_ENDPOINT", "VIDEO_ANALYSIS_API_KEY"],
-  },
-  {
-    title: <span className="flex items-center gap-1.5"><AudioLines className="h-3.5 w-3.5 text-violet-400" />Audio（音乐分析）</span>,
-    mmOnly: false,
-    keys: ["AUDIO_LITELLM_MODEL", "AUDIO_LITELLM_BASE_URL", "AUDIO_LITELLM_API_KEY"],
-  },
-  {
-    title: <span className="flex items-center gap-1.5"><Bot className="h-3.5 w-3.5 text-cyan-400" />Agent（编剧/剪辑/选材）</span>,
-    mmOnly: false,
-    keys: ["AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY"],
-  },
-];
+interface TestResult { loading?: boolean; ok?: boolean; msg?: string }
 
 const FieldLabel = ({ children }: { children: ReactNode }) => (
   <div className="mb-1 text-xs text-slate-400">{children}</div>
 );
+const inputCls = "border-white/10 bg-black/25";
 
 export default function SettingsModal({ onClose }: { onClose: () => void }) {
-  const [cfg, setCfg] = useState<Record<string, string>>({});
+  const ctx = useModelConfig();
   const [pool, setPool] = useState<PoolEntry[]>([]);
-  const [saving, setSaving] = useState(false);
+  const [poolSaving, setPoolSaving] = useState(false);
+  const [poolDirty, setPoolDirty] = useState(false);
   const [error, setError] = useState("");
+  const [tests, setTests] = useState<Record<number, TestResult>>({});
 
+  // local editable copy of the pool, seeded from context
   useEffect(() => {
-    api<Record<string, string>>("/api/config").then(setCfg).catch(() => {});
-    api<PoolEntry[]>("/api/api-pool").then(setPool).catch(() => {});
-  }, []);
+    if (!poolDirty) setPool(ctx.pool);
+  }, [ctx.pool]);
 
-  const applyPreset = (groupIdx: number, name: string) => {
-    const e = pool.find((p) => (p.name ?? p.model) === name);
-    if (!e) return;
-    const [mk, ek, kk] = GROUPS[groupIdx].keys;
-    setCfg((c) => ({
-      ...c,
-      [mk]: e.model ?? "",
-      [ek]: e.endpoint ?? e.api_base ?? "",
-      [kk]: e.api_key ?? "",
-    }));
+  const patchEntry = (i: number, patch: Partial<PoolEntry>) => {
+    setPool((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+    setPoolDirty(true);
   };
 
-  const save = async () => {
-    setError(""); setSaving(true);
+  const savePool = async () => {
+    setError(""); setPoolSaving(true);
     try {
-      const values: Record<string, string> = {};
-      GROUPS.forEach((g) => g.keys.forEach((k) => { values[k] = cfg[k] ?? ""; }));
-      await api("/api/config", { method: "PUT", body: JSON.stringify({ values }) });
-      onClose();
+      await api("/api/api-pool", { method: "PUT", body: JSON.stringify({ pool }) });
+      setPoolDirty(false);
+      await ctx.reload();
     } catch (e: any) { setError(e.message); }
-    setSaving(false);
+    setPoolSaving(false);
+  };
+
+  const testEntry = async (i: number) => {
+    const e = pool[i];
+    setTests((t) => ({ ...t, [i]: { loading: true } }));
+    try {
+      const r = await api<any>("/api/api-pool/test", {
+        method: "POST",
+        body: JSON.stringify({
+          model: e.model ?? "",
+          endpoint: e.endpoint ?? e.api_base ?? "",
+          api_key: e.api_key ?? "",
+        }),
+      });
+      setTests((t) => ({
+        ...t,
+        [i]: r.ok
+          ? { ok: true, msg: `${r.latency_s}s · ${r.reply || "(空回复)"}${r.tokens ? ` · ${r.tokens} tokens` : ""}` }
+          : { ok: false, msg: `${r.latency_s}s · ${r.error}` },
+      }));
+    } catch (e2: any) {
+      setTests((t) => ({ ...t, [i]: { ok: false, msg: e2.message } }));
+    }
   };
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-h-[84vh] overflow-y-auto border-white/10 bg-slate-900/90 backdrop-blur-xl sm:max-w-xl">
+      <DialogContent className="max-h-[86vh] overflow-y-auto border-white/10 bg-slate-900/90 backdrop-blur-xl sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings2 className="h-4 w-4 text-cyan-400" /> 模型设置
           </DialogTitle>
         </DialogHeader>
 
-        {GROUPS.map((g, gi) => {
-          const candidates = pool.filter((p) => !g.mmOnly || p.multimodal);
-          const [mk, ek, kk] = g.keys;
-          return (
-            <div key={gi} className="mb-4">
-              <div className="mb-2 text-xs font-semibold tracking-wider text-slate-400 uppercase">{g.title}</div>
-              {candidates.length > 0 && (
-                <div className="mb-2">
-                  <FieldLabel>预设（来自 api_pool.json）</FieldLabel>
-                  <Select onValueChange={(v) => v && applyPreset(gi, v)}>
-                    <SelectTrigger className="w-full border-white/10 bg-black/25 text-xs">
-                      <SelectValue placeholder="— 选择预设 —" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {candidates.map((p) => (
-                        <SelectItem key={p.name ?? p.model} value={(p.name ?? p.model)!} className="text-xs">
-                          {p.name ?? p.model}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-              <div className="mb-2">
-                <FieldLabel>Model</FieldLabel>
-                <Input className="border-white/10 bg-black/25" value={cfg[mk] ?? ""}
-                  onChange={(e) => setCfg({ ...cfg, [mk]: e.target.value })} />
-              </div>
-              <div className="mb-2">
-                <FieldLabel>Endpoint</FieldLabel>
-                <Input className="border-white/10 bg-black/25" value={cfg[ek] ?? ""}
-                  onChange={(e) => setCfg({ ...cfg, [ek]: e.target.value })} />
-              </div>
-              <div>
-                <FieldLabel>API Key</FieldLabel>
-                <Input type="password" className="border-white/10 bg-black/25" value={cfg[kk] ?? ""}
-                  onChange={(e) => setCfg({ ...cfg, [kk]: e.target.value })} />
-              </div>
+        <Tabs defaultValue="roles">
+          <TabsList className="bg-white/[0.05]">
+            <TabsTrigger value="roles" className="text-xs">角色指派</TabsTrigger>
+            <TabsTrigger value="pool" className="text-xs">API 池管理 ({pool.length})</TabsTrigger>
+          </TabsList>
+
+          {/* ── role → pool-entry assignment (selection only, no free input) ── */}
+          <TabsContent value="roles" className="pt-3">
+            <div className="mb-3 text-xs text-slate-500">
+              模型、Endpoint 和 API Key 只能在「API 池管理」中维护；这里只做角色指派，选择即时生效。
             </div>
-          );
-        })}
+            {(Object.keys(ROLES) as RoleKey[]).map((role) => {
+              const def = ROLES[role];
+              const [mk, ek] = def.keys;
+              return (
+                <div key={role} className="mb-3 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <RoleModelSelect role={role} className="min-w-[240px]" />
+                    <span className="text-xs text-slate-500">{def.hint}</span>
+                  </div>
+                  <div className="mt-2 font-mono text-[11px] text-slate-500">
+                    {ctx.cfg[mk] || "(未设置)"}{ctx.cfg[ek] ? ` @ ${ctx.cfg[ek]}` : ""}
+                  </div>
+                </div>
+              );
+            })}
+          </TabsContent>
+
+          {/* ── API pool manager: the ONLY place to edit credentials ── */}
+          <TabsContent value="pool" className="pt-3">
+            {pool.length === 0 && (
+              <div className="py-6 text-center text-sm text-slate-500">API 池为空 — 添加一个条目</div>
+            )}
+            {pool.map((e, i) => {
+              const t = tests[i];
+              return (
+                <div key={i} className="mb-3 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3">
+                  <div className="mb-2 grid grid-cols-2 gap-2">
+                    <div>
+                      <FieldLabel>名称</FieldLabel>
+                      <Input className={cn("h-8 text-xs", inputCls)} value={e.name ?? ""}
+                        onChange={(ev) => patchEntry(i, { name: ev.target.value })} />
+                    </div>
+                    <div>
+                      <FieldLabel>Model（litellm 格式）</FieldLabel>
+                      <Input className={cn("h-8 text-xs", inputCls)} value={e.model ?? ""}
+                        onChange={(ev) => patchEntry(i, { model: ev.target.value })} />
+                    </div>
+                    <div>
+                      <FieldLabel>Endpoint</FieldLabel>
+                      <Input className={cn("h-8 text-xs", inputCls)} value={e.endpoint ?? e.api_base ?? ""}
+                        onChange={(ev) => patchEntry(i, { endpoint: ev.target.value, api_base: undefined })} />
+                    </div>
+                    <div>
+                      <FieldLabel>API Key</FieldLabel>
+                      <Input type="password" className={cn("h-8 text-xs", inputCls)} value={e.api_key ?? ""}
+                        onChange={(ev) => patchEntry(i, { api_key: ev.target.value })} />
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-300">
+                      <Checkbox checked={!!e.multimodal}
+                        onCheckedChange={(v) => patchEntry(i, { multimodal: v === true })} />
+                      多模态（可做视觉分析）
+                    </label>
+                    <div className="ml-auto flex items-center gap-2">
+                      <Button variant="outline" size="sm"
+                        className="h-7 gap-1.5 border-cyan-500/25 bg-cyan-500/[0.06] text-xs text-cyan-300 hover:bg-cyan-500/15"
+                        disabled={t?.loading} onClick={() => testEntry(i)}>
+                        {t?.loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <FlaskConical className="h-3 w-3" />}
+                        测试
+                      </Button>
+                      <Button variant="outline" size="sm"
+                        className="h-7 gap-1 border-red-500/25 bg-red-500/[0.06] text-xs text-red-400 hover:bg-red-500/15"
+                        onClick={() => { setPool((ps) => ps.filter((_, j) => j !== i)); setPoolDirty(true); }}>
+                        <Trash2 className="h-3 w-3" /> 删除
+                      </Button>
+                    </div>
+                  </div>
+                  {t && !t.loading && (
+                    <div className={cn(
+                      "mt-2 flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-xs",
+                      t.ok ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400",
+                    )}>
+                      {t.ok ? <CircleCheck className="mt-px h-3.5 w-3.5 shrink-0" /> : <CircleX className="mt-px h-3.5 w-3.5 shrink-0" />}
+                      <span className="break-all">{t.msg}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" className="h-8 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+                onClick={() => { setPool((ps) => [...ps, { name: "", model: "", endpoint: "", api_key: "", multimodal: false }]); setPoolDirty(true); }}>
+                <Plus className="h-3.5 w-3.5" /> 新增条目
+              </Button>
+              <Button size="sm" className="ml-auto h-8 gap-1.5 text-xs" onClick={savePool}
+                disabled={poolSaving || !poolDirty}>
+                {poolSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                保存 API 池{poolDirty ? "（有未保存修改）" : ""}
+              </Button>
+            </div>
+            {poolDirty && (
+              <div className="mt-2 text-xs text-amber-400/90">修改仅在点击「保存 API 池」后写入 src/api_pool.json。</div>
+            )}
+          </TabsContent>
+        </Tabs>
 
         {error && (
           <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</div>
         )}
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button onClick={save} disabled={saving}>
-            {saving && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}保存
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
