@@ -1926,6 +1926,38 @@ class ParallelShotOrchestrator:
         # different-source shots run in parallel (independent timelines).
         self.scene_source_map = _build_scene_source_map(video_scene_path)
 
+    def _source_capacity(self) -> dict:
+        """source video → total scene-covered seconds (the raw supply an agent
+        can pick from). Built from the merged scene time_ranges."""
+        caps: dict = {}
+        import glob as _g
+
+        def _ts(v) -> float:
+            try:
+                s = str(v).strip()
+                if ":" in s:
+                    parts = [float(x) for x in s.split(":")]
+                    return sum(p * m for p, m in zip(reversed(parts), [1, 60, 3600]))
+                return float(s)
+            except (TypeError, ValueError):
+                return 0.0
+
+        for f in _g.glob(os.path.join(self.video_scene_path or "", "scene_*.json")):
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                m = re.search(r"scene_(\d+)\.json$", os.path.basename(f))
+                if not m:
+                    continue
+                src = self.scene_source_map.get(int(m.group(1)), "")
+                tr = d.get("time_range") or {}
+                s, e = _ts(tr.get("start_seconds")), _ts(tr.get("end_seconds"))
+                if src and e > s:
+                    caps[src] = caps.get(src, 0.0) + (e - s)
+            except Exception:
+                continue
+        return caps
+
     def _shot_source(self, shot) -> str:
         """Best-guess source video for a shot, from its recommended scene(s).
         Shots whose source is unknown fall back to the primary video path."""
@@ -2305,6 +2337,57 @@ class ParallelShotOrchestrator:
                     f"pending={len(pending)} rerun_count={rerun_count}/{self.max_reruns}"
                 )
 
+                # ── Capacity guard (root cause of "last shot inherits scraps") ──
+                # The Screenwriter assigns scenes by CONTENT alone; nothing
+                # upstream checks whether a source video is long enough for all
+                # the shots sent to it (e.g. three ~5s shots + spacing on a 19s
+                # clip). The last shot of an over-subscribed group would face a
+                # picked-over source and fail. Rebalance BEFORE dispatch: move
+                # surplus shots to the source with the most free footage.
+                _gap = float(getattr(config, 'SHOT_MIN_GAP_SEC', 0.0) or 0.0)
+                _caps = self._source_capacity()
+                _taken: dict = {}
+                for _r in combined_keep_ranges:
+                    _r_src, _r_s, _r_e = _norm_range(_r)
+                    _k = _r_src or (self.video_path or "")
+                    _taken[_k] = _taken.get(_k, 0.0) + max(0.0, (_r_e or 0.0) - (_r_s or 0.0)) + _gap
+                _src_scenes: dict = {}
+                for _sc_idx, _sc_src in self.scene_source_map.items():
+                    _src_scenes.setdefault(_sc_src, []).append(_sc_idx)
+
+                def _demand(items):
+                    d = sum(float(sh.get('time_duration') or 0.0) for _, sh in items)
+                    return d + _gap * max(0, len(items) - 1)
+
+                for _ in range(len(pending)):
+                    _groups: dict = {}
+                    for _key, _shot in pending.items():
+                        _groups.setdefault(self._shot_source(_shot), []).append((_key, _shot))
+                    _free = {s: _caps.get(s, 0.0) - _taken.get(s, 0.0) - _demand(g)
+                             for s, g in _groups.items()}
+                    for s, cap in _caps.items():   # idle sources = spare capacity
+                        _free.setdefault(s, cap - _taken.get(s, 0.0))
+                    _worst = min((s for s in _groups), key=lambda s: _free[s])
+                    if _free[_worst] >= 0 or len(_groups[_worst]) <= 1:
+                        break   # nothing over-subscribed (or nothing movable)
+                    _targets = [s for s in _free if s != _worst and _src_scenes.get(s)]
+                    if not _targets:
+                        break
+                    _best = max(_targets, key=lambda s: _free[s])
+                    # move the smallest slot — easiest to place elsewhere
+                    _key, _shot = min(_groups[_worst],
+                                      key=lambda it: float(it[1].get('time_duration') or 0.0))
+                    _need = float(_shot.get('time_duration') or 0.0) + _gap
+                    if _free[_best] - _need < 0:
+                        print(f"⚖️  [Capacity] {os.path.basename(_worst)} over-subscribed by "
+                              f"{-_free[_worst]:.1f}s but no source has room — material is scarce, "
+                              f"proceeding as planned")
+                        break
+                    _shot['related_scene'] = sorted(_src_scenes[_best])[0]
+                    print(f"⚖️  [Capacity] Shot{_key[1] + 1} ({_need - _gap:.1f}s) reassigned: "
+                          f"{os.path.basename(_worst)} over-subscribed by {-_free[_worst]:.1f}s "
+                          f"→ {os.path.basename(_best)} (free {_free[_best]:.1f}s)", flush=True)
+
                 # Group pending shots by source video. Same-source shots go in
                 # one group and run sequentially (no collisions); different
                 # sources become separate groups that run in parallel.
@@ -2312,6 +2395,10 @@ class ParallelShotOrchestrator:
                 for (s_idx, shot_idx), shot in pending.items():
                     src = self._shot_source(shot)
                     source_groups.setdefault(src, []).append(((s_idx, shot_idx), shot))
+                # Largest slot picks FIRST within each source group: big shots
+                # need long continuous windows; small ones fit in the leftovers.
+                for _g_items in source_groups.values():
+                    _g_items.sort(key=lambda it: -float(it[1].get('time_duration') or 0.0))
                 _grp_summary = ", ".join(
                     f"{os.path.basename(src) or '?'}×{len(g)}" for src, g in source_groups.items()
                 )
