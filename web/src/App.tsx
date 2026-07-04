@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { api, useJob, type JobState } from "./api";
 import { ModelConfigProvider } from "./components/ModelConfig";
 import AgentFlow from "./components/AgentFlow";
+import FloatingTerminal from "./components/FloatingTerminal";
 import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
 import RenderView from "./views/RenderView";
@@ -170,6 +171,18 @@ export default function App() {
     if (!pipelineJobId) return;
     setPipelineStatus(pipelineJob.status === "idle" ? "running" : pipelineJob.status);
   }, [pipelineJob.status, pipelineJobId]);
+
+  // Pipeline view is per-project: clear it when switching projects
+  // (EditorView reattaches the new project's own latest run right after).
+  const lastProjectId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!project) return;
+    if (lastProjectId.current !== null && lastProjectId.current !== project.id) {
+      setPipelineJobId(null);
+      setPipelineStatus("idle");
+    }
+    lastProjectId.current = project.id;
+  }, [project?.id]);
 
   const loadProject = (p: any) => {
     skipSave.current = true;
@@ -337,6 +350,12 @@ export default function App() {
         </main>
 
         {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+
+      <FloatingTerminal
+        lines={pipelineJob.lines}
+        running={pipelineStatus === "running"}
+        visible={!!pipelineJobId || pipelineJob.lines.length > 0}
+      />
 
         <Dialog open={newModal} onOpenChange={(o) => !o && setNewModal(false)}>
           <DialogContent className="border-white/10 bg-slate-900/90 backdrop-blur-xl sm:max-w-md">

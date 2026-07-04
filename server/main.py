@@ -4,6 +4,7 @@ Run:  python server/main.py   (from project root, inside the cutclaw env)
 Serves the built React UI from web/dist at http://127.0.0.1:8765
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -13,6 +14,16 @@ import sys
 import threading
 import time
 import uuid
+
+# Force UTF-8 stdout/stderr so the server's own print() never crashes on non-GBK
+# characters (ø/é/中文 in paths, project names) on a Windows GBK console.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -98,6 +109,9 @@ def _reload_runtime_config():
 
 # ── Job registry (annotate / pipeline / render run as jobs) ────────────────
 
+JOBS_DIR = os.path.join(PROJECT_ROOT, "Output", "jobs")
+
+
 class Job:
     def __init__(self, kind: str):
         self.id = uuid.uuid4().hex[:12]
@@ -108,10 +122,32 @@ class Job:
         self.meta: dict = {}
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self._last_save = 0.0
 
     def add(self, line: str):
         with self.lock:
             self.lines.append(line)
+        self.save()
+
+    def save(self, force: bool = False):
+        """Persist a snapshot so job views survive backend restarts (throttled)."""
+        now = time.time()
+        if not force and now - self._last_save < 3.0:
+            return
+        self._last_save = now
+        try:
+            os.makedirs(JOBS_DIR, exist_ok=True)
+            with self.lock:
+                data = {
+                    "id": self.id, "kind": self.kind, "status": self.status,
+                    "returncode": self.returncode, "meta": self.meta,
+                    "lines": self.lines[-3000:], "saved_at": now,
+                }
+                payload = json.dumps(data, ensure_ascii=False)
+            with open(os.path.join(JOBS_DIR, f"{self.id}.json"), "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception:
+            pass
 
     def to_dict(self, since: int = 0):
         import copy
@@ -127,6 +163,50 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 PIPELINE_JOB_ID: str | None = None
+
+
+def _load_persisted_jobs():
+    """Restore job snapshots after a backend restart (views survive; keep last 12)."""
+    global PIPELINE_JOB_ID
+    if not os.path.isdir(JOBS_DIR):
+        return
+    files = []
+    for fn in os.listdir(JOBS_DIR):
+        if fn.endswith(".json"):
+            fp = os.path.join(JOBS_DIR, fn)
+            try:
+                files.append((os.path.getmtime(fp), fp))
+            except OSError:
+                pass
+    files.sort()
+    for _, fp in files[:-12]:   # prune old snapshots
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+    for _, fp in files[-12:]:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            job = Job(d.get("kind", "job"))
+            job.id = d.get("id") or job.id
+            job.lines = d.get("lines", [])
+            job.meta = d.get("meta", {})
+            job.returncode = d.get("returncode")
+            st = d.get("status", "done")
+            if st == "running":
+                st = "error"
+                job.lines.append(
+                    "[服务重启] 任务跟踪中断 — 子进程可能仍在后台完成并把结果写盘；重跑会走缓存跳过已完成部分。")
+            job.status = st
+            JOBS[job.id] = job
+            if job.kind == "pipeline":
+                PIPELINE_JOB_ID = job.id   # files sorted old→new, last wins
+        except Exception:
+            pass
+
+
+_load_persisted_jobs()
 
 
 def _reader_thread(job: Job, on_line=None):
@@ -149,6 +229,7 @@ def _reader_thread(job: Job, on_line=None):
                 _save_project(p)
             except Exception:
                 pass
+        job.save(force=True)
 
 
 def _spawn(job: Job, cmd: list[str], on_line=None):
@@ -199,16 +280,67 @@ def current_job_of_kind(kind: str):
     return {"job": None}
 
 
+@app.get("/api/jobs/{job_id}/traces")
+def get_job_traces(job_id: str):
+    """ALL unit traces, slimmed for the canvas (one poll instead of N).
+
+    Heavy fields (args/reply) are stripped to flags + snippets; the canvas
+    fetches full detail for a single unit via /trace when a node expands.
+    """
+    import copy
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    out: dict = {}
+    with job.lock:
+        for task, units in (job.meta.get("traces", {}) or {}).items():
+            tu: dict = {}
+            for idx, steps in units.items():
+                slim = []
+                for s in steps:
+                    t = {k: s.get(k) for k in ("phase", "iter", "max_iter", "elapsed", "tool", "verdict", "note") if s.get(k) is not None}
+                    r = s.get("result")
+                    if r:
+                        t["result"] = str(r)[:160]
+                    if s.get("args"):
+                        t["has_args"] = True
+                    if s.get("reply"):
+                        t["has_reply"] = True
+                    slim.append(t)
+                tu[idx] = slim
+            out[task] = tu
+        out = copy.deepcopy(out)
+    return {"traces": out}
+
+
 @app.get("/api/jobs/{job_id}/trace")
 def get_job_trace(job_id: str, task: str, idx: int):
-    """Full agent step trace for one work unit (model replies, tool args)."""
+    """Full agent step trace for one work unit (model replies, tool args).
+
+    Checkpoint-skipped units have no steps in the current run — fall back to
+    the most recent earlier job that traced the same unit.
+    """
     import copy
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     with job.lock:
         steps = copy.deepcopy(job.meta.get("traces", {}).get(task, {}).get(str(idx), []))
-    return {"steps": steps}
+    if steps:
+        return {"steps": steps, "from_previous_run": False}
+
+    cur_sp = job.meta.get("shot_point")
+    for other in reversed(list(JOBS.values())):
+        if other.id == job_id or other.kind != job.kind:
+            continue
+        # same pipeline result target (when known) — avoids cross-project mixups
+        if cur_sp and other.meta.get("shot_point") and other.meta.get("shot_point") != cur_sp:
+            continue
+        with other.lock:
+            s2 = copy.deepcopy(other.meta.get("traces", {}).get(task, {}).get(str(idx), []))
+        if s2:
+            return {"steps": s2, "from_previous_run": True}
+    return {"steps": [], "from_previous_run": False}
 
 
 # ── Config endpoints ────────────────────────────────────────────────────────
@@ -477,7 +609,7 @@ def annotate(body: AnnotateRequest):
         _reload_runtime_config()
         # feed fine-grained segment events (e.g. audio captioning) into this job
         from src.utils import progress as _progress
-        _progress.HOOK = lambda ev: _apply_progress_ev(job, ev)
+        _progress.HOOK = lambda ev: (_apply_progress_ev(job, ev), job.save())
         try:
             from src.asset_manager.annotator import batch_annotate, annotate_asset
             from src.asset_manager.index_store import upsert_annotations
@@ -512,6 +644,7 @@ def annotate(body: AnnotateRequest):
             job.status = "error"
         finally:
             _progress.HOOK = None
+            job.save(force=True)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job.id}
@@ -604,6 +737,8 @@ def auto_select(body: SelectRequest):
             import traceback
             job.add(f"ERROR: {e}\n{traceback.format_exc()[-600:]}")
             job.status = "error"
+        finally:
+            job.save(force=True)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job.id}
@@ -1008,7 +1143,7 @@ def _apply_progress_ev(job: Job, ev: dict):
             # detailed agent iteration step — stored in traces, fetched on demand
             traces = job.meta.setdefault("traces", {}).setdefault(name, {})
             lst = traces.setdefault(str(idx), [])
-            lst.append({k: ev[k] for k in ("phase", "iter", "max_iter", "elapsed", "tool", "args", "reply") if k in ev})
+            lst.append({k: ev[k] for k in ("phase", "iter", "max_iter", "elapsed", "tool", "args", "reply", "verdict", "result", "note") if k in ev})
             if len(lst) > 80:
                 del lst[:len(lst) - 80]
             t.setdefault("iters", {})[str(idx)] = f"{ev.get('iter', '?')}/{ev.get('max_iter', '?')}"
@@ -1039,6 +1174,7 @@ def _parse_progress_line(job: Job, line: str):
     except Exception:
         return
     _apply_progress_ev(job, ev)
+    job.save()
 
 
 def _on_pipeline_line(job: Job, line: str):
@@ -1046,14 +1182,21 @@ def _on_pipeline_line(job: Job, line: str):
     _parse_progress_line(job, line)
 
 
-def _derive_shot_point_path(video_path: str, audio_path: str, instruction: str) -> str:
+def _derive_shot_point_path(video_paths: list, audio_path: str, instruction: str) -> str:
+    """Mirror local_run.py exactly: project dir = {primary_hash[:12]}_{audio_id}."""
     import src.config as config
-    video_id = os.path.splitext(os.path.basename(video_path))[0].replace('.', '_').replace(' ', '_')
-    audio_id = os.path.splitext(os.path.basename(audio_path))[0].replace('.', '_').replace(' ', '_')
+    audio_id = os.path.splitext(os.path.basename(audio_path))[0].replace('.', '_').replace(' ', '_') if audio_path else "no_audio"
     ih = hashlib.md5(instruction.encode("utf-8")).hexdigest()[:8]
-    safe = re.sub(r'[^\w\s-]', '', instruction)[:50].strip().replace(' ', '_')
-    iid = f"{safe}_{ih}" if safe else f"instruction_{ih}"
-    return os.path.join(config.VIDEO_DATABASE_FOLDER, 'Output', f"{video_id}_{audio_id}", f"shot_point_{iid}.json")
+    # Hash-only id (must match local_run.py exactly): always ASCII, no sanitizing.
+    iid = f"instruction_{ih}"
+    primary_hash = ""
+    try:
+        from src.asset_manager.scanner import compute_content_hash
+        primary_hash = compute_content_hash(_resolve(video_paths[0]))[:12]
+    except Exception:
+        pass
+    proj = f"{primary_hash or 'unknown'}_{audio_id}"
+    return os.path.join(config.VIDEO_DATABASE_FOLDER, 'Output', proj, f"shot_point_{iid}.json")
 
 
 class PipelineRequest(BaseModel):
@@ -1092,7 +1235,10 @@ def pipeline_start(body: PipelineRequest):
     video_type = "film" if body.has_dialogue else "vlog"
     min_d = max(5.0, body.target_length - 5.0)
     max_d = body.target_length + 5.0
-    min_s, max_s = _shot_bounds(body.shot_length)
+    # Shot length is no longer a user setting — pacing is decided automatically
+    # from the music's energy (self-calibrating). AUDIO_MIN/MAX_SEGMENT_DURATION
+    # stay at their config defaults (the perceptual fast/slow bounds) and are NOT
+    # overridden here.
 
     # persist UI choices like the Streamlit app does
     save_config("VIDEO_PATH", "||".join(videos))
@@ -1100,8 +1246,6 @@ def pipeline_start(body: PipelineRequest):
     save_config("INSTRUCTION", body.instruction)
     save_config("AUDIO_SEGMENT_MIN_DURATION_SEC", str(min_d))
     save_config("AUDIO_SEGMENT_MAX_DURATION_SEC", str(max_d))
-    save_config("AUDIO_MIN_SEGMENT_DURATION", str(min_s))
-    save_config("AUDIO_MAX_SEGMENT_DURATION", str(max_s))
 
     cmd = [
         sys.executable, "local_run.py",
@@ -1111,8 +1255,6 @@ def pipeline_start(body: PipelineRequest):
         "--type", video_type, "--instruction_type", "object",
         "--config.AUDIO_SEGMENT_MIN_DURATION_SEC", str(min_d),
         "--config.AUDIO_SEGMENT_MAX_DURATION_SEC", str(max_d),
-        "--config.AUDIO_MIN_SEGMENT_DURATION", str(min_s),
-        "--config.AUDIO_MAX_SEGMENT_DURATION", str(max_s),
     ]
     for key in ("VIDEO_ANALYSIS_MODEL", "VIDEO_ANALYSIS_ENDPOINT", "VIDEO_ANALYSIS_API_KEY",
                 "AUDIO_LITELLM_MODEL", "AUDIO_LITELLM_BASE_URL", "AUDIO_LITELLM_API_KEY",
@@ -1125,9 +1267,10 @@ def pipeline_start(body: PipelineRequest):
     if body.srt_path.strip():
         cmd += ["--SRT_Path", _resolve(body.srt_path.strip())]
 
-    from src.utils.video_concat import plan_effective_video_path
-    effective = plan_effective_video_path([_resolve(v) for v in videos])
-    shot_point = _derive_shot_point_path(effective, body.audio_path, body.instruction)
+    # "effective video" for downstream use = the primary (first) REAL video;
+    # multi-source projects never pre-merge, so a planned merged path is a lie
+    effective = _resolve(videos[0])
+    shot_point = _derive_shot_point_path(videos, body.audio_path, body.instruction)
 
     job = Job("pipeline")
     job.meta.update({
@@ -1159,6 +1302,61 @@ def pipeline_start(body: PipelineRequest):
     return {"job_id": job.id, "shot_point": shot_point, "effective_video": effective}
 
 
+class RetryShotRequest(BaseModel):
+    project_id: str
+    section_idx: int
+    shot_idx: int
+
+
+def _remove_shot_from_point(shot_point_path: str, section_idx: int, shot_idx: int) -> bool:
+    """Drop one shot's committed pick so the next run re-selects it. True if removed."""
+    if not shot_point_path or not os.path.exists(shot_point_path):
+        return False
+    try:
+        with open(shot_point_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, list):
+        return False
+    kept = [r for r in data if not (
+        isinstance(r, dict)
+        and r.get("section_idx") == section_idx
+        and r.get("shot_idx") == shot_idx
+    )]
+    if len(kept) == len(data):
+        return False
+    with open(shot_point_path, "w", encoding="utf-8") as f:
+        json.dump(kept, f, ensure_ascii=False, indent=2)
+    return True
+
+
+@app.post("/api/pipeline/retry_shot")
+def retry_shot(body: RetryShotRequest):
+    """Re-generate a single shot: drop its committed pick from shot_point, then
+    relaunch the pipeline with the project's saved params. Analysis + shot plan
+    are cached, so the run resumes and only the dropped shot is re-selected. For
+    a shot that FAILED (never committed) this is just a resume — nothing to drop."""
+    if PIPELINE_JOB_ID and JOBS.get(PIPELINE_JOB_ID) and JOBS[PIPELINE_JOB_ID].status == "running":
+        raise HTTPException(409, "流水线正在运行，请先停止再重试单个镜头。")
+    p = _load_project(body.project_id)
+    removed = _remove_shot_from_point(p.get("shot_point", ""), body.section_idx, body.shot_idx)
+    preq = PipelineRequest(
+        video_paths=p.get("videos", []) or [],
+        audio_path=p.get("audio", "") or "",
+        instruction=p.get("instruction", "") or "",
+        has_dialogue=bool(p.get("has_dialogue", False)),
+        main_character=p.get("main_character", "") or "",
+        srt_path=p.get("srt", "") or "",
+        target_length=float(p.get("target_length", 30.0) or 30.0),
+        shot_length=float(p.get("shot_length", 4.0) or 4.0),
+        project_id=body.project_id,
+    )
+    result = pipeline_start(preq)
+    return {**result, "removed": removed,
+            "section_idx": body.section_idx, "shot_idx": body.shot_idx}
+
+
 @app.post("/api/pipeline/stop")
 def pipeline_stop():
     job = JOBS.get(PIPELINE_JOB_ID or "")
@@ -1169,7 +1367,13 @@ def pipeline_stop():
 
 
 @app.get("/api/pipeline/current")
-def pipeline_current(since: int = 0):
+def pipeline_current(since: int = 0, project_id: str = ""):
+    if project_id:
+        # latest pipeline job belonging to THIS project (running or finished)
+        for job in reversed(list(JOBS.values())):
+            if job.kind == "pipeline" and job.meta.get("project_id") == project_id:
+                return {"job": job.to_dict(since)}
+        return {"job": None}
     job = JOBS.get(PIPELINE_JOB_ID or "")
     if not job:
         return {"job": None}
@@ -1208,6 +1412,7 @@ class RenderRequest(BaseModel):
     ratio: str = "9:16"
     add_ending: bool = False
     has_dialogue: bool = False
+    transition: float = 0.0   # crossfade seconds between clips (0 = hard cuts)
 
 
 @app.post("/api/render")
@@ -1216,17 +1421,46 @@ def render(body: RenderRequest):
     abs_plan = abs_point.replace("shot_point_", "shot_plan_")
     if not os.path.exists(abs_point):
         raise HTTPException(400, f"shot_point not found: {abs_point}")
-    out = os.path.join(os.path.dirname(abs_point), f"output_{body.ratio.replace(':', 'x')}.mp4")
+    # Isolate the render per shot_point (≈ per project/instruction). The project
+    # DIR is keyed only by primary-video-hash + audio, so different instructions
+    # share it; without a per-instruction tag every project overwrote the same
+    # output_{ratio}.mp4 and saw each other's renders. Tag = hash of shot_point name.
+    _sp_tag = hashlib.md5(os.path.basename(abs_point).encode("utf-8")).hexdigest()[:8]
+    out = os.path.join(os.path.dirname(abs_point), f"output_{body.ratio.replace(':', 'x')}_{_sp_tag}.mp4")
     ending = os.path.join(PROJECT_ROOT, "resource", "ending", "ending.mp4")
     font = os.path.join(PROJECT_ROOT, "resource", "font", "Pulp Fiction Italic M54.ttf")
+
+    # --video is only a fallback in multi-source mode (clips carry their own
+    # video_path). Never pass a non-existent path (e.g. a planned-but-never-
+    # created merged file) — resolve a real source from the shot_point instead.
+    vid = _resolve(body.video_path)
+    if not vid or not os.path.exists(vid):
+        try:
+            with open(abs_point, "r", encoding="utf-8") as f:
+                _data = json.load(f)
+            for _r in (_data if isinstance(_data, list) else []):
+                for _c in ([_r] + (_r.get("clips") or [])):
+                    vp = _c.get("video_path") or ""
+                    if vp and os.path.exists(vp):
+                        vid = vp
+                        break
+                if vid and os.path.exists(vid):
+                    break
+        except Exception:
+            pass
+    if not vid or not os.path.exists(vid):
+        raise HTTPException(400, "找不到任何存在的源视频（项目视频与 shot_point 中的 clip 路径均无效）")
+
     cmd = [
         sys.executable, "render/render_video.py",
         "--shot-plan", abs_plan, "--shot-json", abs_point,
-        "--video", _resolve(body.video_path), "--audio", _resolve(body.audio_path),
+        "--video", vid, "--audio", _resolve(body.audio_path),
         "--output", out, "--crop-ratio", body.ratio, "--no-labels",
     ]
     if body.has_dialogue:
         cmd += ["--render-hook-dialogue"]
+    if body.transition and body.transition > 0:
+        cmd += ["--transition", str(body.transition)]
     if body.add_ending and os.path.exists(ending):
         cmd += ["--ending-video", ending]
     if os.path.exists(font):
@@ -1240,13 +1474,137 @@ def render(body: RenderRequest):
     return {"job_id": job.id, "output": out}
 
 
+def _ts_to_sec(v) -> float:
+    """Accept '00:00:13.2' | '13.2' | 13.2 → seconds."""
+    if v is None:
+        return float("nan")
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    try:
+        if ":" in s:
+            parts = [float(x) for x in s.split(":")]
+            mult = [1, 60, 3600]
+            return sum(p * m for p, m in zip(reversed(parts), mult))
+        return float(s)
+    except (ValueError, TypeError):
+        return float("nan")
+
+
+@app.get("/api/render/clip_map")
+def render_clip_map(shot_point: str):
+    """Map the finished-video timeline → each source clip + the AI description
+    that drove its selection. Joins shot_point.json (coordinates the renderer
+    actually uses) with shot_plan.json (Screenwriter's per-shot intent)."""
+    abs_point = _resolve(shot_point)
+    if not os.path.exists(abs_point):
+        return {"clips": [], "total": 0.0, "error": "shot_point not found"}
+    try:
+        entries = json.load(open(abs_point, encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {"clips": [], "total": 0.0, "error": f"parse: {e}"}
+    if not isinstance(entries, list):
+        entries = entries.get("shots") or entries.get("clips") or []
+
+    # sibling shot_plan.json (same instruction id) → descriptions
+    plan_path = abs_point.replace("shot_point_", "shot_plan_")
+    plan_shots = {}  # (section_idx, shot_idx) -> desc dict
+    try:
+        plan = json.load(open(plan_path, encoding="utf-8"))
+        for si, sec in enumerate(plan.get("video_structure", []) or []):
+            for shi, shot in enumerate((sec.get("shot_plan") or {}).get("shots", []) or []):
+                plan_shots[(si, shi)] = shot
+    except Exception:  # noqa: BLE001
+        pass
+
+    # basename → dense_segments (what the VLM actually saw, from the analysis cache).
+    # This is the ground truth the editor selected against; comparing it to the
+    # Screenwriter's intent shows whether a clip's pick actually matches its slot.
+    dense_by_video: dict = {}
+    analyzed_root = os.path.join(PROJECT_ROOT, "Output", "analyzed")
+    for md in glob.glob(os.path.join(analyzed_root, "*", "metadata.json")):
+        try:
+            meta = json.load(open(md, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        name = meta.get("file_name")
+        if not name:
+            continue
+        ck = os.path.join(os.path.dirname(md), "captions", "ckpt")
+        if not os.path.isdir(ck):
+            continue
+        segs: dict = {}  # (s,e) -> content, dedup across ckpt files
+        for f in os.listdir(ck):
+            if not f.endswith(".json"):
+                continue
+            try:
+                dd = json.load(open(os.path.join(ck, f), encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            for sg in dd.get("dense_segments") or []:
+                s, e = sg.get("start_sec_abs"), sg.get("end_sec_abs")
+                if s is None or e is None:
+                    continue
+                segs[(round(float(s), 1), round(float(e), 1))] = sg.get("content_description", "")
+        if segs:
+            dense_by_video[name] = sorted(
+                ([s, e, txt] for (s, e), txt in segs.items()), key=lambda x: x[0])
+
+    def _analysis_at(video_name: str, a: float, b: float) -> str:
+        """VLM descriptions of segments overlapping [a,b] in the source video."""
+        segs = dense_by_video.get(video_name)
+        if not segs or a != a or b != b:  # NaN guard
+            return ""
+        parts = []
+        for s, e, txt in segs:
+            if e > a and s < b and txt:  # overlap
+                parts.append(f"[{s:g}-{e:g}s] {txt}")
+        return "  ".join(parts)
+
+    out, cursor = [], 0.0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        sec_i = e.get("section_idx", 0)
+        shot_i = e.get("shot_idx", 0)
+        desc = plan_shots.get((sec_i, shot_i), {})
+        for c in e.get("clips", []) or []:
+            src_s = _ts_to_sec(c.get("start"))
+            src_e = _ts_to_sec(c.get("end"))
+            dur = c.get("duration")
+            dur = float(dur) if isinstance(dur, (int, float)) else (src_e - src_s)
+            if not (dur > 0):
+                continue
+            out.append({
+                "out_start": round(cursor, 2),
+                "out_end": round(cursor + dur, 2),
+                "duration": round(dur, 2),
+                "video": os.path.basename(str(c.get("video_path") or e.get("video_path") or "")),
+                "src_start": round(src_s, 2) if src_s == src_s else None,
+                "src_end": round(src_e, 2) if src_e == src_e else None,
+                "section_idx": sec_i,
+                "shot_idx": shot_i,
+                "content": desc.get("content", ""),
+                "visuals": desc.get("visuals", ""),
+                "emotion": desc.get("emotion", ""),
+                "visual_beat": desc.get("visual_beat", ""),
+                # ground truth: what the VLM actually saw at this source range
+                "analysis": _analysis_at(
+                    os.path.basename(str(c.get("video_path") or e.get("video_path") or "")),
+                    src_s, src_e),
+            })
+            cursor += dur
+    return {"clips": out, "total": round(cursor, 2)}
+
+
 @app.get("/api/render/outputs")
 def render_outputs(shot_point: str):
     abs_point = _resolve(shot_point)
     d = os.path.dirname(abs_point)
+    _sp_tag = hashlib.md5(os.path.basename(abs_point).encode("utf-8")).hexdigest()[:8]
     out = []
     for ratio in ("9:16", "16:9", "1:1"):
-        p = os.path.join(d, f"output_{ratio.replace(':', 'x')}.mp4")
+        p = os.path.join(d, f"output_{ratio.replace(':', 'x')}_{_sp_tag}.mp4")
         if os.path.exists(p):
             out.append({"ratio": ratio, "path": p, "size_mb": round(os.path.getsize(p) / 1e6, 1),
                         "mtime": os.path.getmtime(p)})

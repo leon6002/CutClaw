@@ -1088,6 +1088,40 @@ def caption_audio_with_madmom_segments(
     # Collect all sub-segments to process in batches
     all_subsegments = []  # List of (section_idx, subseg_idx, start, end)
 
+    # ── Energy-adaptive pacing (self-calibrating, no user knob) ──────────────
+    # Each section's cut density follows its musical energy RELATIVE to this
+    # track: the most energetic section cuts fastest (→ AUDIO_MIN_SEGMENT_DURATION),
+    # the calmest holds longest (→ AUDIO_MAX_SEGMENT_DURATION), the rest scale in
+    # between. Relative ranking means the mapping recalibrates for every song, so
+    # there is nothing to configure — the AI paces it like an editor would.
+    _MIN_CUT = max(0.3, float(min_segment_duration))
+    _MAX_HOLD = max(_MIN_CUT + 0.5, float(max_segment_duration))
+    _sec_energy = []
+    for _s1 in stage1_sections:
+        _ss = mmss_to_seconds(_s1.get("Start_Time", "00:00"))
+        _se = mmss_to_seconds(_s1.get("End_Time", "00:00"))
+        _kin = [kp.get('normalized_intensity', kp.get('intensity', 0))
+                for kp in keypoints if _ss < kp['time'] < _se]
+        _sec_energy.append(sum(_kin) / len(_kin) if _kin else 0.0)
+    _e_lo = min(_sec_energy) if _sec_energy else 0.0
+    _e_hi = max(_sec_energy) if _sec_energy else 0.0
+    _e_spread = _e_hi - _e_lo
+    # Only stretch pacing to the full fast↔slow range when the track genuinely has
+    # dynamic contrast. A near-uniform song must NOT manufacture extreme swings
+    # from tiny energy noise — damp the contrast toward a neutral mid pace when the
+    # energy spread is small. (~0.15 of normalized intensity = "clearly dynamic".)
+    _pace_conf = min(1.0, _e_spread / 0.15) if _e_spread > 0 else 0.0
+
+    def _section_target(idx: int) -> float:
+        """Target shot length for a section from its energy relative to the track."""
+        e = _sec_energy[idx] if idx < len(_sec_energy) else 0.0
+        raw = (e - _e_lo) / _e_spread if _e_spread > 0 else 0.5       # 0=calmest, 1=peak
+        rel = 0.5 + (raw - 0.5) * _pace_conf                         # damp on flat tracks
+        return _MAX_HOLD - rel * (_MAX_HOLD - _MIN_CUT)              # peak → short, calm → long
+
+    print(f"\n🎚️  [Pacing] Energy-adaptive shot length {_MIN_CUT:.1f}s (peak) … "
+          f"{_MAX_HOLD:.1f}s (calm) — self-calibrated to this track")
+
     for section_idx, stage1_sec in enumerate(stage1_sections):
         # Parse section times
         sec_start = mmss_to_seconds(stage1_sec.get("Start_Time", "00:00"))
@@ -1121,7 +1155,15 @@ def caption_audio_with_madmom_segments(
         # 2. If any resulting interval still exceeds max_segment_duration (no keypoint
         #    was available to split it), insert evenly-spaced midpoints to cap the length.
 
-        # Step 1: greedy keypoint selection
+        # Energy-adaptive target for THIS section: high-energy sections cut fast,
+        # calm sections hold long (instead of one global fixed shot length).
+        sec_target = _section_target(section_idx)
+        sec_min = max(_MIN_CUT, sec_target)
+        sec_max = min(_MAX_HOLD, sec_target * 1.4)
+        print(f"  🎚️  energy={_sec_energy[section_idx]:.2f} → target ≈ {sec_target:.1f}s "
+              f"(cuts {sec_min:.1f}–{sec_max:.1f}s)")
+
+        # Step 1: greedy keypoint selection (min gap = this section's target)
         section_all_kps = sorted(
             [kp for kp in keypoints if sec_start < kp['time'] < sec_end],
             key=lambda x: x.get('normalized_intensity', x.get('intensity', 0)),
@@ -1130,16 +1172,16 @@ def caption_audio_with_madmom_segments(
         accepted = [sec_start, sec_end]
         for kp in section_all_kps:
             t = kp['time']
-            if all(abs(t - a) >= min_segment_duration for a in accepted):
+            if all(abs(t - a) >= sec_min for a in accepted):
                 accepted.append(t)
         accepted.sort()
 
-        # Step 2: insert midpoints for intervals that still exceed max_segment_duration
+        # Step 2: insert midpoints for intervals that exceed this section's max
         boundaries = [accepted[0]]
         for t in accepted[1:]:
             gap = t - boundaries[-1]
-            if max_segment_duration > 0 and gap > max_segment_duration:
-                n = int(np.ceil(gap / max_segment_duration))
+            if sec_max > 0 and gap > sec_max:
+                n = int(np.ceil(gap / sec_max))
                 step = gap / n
                 for j in range(1, n):
                     boundaries.append(boundaries[-1] + step)

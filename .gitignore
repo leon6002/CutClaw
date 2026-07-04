@@ -44,9 +44,11 @@ asset/demo_compressed
 ProVideo
 CLAUDE.md
 
-/resource/imports/
+/resource/
 /tools/
 # Web UI
 web/node_modules/
 web/dist/
-/resource/
+# runtime job snapshots
+Output/jobs/
+Output/

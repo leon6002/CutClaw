@@ -156,7 +156,7 @@ class SceneVideoAnalyzer:
 
         return content
 
-    async def generate_caption(self, frames: List[Image.Image], dialogue: str, known_chars: str, max_retries: int = 5) -> Optional[Dict]:
+    async def generate_caption(self, frames: List[Image.Image], dialogue: str, known_chars: str, max_retries: int = 3) -> Optional[Dict]:
         """生成场景描述，验证必需字段"""
         # 根据配置选择 prompt
         base_prompt = VLOG_SCENE_CAPTION_PROMPT if config.SCENE_PROMPT_TYPE == "vlog" else SCENE_VIDEO_CAPTION_PROMPT
@@ -171,7 +171,9 @@ class SceneVideoAnalyzer:
             prompt = base_prompt.replace("{CHARACTERS}", char_text).replace("{DIALOGUE}", dialogue)
             content = self._build_content(frames, [f"Characters:\n{char_text}", f"\nDialogue:\n{dialogue}"])
 
-        timeouts = [80, 120, 120, 180, 180]
+        # Capped so a flaky endpoint fails fast (~6 min worst case) instead of the
+        # old ~11 min of retries that looked like the pipeline had frozen.
+        timeouts = [90, 120, 150]
         for attempt in range(max_retries):
             timeout = timeouts[min(attempt, len(timeouts) - 1)]
             result = await self._call_vlm(prompt, content, max_tokens=4096, timeout=timeout)

@@ -162,6 +162,14 @@ def _iter_clip_frames(
         return " ".join(parts).strip() or "No transcript."
 
     for shot_id, (start_frame, end_frame) in enumerate(long_shots):
+        # long_shots must be in sampled-frame space; a boundary can never exceed
+        # the number of frames we actually sampled. Legacy caches wrote some
+        # boundaries in SOURCE-frame units, which inflated shots to a phantom
+        # 30s+; clamp so the shot always maps onto real footage.
+        start_frame = max(0, min(int(start_frame), sampled_count))
+        end_frame = max(0, min(int(end_frame), sampled_count))
+        if end_frame <= start_frame:
+            continue
         shot_start_sec = start_frame / config.SHOT_DETECTION_FPS
         shot_end_sec = end_frame / config.SHOT_DETECTION_FPS
         shot_duration = shot_end_sec - shot_start_sec
@@ -414,10 +422,13 @@ def process_video(
     pbar = tqdm(total=0, desc="Captioning clips")
     loop = asyncio.new_event_loop()
     try:
-        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=30))
+        # First pass timeout bumped 30->90s: the VLM endpoint (proxied Gemini) is
+        # slow, and 30s made many clips "fail" only to succeed on retry — wasting a
+        # retry round and flooding the UI with red. 90s lets most pass first time.
+        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=90))
 
         # Retry failed clips (already have arrays in memory)
-        timeouts = [100, 100]
+        timeouts = [120, 120]
         for attempt, timeout in enumerate(timeouts):
             if not failed:
                 break

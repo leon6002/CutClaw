@@ -81,8 +81,30 @@ def get_missing_shot_plan_parts(output_data: dict) -> list[str]:
     return missing_parts
 
 
+# Call counter so the UI trace can number the Screenwriter's LLM calls
+_SW_CALLS = {"n": 0}
+
+
+def _sw_emit(**payload):
+    try:
+        from src.utils.progress import emit_progress
+        emit_progress("screenwriter_llm", 1, 0, "step", **payload)
+    except Exception:
+        pass
+
+
+def _sw_state(event: str):
+    try:
+        from src.utils.progress import emit_progress
+        emit_progress("screenwriter_llm", 1, 0, event)
+    except Exception:
+        pass
+
+
 def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
     """Call the agent LLM via litellm. Returns content string or None on failure."""
+    import time as _time
+
     kwargs = dict(
         model=config.AGENT_LITELLM_MODEL,
         messages=messages,
@@ -94,13 +116,61 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
     )
     if config.AGENT_LITELLM_URL:
         kwargs["api_base"] = config.AGENT_LITELLM_URL
+
+    _SW_CALLS["n"] += 1
+    _n = _SW_CALLS["n"]
+    _prompt_text = "\n\n".join(
+        f"[{m.get('role', '?')}]\n{m.get('content', '')}" for m in messages
+    )[:15000]
+    _sw_state("start")
+    _sw_emit(phase="calling", iter=_n, elapsed=0)
+    _t0 = _time.time()
+
+    # Transient SSL/network hiccups are common on large requests — retry with
+    # backoff instead of dying on the first failure (parity with the editor).
+    _max_retries = int(getattr(config, "AGENT_LLM_MAX_RETRIES", 3))
+    resp = None
+    for _attempt in range(1, _max_retries + 1):
+        try:
+            resp = litellm.completion(**kwargs)
+            break
+        except Exception as _e:
+            _msg = str(_e)[:300]
+            print(f"⚠️ [Screenwriter] LLM call failed (attempt {_attempt}/{_max_retries}): {_msg}", flush=True)
+            _sw_emit(
+                phase="result", tool="screenwriter", iter=_n,
+                elapsed=round(_time.time() - _t0),
+                verdict=("warn" if _attempt < _max_retries else "fail"),
+                result=f"第 {_attempt}/{_max_retries} 次调用失败：{_msg}",
+            )
+            if _attempt < _max_retries:
+                _time.sleep(min(2 ** _attempt, 15))
+
+    if resp is None:
+        _sw_emit(phase="action", tool="screenwriter", iter=_n,
+                 elapsed=round(_time.time() - _t0), args=_prompt_text, reply="")
+        _sw_state("fail")
+        return None
+
     try:
-        resp = litellm.completion(**kwargs)
         content = resp.choices[0].message.content
+        _reasoning = getattr(resp.choices[0].message, "reasoning_content", None) or ""
+
+        def _emit_ok(final_text: str | None):
+            _sw_emit(
+                phase="action", tool="screenwriter", iter=_n,
+                elapsed=round(_time.time() - _t0),
+                args=_prompt_text,
+                reply=(( _reasoning + "\n\n" if _reasoning else "") + (final_text or "(空回复)"))[:15000],
+            )
+            _sw_state("done")
+
         if content is None:
+            _emit_ok(None)
             return None
         if isinstance(content, str):
             content = content.strip()
+            _emit_ok(content)
             return content or None
         # Some providers may return structured content blocks.
         if isinstance(content, list):
@@ -111,9 +181,20 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
                 elif isinstance(item, str):
                     text_parts.append(item.strip())
             merged = "\n".join([p for p in text_parts if p]).strip()
+            _emit_ok(merged)
             return merged or None
-        return str(content).strip() or None
+        merged = str(content).strip()
+        _emit_ok(merged)
+        return merged or None
     except Exception as e:
+        _sw_emit(
+            phase="result", tool="screenwriter", iter=_n,
+            elapsed=round(_time.time() - _t0),
+            verdict="fail", result=f"LLM 调用失败：{str(e)[:600]}",
+        )
+        _sw_emit(phase="action", tool="screenwriter", iter=_n,
+                 elapsed=round(_time.time() - _t0), args=_prompt_text, reply="")
+        _sw_state("fail")
         return None
 
 

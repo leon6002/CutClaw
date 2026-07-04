@@ -115,7 +115,7 @@ def _call_audio_api_sync(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
-        timeout=300,
+        timeout=150,
         api_key=AUDIO_API_KEY,
         **({"api_base": AUDIO_BASE_URL} if AUDIO_BASE_URL else {}),
     )
@@ -235,7 +235,7 @@ async def acall_audio_api(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
-        timeout=300,
+        timeout=150,
         api_key=AUDIO_API_KEY,
         **({"api_base": AUDIO_BASE_URL} if AUDIO_BASE_URL else {}),
     )

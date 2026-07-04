@@ -16,6 +16,18 @@ import tempfile
 import textwrap
 
 
+# Force UTF-8 stdout/stderr so print() never crashes on non-GBK characters
+# (ø/é/中文/emoji in file paths) — the Windows console defaults to GBK, which
+# can't encode them and raises UnicodeEncodeError mid-render.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def _ensure_ffmpeg_on_path() -> None:
     """Make ffmpeg/ffprobe discoverable on Windows when not activated via conda.
 
@@ -488,6 +500,42 @@ def extract_all_clips(
     return all_clips
 
 
+def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, transition_duration):
+    """ffmpeg command to join the per-clip files into one video.
+
+    Default: hard-cut concat demuxer (stream copy) — unchanged behavior.
+    transition_duration > 0: crossfade (dissolve) between clips via chained xfade.
+    Note: xfade overlaps adjacent clips, so the total shortens by ~duration per cut
+    and cut points drift slightly off the beat. (Beat-exact transitions would need
+    each clip to grab an extra tail; kept out of v1 to avoid touching extraction.)
+    xfade emits video only — the BGM step maps 0:v:0 so that's fine for music-only.
+    """
+    T = float(transition_duration or 0.0)
+    if T > 0 and len(clip_files) > 1:
+        inputs = []
+        for cf in clip_files:
+            inputs += ['-i', cf]
+        parts = []
+        prev = '[0:v]'
+        cum = 0.0
+        n = len(clip_files)
+        for k in range(1, n):
+            cum += float(clips[k - 1].get('duration', 0) or 0)   # sum of intended durations d0..d(k-1)
+            offset = max(0.05, cum - k * T)                       # xfade start in the accumulated stream
+            out = '[vout]' if k == n - 1 else f'[vx{k}]'
+            parts.append(f"{prev}[{k}:v]xfade=transition=fade:duration={T}:offset={offset:.4f}{out}")
+            prev = out
+        return [
+            'ffmpeg', '-y', *inputs,
+            '-filter_complex', ";".join(parts),
+            '-map', '[vout]',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
+            '-r', str(video_fps), out_path,
+        ]
+    # default: fast hard-cut concat
+    return ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file, '-c', 'copy', out_path]
+
+
 def render_video_ffmpeg(
     video_path: str,
     clips: List[Dict[str, Any]],
@@ -518,7 +566,8 @@ def render_video_ffmpeg(
     auto_loudness_match: bool = True,
     target_lufs: float = -18.0,
     target_lra: float = 11.0,
-    target_tp: float = -1.5
+    target_tp: float = -1.5,
+    transition_duration: float = 0.0
 ) -> bool:
     """
     Render video clips using ffmpeg concat demuxer.
@@ -616,7 +665,13 @@ def render_video_ffmpeg(
             overlay_text = clip.get('overlay_text')
             subtitle_lines = clip.get('subtitle_lines') or []
 
-            ending_video_path = clip.get('video_path')
+            # Ending clips are identified by the explicit is_ending flag — NOT by
+            # having a video_path. In multi-source mode EVERY clip carries its own
+            # video_path; keying on it sent all clips down this branch, which has
+            # no -ss (always extracts from 0s). That silently replaced every clip
+            # with the first `duration` seconds of its source: "只取开头几秒" +
+            # identical duplicate clips whenever two picks shared a source.
+            ending_video_path = clip.get('video_path') if clip.get('is_ending') else None
             if ending_video_path:
                 # Transcode ending video to match main video format exactly.
                 # If crop_ratio is set, scale+pad to the cropped output size.
@@ -883,6 +938,12 @@ def render_video_ffmpeg(
                         '-i', source_video,
                         '-t', str(duration),
                         '-vf', video_filter,
+                        # Uniform fps is REQUIRED: clips are joined with the concat
+                        # demuxer in stream-copy mode, and mixed frame rates (e.g. a
+                        # 59.94fps source among 50fps ones) corrupt the timeline —
+                        # segments play at the wrong speed and the total duration
+                        # inflates. Every extraction branch must emit the same -r.
+                        '-r', str(video_fps),
                         '-c:v', 'libx264',  # Re-encode for consistent format
                         '-c:a', 'aac',
                         '-ar', str(audio_ar),
@@ -949,17 +1010,9 @@ def render_video_ffmpeg(
         print("Concatenating clips...")
 
         if audio_path and os.path.exists(audio_path):
-            # First concatenate video clips
+            # First join video clips (hard cut, or crossfade if transition_duration>0)
             temp_video = os.path.join(temp_dir, 'temp_video.mp4')
-            cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',
-                temp_video
-            ]
+            cmd = _build_video_join_cmd(concat_file, clip_files, clips, temp_video, video_fps, transition_duration)
 
             result = subprocess.run(
                 cmd,
@@ -1153,16 +1206,8 @@ def render_video_ffmpeg(
                     output_path
                 ]
         else:
-            # Just concatenate without additional audio
-            cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',
-                output_path
-            ]
+            # Just join clips without additional audio (hard cut or crossfade)
+            cmd = _build_video_join_cmd(concat_file, clip_files, clips, output_path, video_fps, transition_duration)
 
         result = subprocess.run(
             cmd,
@@ -1312,6 +1357,12 @@ def main():
         help='Optional aspect ratio for center cropping (e.g., "9:16", "16:9", "1:1"). Keeps height unchanged and crops width to match the ratio.'
     )
     parser.add_argument(
+        '--transition',
+        type=float,
+        default=0.0,
+        help='Crossfade (dissolve) duration in seconds between clips. 0 = hard cuts (default).'
+    )
+    parser.add_argument(
         '--visualize-detections',
         action='store_true',
         help='Visualize protagonist detection results on video (draw bounding boxes, crop center, and crop area)'
@@ -1367,8 +1418,8 @@ def main():
     parser.add_argument(
         '--ending-video',
         type=str,
-        default='resource/ending/ending.mp4',
-        help='Ending video path to display as final clip (uses its natural duration by default)'
+        default=None,
+        help='Ending video path to display as final clip (omit = no ending appended)'
     )
     parser.add_argument(
         '--ending-fade-target',
@@ -1652,7 +1703,8 @@ def main():
         auto_loudness_match=not args.disable_auto_loudness_match,
         target_lufs=args.target_lufs,
         target_lra=args.target_lra,
-        target_tp=args.target_tp
+        target_tp=args.target_tp,
+        transition_duration=args.transition
     )
 
     if success:

@@ -111,24 +111,34 @@ VLM_AESTHETIC_ANALYSIS_PROMPT = """You are an expert cinematographer and visual 
 - Output ONLY valid JSON, no additional text
 """
 
+# One unified, content-adaptive dense-caption prompt (name kept for import compat).
+# Handles BOTH people/narrative footage and landscape/travel/b-roll — describe
+# whatever is actually there; never assume or invent a person.
 DENSE_CAPTION_PROMPT_FILM = """
     [Role]
-    You are an expert Cinematographer and Video Editor specializing in shot boundary detection and emotional analysis.
+    You are an expert Cinematographer and Video Editor analyzing a clip for montage
+    editing. The footage may be anything — people/narrative OR landscape/travel/b-roll.
+    Describe WHAT IS ACTUALLY THERE; never assume a person is present.
 
-    [Main Character Focus]
-    - The target protagonist is: MAIN_CHARACTER_NAME_PLACEHOLDER
-    - For each segment, you MUST evaluate protagonist visibility and framing quality.
-    - Prioritize visual evidence (face/body visibility, shot scale, occlusion, blur) over assumptions.
-    - If identity is uncertain, be conservative and set low confidence / not visible.
+    [Subject]
+    - The main subject is whatever the frame is actually about: a prominent person if
+      one is clearly present, otherwise the scenery / vista / motion itself.
+    - A protagonist of interest may be: MAIN_CHARACTER_NAME_PLACEHOLDER
+    - ONLY mark a protagonist visible when a person is genuinely, prominently in frame.
+      For landscape/empty shots set main_character_visible=false and describe the visual
+      focus (terrain, sky, water, light, motion) — do NOT invent a person.
+    - Prioritize visual evidence (face/body visibility, shot scale, occlusion, blur).
 
     [Task]
     Identify KEY CUT POINTS where significant visual or narrative changes occur, and provide quality/emotion analysis for each segment.
     
     [What Constitutes a Key Cut Point]
     1. **Hard Cut**: Camera angle, framing, or location changes completely (different shot)
-    2. **Scene Transition**: Change in time, place, or context
-    3. **Significant Action Shift**: Major plot beat or dramatic action change (NOT minor movements)
-    4. **Emotional Pivot**: Clear shift in mood or tone of the scene
+    2. **Scene / Vista Transition**: Change in time, place, or context — OR a camera move
+       (pan / tilt / aerial push) that reveals a distinctly new composition or vista
+    3. **Significant Action / Motion Shift**: Major plot beat, dramatic action, or a clear
+       change in motion / energy (NOT minor movements or slow steady drift)
+    4. **Emotional / Light Pivot**: Clear shift in mood, tone, lighting, or color
 
     [What is NOT a Cut Point]
     - Minor head turns, gestures, or expressions within the same shot
@@ -180,8 +190,9 @@ DENSE_CAPTION_PROMPT_FILM = """
     - Be precise with timestamps - mark the exact moment where the cut occurs
     - Segments should COLLECTIVELY cover the ENTIRE duration of the provided video clip
     - Emotion analysis should reflect what's visually conveyed, not assumed
-    - Character analysis MUST focus on MAIN_CHARACTER_NAME_PLACEHOLDER and be grounded in visible evidence
-    - If protagonist is not visible enough, explicitly reflect this in character_presence and recommendation
+    - If a person IS present, ground character analysis on visible evidence; if NO person
+      is present (landscape/b-roll), set main_character_visible=false and describe the vista
+    - NEVER invent a protagonist who isn't actually in the frame
     - Output ONLY valid JSON, no additional text
 
     [Example]
@@ -197,6 +208,8 @@ DENSE_CAPTION_PROMPT_FILM = """
     }
     ```
     """
+
+
 
 SHOT_CAPTION_PROMPT = """
     [Role]
@@ -847,46 +860,32 @@ Find ONE continuous video clip (or multiple nearby shots that can be stitched to
       - Editor recommendations
    Pro tip: Call this on slightly longer ranges (e.g., target + 2-3 seconds) to see context
 
-3. **review_clip** - Your validation checkpoint
-   Purpose: Check if your selected time range is valid
-    When to use: ALWAYS call this right before Commit()
-   What it checks:
-      - No overlap with previously used footage
-      - Protagonist appears in enough frames
-   Pro tip: This is mandatory - never skip it!
+3. **review_clip** - Optional validation
+   Purpose: Check if your selected time range overlaps previously used footage
+   When to use: ONLY if you have spare budget AND are genuinely unsure.
+   Note: Overlap conflicts are ALSO detected automatically after commit (you'd
+   get a guided rerun), so skipping review_clip is SAFE.
+   ⚠️ NEVER spend your LAST tool call on review_clip — a validated-but-uncommitted
+   shot is a FAILED shot.
 
-4. **commit** - Your final submission
+4. **commit** - Your final submission (THE ONLY WAY TO SUCCEED)
    Purpose: Submit your final shot selection
-   When to use: After review_clip confirms your selection is valid
    Format: [shot: HH:MM:SS to HH:MM:SS]
    Note: You can submit ONE continuous clip OR multiple short clips that form a coherent sequence
 
-[Recommended Workflow]
+[Your Tool Budget — READ THIS FIRST]
 
-Step 1: EXPLORE
-→ Call semantic_neighborhood_retrieval to see available footage
-→ Read the shot descriptions and identify 2-3 promising candidates
+You have exactly MAX_ITERATIONS_PLACEHOLDER tool calls total. An uncommitted shot FAILS
+no matter how good your analysis was. Budget the calls:
 
-Step 2: ANALYZE
-→ Call fine_grained_shot_trimming on your best candidate (use target duration + 2s as range)
-→ Review the "internal_scenes" carefully:
-   * Check protagonist_ratio for each scene
-   * Check visual_quality scores
-   * Check emotion/mood alignment
-   * Read editor_recommendation notes
+→ Call 1: semantic_neighborhood_retrieval (the recommended scenes are usually right — don't over-expand)
+→ Call 2: fine_grained_shot_trimming ONCE on your best candidate (target duration + 2s)
+→ Final call: commit. Not review. Not a second trim. COMMIT.
 
-Step 3: REFINE (if needed)
-→ If the range isn't perfect, call fine_grained_shot_trimming again with adjusted boundaries
-→ Look for adjacent scenes that could extend a good short clip
-→ Consider stitching 2-3 nearby shots if they maintain visual continuity
-
-Step 4: VALIDATE
-→ Call review_clip with your selected time range
-→ If it fails, adjust and try again
-→ If it passes, proceed immediately to commit
-
-Step 5: SUBMIT
-→ Call commit with your final selection in format: [shot: HH:MM:SS to HH:MM:SS]
+A good-enough clip committed on time beats a perfect clip you never submitted.
+If fine_grained shows the subject present, quality ≥3 and emotion roughly right — commit it.
+You may even skip retrieval when the recommended scene info above already tells you where to look,
+freeing a call for analysis.
 
 [Critical Selection Criteria]
 
@@ -946,7 +945,8 @@ Option E: Use music as your guide
 ❌ Calling fine_grained_shot_trimming with the exact same time range twice
 ❌ Selecting shots without the main character
 ❌ Being too rigid about exact content matching
-❌ Forgetting to call review_clip before Commit
+❌ Running out of tool calls without committing (the #1 failure cause — commit early!)
+❌ Re-analyzing with a second fine_grained call when the first already showed a usable range
 ❌ Giving up because "perfect match not found" (there's always a best option!)
 ❌ Selecting long/wide shots where protagonist is too small
 ❌ Stitching shots with visual discontinuity (different locations, jarring cuts)
@@ -965,7 +965,18 @@ Ready? Start with semantic_neighborhood_retrieval!
 ========================================
 """
 
-EDITOR_FINISH_PROMPT = "Please call the `commit` function to finish the task."
+EDITOR_FINISH_PROMPT = (
+    "This is your LAST tool call. Call `commit` NOW with your best time range in the "
+    "format [shot: HH:MM:SS to HH:MM:SS]. Do NOT call review_clip or fine_grained_shot_trimming — "
+    "any call other than commit will FAIL this shot."
+)
+
+EDITOR_FORCED_COMMIT_PROMPT = (
+    "Your tool budget is exhausted but you never committed. You get ONE bonus call, and it must be "
+    "`commit`. Pick the strongest range you already inspected with fine_grained_shot_trimming "
+    "(subject present, quality acceptable, closest to the target duration) and submit it as "
+    "[shot: HH:MM:SS to HH:MM:SS]. Do not aim for perfect — submit the best range you have."
+)
 
 EDITOR_USE_TOOL_PROMPT = "You must call a tool function (semantic_neighborhood_retrieval, fine_grained_shot_trimming, or commit). Do not output your reasoning as text - use the tool_calls format."
 

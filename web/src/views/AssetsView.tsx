@@ -23,6 +23,7 @@ import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
 import TaskGrids from "../components/TaskGrids";
+import AgentWorkbench from "../components/AgentWorkbench";
 import type { ProjectState } from "../App";
 
 const SELECT_STEPS = [
@@ -390,7 +391,10 @@ function DetailSheet({
 
 // ── asset card ──────────────────────────────────────────────────────────────
 
-function AssetCard({ a, onOpen, index }: { a: Asset; onOpen: () => void; index: number }) {
+function AssetCard({ a, onOpen, index, picked, onTogglePick }: {
+  a: Asset; onOpen: () => void; index: number;
+  picked?: boolean; onTogglePick?: () => void;
+}) {
   const ann = a.annotation ?? {};
   const src = mediaUrl(a.absolute_path || a.file_path);
   const tags: string[] = [
@@ -405,9 +409,27 @@ function AssetCard({ a, onOpen, index }: { a: Asset; onOpen: () => void; index: 
       transition={{ duration: 0.3, delay: Math.min(index * 0.04, 0.5) }}
     >
       <Card
-        className="cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]"
+        className={cn(
+          "relative cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]",
+          picked && "border-cyan-400/60 shadow-[0_0_16px_rgba(34,211,238,0.18)]",
+        )}
+        style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}
         onClick={onOpen}
       >
+        {onTogglePick && (
+          <button
+            title={picked ? "取消选择" : a.asset_type === "audio" ? "选为项目音乐" : "加入项目素材"}
+            className={cn(
+              "absolute top-2 left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold transition-all",
+              picked
+                ? "border-cyan-300 bg-cyan-400 text-slate-950 shadow-[0_0_10px_rgba(34,211,238,0.6)]"
+                : "border-white/30 bg-black/50 text-transparent hover:border-cyan-300 hover:text-cyan-300",
+            )}
+            onClick={(e) => { e.stopPropagation(); onTogglePick(); }}
+          >
+            ✓
+          </button>
+        )}
         <div
           className="flex aspect-video items-center justify-center overflow-hidden bg-black"
           onClick={(e) => e.stopPropagation()}
@@ -474,10 +496,54 @@ export default function AssetsView({
   const selJob = useJob(selJobId);
   const selecting = selJob.status === "running";
   const [typeTab, setTypeTab] = useState<string>("video");
+  const [annWb, setAnnWb] = useState<{ task: string; idx?: number } | null>(null);
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
+  // manual selection: video/image hashes (multi) + audio hash (single)
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [pickedAudio, setPickedAudio] = useState("");
+  const [pickApplied, setPickApplied] = useState(false);
 
   const busy = annJob.status === "running";
+
+  const assetPath = (a: Asset) => a.absolute_path || a.file_path;
+  const normPath = (p: string) => p.replace(/\//g, "\\").toLowerCase();
+
+  // pre-check assets already in the project (after scan / project switch)
+  useEffect(() => {
+    if (assets.length === 0) return;
+    const inProj = new Set(project.videos.map(normPath));
+    setPicked(new Set(assets.filter((a) => a.asset_type !== "audio" && inProj.has(normPath(assetPath(a)))).map((a) => a.content_hash)));
+    const audio = assets.find((a) => a.asset_type === "audio" && project.audio && normPath(assetPath(a)) === normPath(project.audio));
+    setPickedAudio(audio?.content_hash ?? "");
+    setPickApplied(false);
+  }, [assets, project.id]);
+
+  const togglePick = (a: Asset) => {
+    setPickApplied(false);
+    if (a.asset_type === "audio") {
+      setPickedAudio((h) => (h === a.content_hash ? "" : a.content_hash));
+    } else {
+      setPicked((s) => {
+        const n = new Set(s);
+        if (n.has(a.content_hash)) n.delete(a.content_hash); else n.add(a.content_hash);
+        return n;
+      });
+    }
+  };
+
+  const pickedVideos = assets.filter((a) => picked.has(a.content_hash));
+  const pickedAudioAsset = assets.find((a) => a.content_hash === pickedAudio);
+
+  const applyPick = () => {
+    setProject((p) => ({
+      ...p,
+      videos: pickedVideos.map(assetPath),
+      audio: pickedAudioAsset ? assetPath(pickedAudioAsset) : p.audio,
+      selectionRationale: "手动选材",
+    }));
+    setPickApplied(true);
+  };
 
   // reattach to jobs still running server-side after a page refresh
   useEffect(() => {
@@ -583,6 +649,17 @@ export default function AssetsView({
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Tags className="h-4 w-4" />}
               全部标注{newCount > 0 ? ` (${newCount})` : ""}
             </Button>
+            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04]"
+              title="强制重新分析所有素材（会重跑视觉/音频分析）"
+              onClick={() => {
+                const hs = assets.map((a) => a.content_hash).filter(Boolean);
+                if (hs.length && window.confirm(`重新标注全部 ${hs.length} 个素材？将重跑视觉/音频分析（消耗 API）。`))
+                  annotate(hs, true);
+              }}
+              disabled={!scanned || assets.length === 0 || busy}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              重新标注全部
+            </Button>
             <Button
               className="h-9 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_16px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
               onClick={autoSelect} disabled={selecting || assets.every((a) => !a.annotated)}>
@@ -612,7 +689,16 @@ export default function AssetsView({
               <div className="mt-1 text-xs text-slate-400">
                 {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
               </div>
-              <TaskGrids tasks={annJob.meta.tasks ?? {}} jobId={annJobId} />
+              <TaskGrids
+                tasks={annJob.meta.tasks ?? {}} jobId={annJobId}
+                onOpenWorkbench={(task, idx) => setAnnWb({ task, idx })}
+              />
+              {annWb && annJobId && (annJob.meta.tasks ?? {})[annWb.task] && (
+                <AgentWorkbench
+                  name={annWb.task} t={annJob.meta.tasks[annWb.task]} jobId={annJobId}
+                  initialIdx={annWb.idx} onClose={() => setAnnWb(null)}
+                />
+              )}
               <JobLog lines={annJob.lines.slice(-80)} height={180} />
             </div>
           )}
@@ -721,8 +807,48 @@ export default function AssetsView({
           ) : (
             <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
               {shown.map((a, i) => (
-                <AssetCard key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)} />
+                <AssetCard
+                  key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
+                  picked={a.asset_type === "audio" ? a.content_hash === pickedAudio : picked.has(a.content_hash)}
+                  onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
+                />
               ))}
+            </div>
+          )}
+
+          {/* manual selection apply bar */}
+          {(pickedVideos.length > 0 || pickedAudioAsset) && (
+            <div className="sticky bottom-3 z-20 mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-slate-900/95 px-4 py-2.5 shadow-[0_0_24px_rgba(0,0,0,0.5)]">
+              <span className="text-sm font-semibold text-cyan-300">手动选材：</span>
+              {pickedVideos.map((a) => (
+                <Badge key={a.content_hash} variant="outline" className="border-sky-500/40 bg-sky-500/10 text-[11px] text-sky-300">
+                  <Film className="mr-1 h-3 w-3" />{a.file_name || a.file_path}
+                </Badge>
+              ))}
+              {pickedAudioAsset && (
+                <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
+                  <Music2 className="mr-1 h-3 w-3" />{pickedAudioAsset.file_name || pickedAudioAsset.file_path}
+                </Badge>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                {pickApplied ? (
+                  <span className="text-xs text-emerald-400">✓ 已写入项目 — 切到「项目编辑」运行流水线</span>
+                ) : (
+                  <span className="text-[11px] text-slate-500">
+                    {pickedVideos.length} 视频{pickedAudioAsset ? " · 1 音乐" : " · 未选音乐"}
+                  </span>
+                )}
+                <Button variant="outline" size="sm" className="h-7 border-white/10 bg-white/[0.04] text-xs"
+                  onClick={() => { setPicked(new Set()); setPickedAudio(""); setPickApplied(false); }}>
+                  清空
+                </Button>
+                <Button size="sm"
+                  className="h-7 gap-1 bg-cyan-500 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
+                  disabled={pickedVideos.length === 0}
+                  onClick={applyPick}>
+                  <Pin className="h-3 w-3" /> 应用到项目
+                </Button>
+              </div>
             </div>
           )}
         </>

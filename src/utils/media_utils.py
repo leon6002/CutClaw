@@ -275,9 +275,31 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
             location = scene_summary.get('location', '')
             time_state = scene_summary.get('time', '')
 
+            # Per-scene shot capacity so the Screenwriter doesn't pile more
+            # shots onto a scene than its footage can physically host.
+            capacity_line = ""
+            try:
+                from src import config as _cfg
+                from src.utils.time_format_convert import hhmmss_to_seconds as _to_sec
+                _shot_len = (float(getattr(_cfg, "AUDIO_MIN_SEGMENT_DURATION", 3.0))
+                             + float(getattr(_cfg, "AUDIO_MAX_SEGMENT_DURATION", 5.0))) / 2.0
+                # start/end are HH:MM:SS(.s) strings (e.g. "00:00:19.0"), not floats —
+                # float() on them throws, which silently killed this whole block.
+                _dur = _to_sec(str(end_time)) - _to_sec(str(start_time))
+                if _dur > 0 and _shot_len > 0:
+                    _hard = max(1, int(_dur / _shot_len))
+                    _safe = max(1, int(_dur * 0.6 / _shot_len))
+                    capacity_line = (
+                        f"Capacity: {_dur:.0f}s of footage — HARD LIMIT {_hard} non-overlapping "
+                        f"shots of ~{_shot_len:.1f}s; prefer assigning at most {_safe} shots here.\n"
+                    )
+            except Exception:
+                pass
+
             summary_text = (
                 f"[Scene {scene_id}] ({start_time} - {end_time})\n"
                 f"Location: {location}, Time: {time_state}\n"
+                f"{capacity_line}"
                 f"Key Event: {key_event}\n"
                 f"Narrative: {narrative}\n"
             )
@@ -289,7 +311,14 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
 
     total_scene_files = len(scene_files)
     print(f"Loaded {len(scene_summaries)} scene summaries (out of {total_scene_files} files) from {scene_folder_path}")
-    return "\n".join(scene_summaries), total_scene_files
+
+    budget_header = (
+        "SCENE CAPACITY BUDGET: each scene lists how many non-overlapping shots its "
+        "footage can host. NEVER assign more shots to a scene than its HARD LIMIT; "
+        "spread shots across different scenes whenever the narrative allows, so the "
+        "editor is never starved of usable time ranges.\n\n"
+    )
+    return budget_header + "\n".join(scene_summaries), total_scene_files
 
 
 def parse_structure_proposal_output(output: str) -> Optional[Dict]:

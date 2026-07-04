@@ -17,9 +17,9 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "E:\\apps\\CutClaw\\resource/imports/DJI_20260615120557_0642_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260619162056_0786_D.MP4"
-AUDIO_PATH = "E:\\apps\\CutClaw\\resource/imports/JINBAO - Long Journey.mp3"
-INSTRUCTION = "以日记视角编排，航拍山川田野衔接女孩们奔跑嬉戏，记录一段穿越风景的自由之旅。"
+VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615120557_0642_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615165651_0680_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260619162056_0786_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
+AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\马也_Crabbit - 海屿你.mp3"
+INSTRUCTION = "将栈道漫步、营地航拍和花海奔跑串联，以动态镜头语言呈现一段前往旷野的青春旅行记录。"
 SRT_PATH = ""
 
 
@@ -275,12 +275,31 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Silence filtering threshold (dB).
 # Segments below this level are treated as too quiet and filtered.
 
-# ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 3.44
-# Minimum segment duration (seconds). Smaller values create faster cuts.
+# ----- Shot-length perceptual bounds (NOT a user setting) -----
+# Shot length is decided automatically per song: cut density follows the music's
+# energy relative to the whole track (energetic sections cut fast, calm sections
+# hold long). These two values are only the PERCEPTUAL EXTREMES the algorithm is
+# allowed to reach — editing-craft constants, like frame rate, not knobs a novice
+# user should set. The self-calibrating pacing lives in audio_caption_madmom.py.
+AUDIO_MIN_SEGMENT_DURATION = 1.2
+# Fastest cut (seconds) — reached at the track's most energetic moments.
+# Below ~1s a shot is too brief to read.
 
-AUDIO_MAX_SEGMENT_DURATION = 5.44
-# Maximum segment duration (seconds). Larger values create slower pacing.
+AUDIO_MAX_SEGMENT_DURATION = 7.0
+# Longest hold (seconds) — reached at the track's calmest moments.
+# Above ~8s a montage shot starts to drag.
+
+DENSE_CAPTION_MAX_SEGMENT_SEC = 6.0
+# Internal: longest a single pre-annotation dense-caption segment may span. Longer
+# uniform segments are split into equal anchors (same description) so the editor's
+# cache lookup always finds coverage and never needs a fresh model call. Not a UI knob.
+
+SHOT_MIN_GAP_SEC = 2.0
+# Minimum spacing (seconds) between two clips taken from the SAME source video.
+# Adjacent slices of one continuous shot look like duplicates; the orchestrator
+# reruns picks closer than this to spread them out (or push onto a different
+# source). It never drops a shot over spacing — if a crowded/single source can't
+# satisfy the gap, the close pick is committed anyway. Set 0 to disable.
 
 # ----- Music structure analysis (Level-1) -----
 AUDIO_STRUCTURE_TEMPERATURE = 0.7
@@ -321,12 +340,18 @@ AUDIO_KEYPOINT_MAX_TOKENS = 4096
 AGENT_MODEL_MAX_TOKEN = 8192
 # Maximum generated tokens per agent response (not total context size).
 
-AGENT_MAX_ITERATIONS = 12
+AGENT_MAX_ITERATIONS = 3
 # Max tool-use iterations per shot in the editor agent loop. Each iteration is
 # one LLM round-trip carrying the full (growing) message history, so this is the
-# single biggest lever on token cost. Lower = cheaper; too low may cut off hard
-# shots before they commit. 12 keeps room for normal shots while trimming the
-# wasteful tail of failing ones.
+# single biggest lever on token cost. Minimal decisive path is: retrieve →
+# (one inspect) → commit. Kept tight to force decisiveness; if too many shots
+# fail before committing, bump to 4-5. Works together with AGENT_MAX_FINE_GRAINED.
+
+AGENT_MAX_FINE_GRAINED = 2
+# Max DISTINCT fine_grained_shot_trimming (inspection) calls per shot. The agent
+# tends to over-analyze — it will call this 9+ times, burning the whole iteration
+# budget before it ever commits. After this many candidate inspections it is told
+# to stop and commit its best pick.
 
 AGENT_MODEL_MAX_RETRIES = 2
 # Max retries per agent step when model calls fail. Each retry re-sends the whole
@@ -336,8 +361,8 @@ AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 64.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 74.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 55.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 65.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3

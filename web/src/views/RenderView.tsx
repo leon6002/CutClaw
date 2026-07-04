@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, GanttChartSquare, Loader2, Play, RotateCw, Video } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
 import { ShotTimeline } from "../components/Charts";
+import { ClipCaption, ClipInspector, activeClipAt, useClipMap } from "../components/ClipInspector";
 import type { PipelineStatus, ProjectState } from "../App";
 
 interface RecentProject {
@@ -21,7 +22,8 @@ interface RecentProject {
 interface Output { ratio: string; path: string; size_mb: number; mtime: number }
 
 const RATIOS = ["9:16", "16:9", "1:1"];
-const WIDTH: Record<string, number> = { "9:16": 240, "16:9": 480, "1:1": 320 };
+// max preview width per ratio (height capped at 480 so player + chart fit side by side)
+const PREVIEW_W: Record<string, number> = { "9:16": 280, "16:9": 620, "1:1": 460 };
 
 export default function RenderView({
   project, setProject, pipelineStatus, onOutputsCount,
@@ -35,25 +37,55 @@ export default function RenderView({
   const [outputs, setOutputs] = useState<Output[]>([]);
   const [hasEnding, setHasEnding] = useState(false);
   const [addEnding, setAddEnding] = useState(false);
+  const [transition, setTransition] = useState(false);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
+  const [spExists, setSpExists] = useState<boolean | null>(null);
+  const [playhead, setPlayhead] = useState(0);
+  const [activeRatio, setActiveRatio] = useState("");
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const job = useJob(jobId);
 
+  const seekTo = (t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.currentTime = t;
+    setPlayhead(t);
+    if (v.paused) v.play().catch(() => {});
+  };
+
   const shotPoint = project.shotPoint;
+  const { clips: clipMap, error: clipMapError, reload: reloadClipMap } = useClipMap(shotPoint);
+  const activeIdx = activeClipAt(clipMap, playhead);
+  const activeClip = activeIdx >= 0 && clipMap ? clipMap[activeIdx] : null;
+  const activeOutput = outputs.find((o) => o.ratio === activeRatio) ?? outputs[0];
 
   const refreshRecent = () => {
     api<RecentProject[]>("/api/project/recent").then(setRecent).catch(() => {});
   };
 
   const refreshOutputs = (sp: string) => {
-    if (!sp) { setOutputs([]); onOutputsCount?.(0); return; }
+    if (!sp) { setOutputs([]); setSpExists(null); onOutputsCount?.(0); return; }
     api<any>(`/api/render/outputs?shot_point=${encodeURIComponent(sp)}`).then((r) => {
       setOutputs(r.outputs);
       setHasEnding(r.has_ending_video);
+      setSpExists(!!r.shot_point_exists);
       onOutputsCount?.(r.outputs.length);
     }).catch(() => {});
   };
+
+  // Self-heal: legacy projects may reference a shot_point path derived with an
+  // old (wrong) scheme. If the file doesn't exist, re-point to the on-disk
+  // result with the SAME filename (identical instruction id).
+  useEffect(() => {
+    if (spExists !== false || !shotPoint || recent.length === 0) return;
+    const base = shotPoint.split(/[\\/]/).pop();
+    const match = recent.find((r) => r.shot_point.split(/[\\/]/).pop() === base);
+    if (match && match.shot_point !== shotPoint) {
+      setProject((p) => ({ ...p, shotPoint: match.shot_point }));
+    }
+  }, [spExists, recent, shotPoint]);
 
   // reattach to a render still running server-side after a page refresh
   useEffect(() => {
@@ -79,6 +111,7 @@ export default function RenderView({
           video_path: project.effectiveVideo || project.videos[0] || "",
           audio_path: project.audio,
           ratio, add_ending: addEnding, has_dialogue: project.hasDialogue,
+          transition: transition ? 0.4 : 0,
         }),
       });
       setJobId(r.job_id);
@@ -135,11 +168,16 @@ export default function RenderView({
               </div>
 
               {hasEnding && (
-                <label className="mb-4 flex cursor-pointer items-center gap-2.5 text-[13px] text-slate-300">
+                <label className="mb-2 flex cursor-pointer items-center gap-2.5 text-[13px] text-slate-300">
                   <Checkbox checked={addEnding} onCheckedChange={(v) => setAddEnding(v === true)} />
                   追加片尾视频
                 </label>
               )}
+              <label className="mb-4 flex cursor-pointer items-center gap-2.5 text-[13px] text-slate-300">
+                <Checkbox checked={transition} onCheckedChange={(v) => setTransition(v === true)} />
+                画面转场（交叉溶解 0.4s）
+                <span className="text-[11px] text-slate-500">快节奏卡点建议关闭（硬切更带感）</span>
+              </label>
 
               <div className="flex flex-wrap gap-2">
                 {RATIOS.map((r) => (
@@ -177,44 +215,74 @@ export default function RenderView({
       </Card>
 
       {shotPoint && (
-        <Card className={cn(glass, "mt-4")}>
+        <Card className={cn(glass, "mt-4")} style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}>
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-sm">
-              <GanttChartSquare className="h-4 w-4 text-cyan-400" /> 成片时间轴
+              <GanttChartSquare className="h-4 w-4 text-cyan-400" /> 成片预览与解析
+              <span className="text-[11px] font-normal text-slate-500">
+                播放视频 — 时间轴游标与镜头解析实时联动 · 对照「编剧想要」vs「VLM 实际看到」
+              </span>
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ShotTimeline shotPoint={shotPoint} />
-          </CardContent>
-        </Card>
-      )}
-
-      {outputs.length > 0 && (
-        <>
-          <div className="mt-5 mb-3 text-xs font-semibold tracking-wider text-slate-400 uppercase">预览</div>
-          <div className="flex flex-wrap items-start gap-4">
-            {outputs.map((o) => (
-              <Card key={o.ratio} className={glass}>
-                <CardContent className="p-3">
-                  <div className="mb-2 text-xs text-slate-400">
-                    {o.ratio} · {o.size_mb}MB · {new Date(o.mtime * 1000).toLocaleString()}
-                  </div>
+            {/* top: player (centered) */}
+            <div className="flex flex-col items-center">
+              {outputs.length > 1 && (
+                <div className="mb-2 flex gap-1.5 self-start">
+                  {outputs.map((o) => (
+                    <button
+                      key={o.ratio}
+                      className={cn(
+                        "rounded-md border px-2.5 py-1 text-xs transition-colors",
+                        o.ratio === activeOutput?.ratio
+                          ? "border-cyan-400/60 bg-cyan-400/15 font-semibold text-cyan-300"
+                          : "border-white/10 bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]",
+                      )}
+                      onClick={() => { setActiveRatio(o.ratio); setPlayhead(0); }}
+                    >
+                      {o.ratio}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {activeOutput ? (
+                <>
                   <video
-                    src={mediaUrl(o.path) + `&t=${o.mtime}`} controls
-                    className="rounded-lg bg-black" style={{ width: WIDTH[o.ratio] ?? 320, maxHeight: 430 }}
+                    ref={videoRef}
+                    key={activeOutput.ratio}
+                    src={mediaUrl(activeOutput.path) + `&t=${activeOutput.mtime}`} controls playsInline
+                    className="rounded-lg bg-black"
+                    style={{ maxHeight: 520, maxWidth: PREVIEW_W[activeOutput.ratio] ?? 720 }}
+                    onTimeUpdate={(e) => setPlayhead((e.target as HTMLVideoElement).currentTime)}
                   />
-                  <div className="mt-2.5">
-                    <Button asChild variant="outline" size="sm" className="h-7 gap-1.5 border-white/10 bg-white/[0.04] text-xs">
-                      <a href={mediaUrl(o.path)} download>
-                        <Download className="h-3.5 w-3.5" /> 下载 output_{o.ratio.replace(":", "x")}.mp4
+                  <div className="w-full" style={{ maxWidth: 720 }}>
+                    <ClipCaption clip={activeClip} />
+                  </div>
+                  <div className="mt-2 flex items-center gap-2 text-xs text-slate-400">
+                    {activeOutput.ratio} · {activeOutput.size_mb}MB · {new Date(activeOutput.mtime * 1000).toLocaleString()}
+                    <Button asChild variant="outline" size="sm" className="h-6 gap-1 border-white/10 bg-white/[0.04] px-2 text-[11px]">
+                      <a href={mediaUrl(activeOutput.path)} download>
+                        <Download className="h-3 w-3" /> 下载
                       </a>
                     </Button>
                   </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </>
+                </>
+              ) : (
+                <div className="flex h-[180px] w-full items-center justify-center rounded-lg border border-dashed border-white/10 text-xs text-slate-500">
+                  还没有渲染结果 — 点击上方「渲染」
+                </div>
+              )}
+            </div>
+
+            {/* below: timeline chart (progress bar) + per-shot inspector, synced to playhead */}
+            <div className="mt-4">
+              <ShotTimeline shotPoint={shotPoint} playhead={playhead} />
+            </div>
+            <div className="mt-3">
+              <ClipInspector clips={clipMap} currentTime={playhead} error={clipMapError} onRetry={reloadClipMap} onSeek={seekTo} />
+            </div>
+          </CardContent>
+        </Card>
       )}
     </div>
   );

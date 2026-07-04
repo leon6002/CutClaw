@@ -172,6 +172,15 @@ function extractClips(data: any): TimelineClip[] {
     : data?.shots ?? data?.clips ?? data?.shot_points ?? data?.results ?? data?.segments ?? [];
   if (!Array.isArray(arr) && typeof arr === "object") arr = Object.values(arr ?? {});
   if (!Array.isArray(arr)) return [];
+  // shot_point entries nest the real clips under .clips[] (multi-source format)
+  arr = arr.flatMap((e: any) =>
+    Array.isArray(e?.clips)
+      ? e.clips.map((c: any) => ({
+          ...c,
+          video_path: c?.video_path ?? e?.video_path,
+          description: c?.description ?? e?.description,
+        }))
+      : [e]);
   const num = (v: any): number => (typeof v === "number" ? v : ts2sec(v) ?? NaN);
   return arr
     .map((c: any) => ({
@@ -183,7 +192,7 @@ function extractClips(data: any): TimelineClip[] {
     .filter((c) => isFinite(c.start) && isFinite(c.end) && c.end > c.start);
 }
 
-export function ShotTimeline({ shotPoint }: { shotPoint: string }) {
+export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; playhead?: number }) {
   const [clips, setClips] = useState<TimelineClip[] | null>(null);
 
   useEffect(() => {
@@ -210,6 +219,11 @@ export function ShotTimeline({ shotPoint }: { shotPoint: string }) {
     return { items: its, sources: srcs, total: cursor };
   }, [clips]);
 
+  // clip index the playhead is currently inside (output-timeline coordinates)
+  const activeIdx = playhead >= 0
+    ? items.findIndex((it) => playhead >= (it.value[0] as number) && playhead < (it.value[1] as number))
+    : -1;
+
   if (!shotPoint) return null;
   if (clips === null) return <Hint>加载成片时间轴…</Hint>;
   if (clips.length === 0) return <Hint>无法解析 shot_point 数据</Hint>;
@@ -231,7 +245,7 @@ export function ShotTimeline({ shotPoint }: { shotPoint: string }) {
                 + (c.desc ? `<br/><span style="font-size:11px;color:#94a3b8">${c.desc.slice(0, 100)}</span>` : "");
             },
           },
-          grid: { left: 110, right: 16, top: 10, bottom: 26 },
+          grid: { left: 110, right: 16, top: 18, bottom: 26 },
           xAxis: { type: "value", name: "s", max: Math.ceil(total), axisLabel: AXIS, splitLine: SPLIT },
           yAxis: {
             type: "category", data: sources.map(basename),
@@ -244,19 +258,32 @@ export function ShotTimeline({ shotPoint }: { shotPoint: string }) {
               const start = apiE.coord([apiE.value(0), apiE.value(2)]);
               const end = apiE.coord([apiE.value(1), apiE.value(2)]);
               const h = 22;
+              const isActive = params.dataIndex === activeIdx;
               return {
                 type: "rect",
                 shape: { x: start[0], y: start[1] - h / 2, width: Math.max(2, end[0] - start[0] - 1.5), height: h, r: 4 },
                 style: {
                   fill: PALETTE[(apiE.value(2) as number) % PALETTE.length],
-                  opacity: 0.9,
+                  opacity: isActive ? 1 : (activeIdx >= 0 ? 0.45 : 0.9),
+                  ...(isActive ? { shadowBlur: 12, shadowColor: "#22d3ee", stroke: "#22d3ee", lineWidth: 1.5 } : {}),
                 },
                 emphasis: { style: { opacity: 1, shadowBlur: 10, shadowColor: "#22d3ee" } },
               };
             },
             encode: { x: [0, 1], y: 2 },
             data: items,
-            animationDelay: (i: number) => i * 30,
+            animation: false,
+            // moving playhead cursor while the preview video plays
+            markLine: playhead >= 0 && playhead <= total + 0.5 ? {
+              silent: true, symbol: "none", animation: false,
+              lineStyle: { color: "#22d3ee", width: 1.5 },
+              label: {
+                show: true, position: "end", rotate: 0, distance: 4,
+                formatter: () => `${playhead.toFixed(1)}s`,
+                color: "#22d3ee", fontSize: 10, fontWeight: "bold" as const,
+              },
+              data: [{ xAxis: Math.min(playhead, total) }],
+            } : undefined,
           }],
         }}
       />

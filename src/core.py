@@ -24,6 +24,7 @@ from src.prompt import (
     EDITOR_USER_PROMPT,
     EDITOR_FINISH_PROMPT,
     EDITOR_USE_TOOL_PROMPT,
+    EDITOR_FORCED_COMMIT_PROMPT,
 )
 
 
@@ -103,6 +104,11 @@ def _parse_shot_time_ranges(answer: str) -> list[tuple[float, float]]:
 
 def _ranges_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
     return a_start < b_end and a_end > b_start
+
+
+def _range_gap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    """Seconds separating two intervals; 0 when touching, negative when overlapping."""
+    return max(b_start - a_end, a_start - b_end)
 
 
 def _parse_retry_after_seconds(error_text: str, default_seconds: float = 1.0) -> float:
@@ -320,6 +326,8 @@ def semantic_neighborhood_retrieval(
         - Going too far from recommended scenes may result in mismatched content
     """
 
+    range_note = ""  # set when out-of-range requested scenes get auto-dropped
+
     # Validate scene range if agent requested specific scenes
     if related_scenes and recommended_scenes:
         from src import config
@@ -351,16 +359,27 @@ def semantic_neighborhood_retrieval(
                 if scene_idx >= 0 and (max_scene_idx == 0 or scene_idx <= max_scene_idx):
                     allowed_scenes.add(scene_idx)
 
-        # Check if all requested scenes are within allowed range
+        # Requested scenes outside the allowed range: drop them and continue with
+        # the valid subset (hard-erroring here burns a whole agent iteration for
+        # what is usually a single hallucinated index). Only error if NONE valid.
         invalid_scenes = [s for s in related_scenes if s not in allowed_scenes]
+        range_note = ""
         if invalid_scenes:
-            return (
-                f"❌ Error: Cannot search scenes {invalid_scenes} - they are outside the allowed range.\n"
-                f"Recommended scenes: {recommended_scenes}\n"
-                f"Allowed exploration range: ±{allowed_range} scenes\n"
-                f"Valid scenes you can search: {sorted(list(allowed_scenes))}\n"
-                f"Please select scenes within the allowed range or omit the 'related_scenes' parameter to use defaults."
+            valid_requested = [s for s in related_scenes if s in allowed_scenes]
+            if not valid_requested:
+                return (
+                    f"❌ Error: Cannot search scenes {invalid_scenes} - they are outside the allowed range.\n"
+                    f"Recommended scenes: {recommended_scenes}\n"
+                    f"Allowed exploration range: ±{allowed_range} scenes\n"
+                    f"Valid scenes you can search: {sorted(list(allowed_scenes))}\n"
+                    f"Please select scenes within the allowed range or omit the 'related_scenes' parameter to use defaults."
+                )
+            range_note = (
+                f"Note: scenes {invalid_scenes} do not exist / are out of range and were IGNORED "
+                f"(valid scenes: {sorted(list(allowed_scenes))}). Searched {valid_requested} instead.\n\n"
             )
+            print(f"⚠️  [Explore] Ignored out-of-range scenes {invalid_scenes}, using {valid_requested}")
+            related_scenes = valid_requested
 
         print(f"🗺️  [Explore] Agent exploring nearby scenes: {related_scenes} (recommended: {recommended_scenes})")
     elif not related_scenes and recommended_scenes:
@@ -411,7 +430,7 @@ def semantic_neighborhood_retrieval(
             all_shots_info.append(f"Scene {scene_idx}: File not found")
 
     result = "\n".join(all_shots_info)
-    return f"Here are the available shots from related scenes {related_scenes}:\n{result}"
+    return f"{range_note}Here are the available shots from related scenes {related_scenes}:\n{result}"
 
 
 def review_clip(
@@ -559,10 +578,88 @@ def fine_grained_shot_trimming(
     # Convert to seconds
     start_sec = hhmmss_to_seconds(start_time_str)
     end_sec = hhmmss_to_seconds(end_time_str)
-    
+
+    # Reject degenerate ranges BEFORE wasting a VLM call. A zero/negative range
+    # (e.g. "00:00:00 to 00:00:00") extracts no frames, so the model returns
+    # nothing and the caller only sees a confusing "Failed to generate caption".
+    _MIN_TRIM_SEC = 0.5
+    if end_sec - start_sec < _MIN_TRIM_SEC:
+        return (
+            f"Error: time range '{time_range}' is too short "
+            f"({max(0.0, end_sec - start_sec):.2f}s) to analyze. Provide a real range where the "
+            f"end is at least {_MIN_TRIM_SEC:.1f}s after the start (ideally around the target shot "
+            f"length), e.g. '00:00:00 to 00:00:04'."
+        )
+
     # Convert seconds to HH:MM:SS format for display
     clip_start_time = convert_seconds_to_hhmmss(start_sec)
     clip_end_time = convert_seconds_to_hhmmss(end_sec)
+
+    # ── Cache-first: reuse the pre-annotation dense captions, skip the VLM ────
+    # This footage was already described once at annotation time (dense_segments);
+    # re-describing the same frames on every edit just burns tokens/latency. Only
+    # fall back to a live model call when the cache doesn't cover the range well.
+    def _cached_scenes_for_range():
+        if not frame_path:
+            return []
+        ckpt_dir = os.path.join(os.path.dirname(frame_path), "captions", "ckpt")
+        if not os.path.isdir(ckpt_dir):
+            return []
+        hits = []
+        for fn in os.listdir(ckpt_dir):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(ckpt_dir, fn), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+            except Exception:
+                continue
+            for seg in d.get("dense_segments") or []:
+                try:
+                    s = float(seg.get("start_sec_abs"))
+                    e = float(seg.get("end_sec_abs"))
+                except (TypeError, ValueError):
+                    continue
+                if e > start_sec and s < end_sec:   # overlaps the requested range
+                    hits.append((s, e, seg))
+        hits.sort(key=lambda x: x[0])
+        return hits
+
+    _hits = _cached_scenes_for_range()
+    if _hits:
+        _covered = sum(min(e, end_sec) - max(s, start_sec) for s, e, _ in _hits)
+        _requested = end_sec - start_sec
+        if _requested > 0 and _covered / _requested >= 0.8:
+            internal = []
+            for s_abs, e_abs, seg in _hits:
+                cs, ce = max(s_abs, start_sec), min(e_abs, end_sec)
+                parts = []
+                if seg.get("cut_type"):
+                    parts.append(f"[{str(seg['cut_type']).upper()}]")
+                if seg.get("content_description"):
+                    parts.append(str(seg["content_description"]))
+                vq = seg.get("visual_quality", {}) or {}
+                em = seg.get("emotion", {}) or {}
+                internal.append({
+                    "scene_time": f"{convert_seconds_to_hhmmss(cs)} to {convert_seconds_to_hhmmss(ce)}",
+                    "description": " ".join(parts),
+                    "cut_type": seg.get("cut_type", ""),
+                    "visual_quality": {"score": vq.get("score", "N/A"), "notes": vq.get("notes", "")},
+                    "emotion": {"mood": em.get("mood", ""), "intensity": em.get("intensity", ""),
+                                "narrative_function": em.get("narrative_function", "")},
+                    "character_presence": seg.get("character_presence", {}) or {},
+                    "editor_recommendation": seg.get("editor_recommendation", ""),
+                    "duration_sec": round(ce - cs, 2),
+                })
+            if internal:
+                print(f"♻️  [trim_shot] Reusing {len(internal)} cached dense caption(s) "
+                      f"for {clip_start_time}–{clip_end_time} (no VLM call)")
+                return json.dumps({
+                    "analyzed_range": f"{clip_start_time} to {clip_end_time}",
+                    "total_duration_sec": round(end_sec - start_sec, 2),
+                    "usability_assessment": "Reused from pre-annotated dense captions (cached — no new model call).",
+                    "internal_scenes": internal,
+                }, indent=4, ensure_ascii=False)
 
     subtitles_context = _extract_subtitles_in_range(transcript_path, start_sec, end_sec)
     
@@ -1002,6 +1099,7 @@ class EditorCoreAgent:
     def _prepare_shot_messages(self, shot, audio_section_info, related_scene_value, guidance_text=None, forbidden_time_ranges=None):
         msgs = copy.deepcopy(self.messages)
         msgs[-1]["content"] = msgs[-1]["content"].replace("VIDEO_LENGTH_PLACEHOLDER", str(shot['time_duration']))
+        msgs[-1]["content"] = msgs[-1]["content"].replace("MAX_ITERATIONS_PLACEHOLDER", str(self.max_iterations))
         msgs[-1]["content"] = msgs[-1]["content"].replace("CURRENT_VIDEO_CONTENT_PLACEHOLDER", shot['content']).replace("CURRENT_VIDEO_EMOTION_PLACEHOLDER", shot['emotion'])
         msgs[-1]["content"] = msgs[-1]["content"].replace("BACKGROUND_MUSIC_PLACEHOLDER", audio_section_info)
 
@@ -1011,10 +1109,40 @@ class EditorCoreAgent:
         if guidance_text or forbidden_time_ranges:
             avoid_msg = []
             if forbidden_time_ranges:
+                # ranges may be (start, end) or (source, start, end); only those on
+                # THIS shot's source video are meaningful to the agent
+                _scenes = (related_scene_value if isinstance(related_scene_value, list)
+                           else [related_scene_value] if related_scene_value is not None else [])
+                _shot_src = ""
+                for _s in _scenes:
+                    try:
+                        _shot_src = self.scene_source_map.get(int(_s), "") or _shot_src
+                    except (TypeError, ValueError):
+                        pass
+                    if _shot_src:
+                        break
+                if not _shot_src:
+                    _shot_src = self.video_path or ""
+                # Pad each forbidden range by the min-gap so the agent naturally
+                # keeps its distance — adjacent slices of one continuous shot look
+                # like duplicates in the final montage.
+                _gap = float(getattr(config, "SHOT_MIN_GAP_SEC", 0.0) or 0.0)
                 formatted = []
-                for start_sec, end_sec in forbidden_time_ranges:
-                    formatted.append(f"{convert_seconds_to_hhmmss(start_sec)} to {convert_seconds_to_hhmmss(end_sec)}")
-                avoid_msg.append("Avoid time ranges: " + "; ".join(formatted))
+                for _f in forbidden_time_ranges:
+                    f_src, start_sec, end_sec = _norm_range(_f)
+                    if not _same_source(f_src, _shot_src):
+                        continue
+                    _s = max(0.0, start_sec - _gap)
+                    _e = end_sec + _gap
+                    formatted.append(f"{convert_seconds_to_hhmmss(_s)} to {convert_seconds_to_hhmmss(_e)}")
+                if formatted:
+                    avoid_msg.append(
+                        "Avoid time ranges (already used on this source, padded to keep clips apart): "
+                        + "; ".join(formatted)
+                        + ". These ranges are on the SAME source video as this shot — if you cannot find "
+                          "a well-separated range here, prefer a DIFFERENT source video so consecutive "
+                          "shots don't reuse near-identical footage."
+                    )
             if guidance_text:
                 avoid_msg.append("Guidance: " + guidance_text)
             msgs.append({
@@ -1036,7 +1164,19 @@ class EditorCoreAgent:
         tag = f"S{(self.current_section_idx or 0) + 1}·Shot{(self.current_shot_idx or 0) + 1}"
         loop_start = time.time()
 
-        for i in range(max_iterations):
+        # One extra "grace" iteration beyond the budget: if the agent inspected
+        # footage but spent its last call on review/trim instead of commit (the
+        # dominant failure mode with small budgets), force a commit instead of
+        # failing the shot. tool_choice is locked to `commit` so it cannot wander.
+        grace_iter = False
+        for i in range(max_iterations + 1):
+            if i == max_iterations:
+                if section_completed or should_restart or not self.attempted_time_ranges:
+                    break
+                grace_iter = True
+                print(f"⚠️  [{tag}] budget exhausted with footage inspected but no commit — forcing commit now")
+                msgs.append({"role": "user", "content": EDITOR_FORCED_COMMIT_PROMPT})
+            self._cur_iter = i + 1
             if i == max_iterations - 1:
                 msgs.append(
                     {
@@ -1063,7 +1203,9 @@ class EditorCoreAgent:
                             temperature=1.0,
                             max_tokens=config.AGENT_MODEL_MAX_TOKEN,
                             tools=self.function_schemas,
-                            tool_choice="auto",
+                            # grace iteration: the model may ONLY commit
+                            tool_choice=({"type": "function", "function": {"name": "commit"}}
+                                         if grace_iter else "auto"),
                         )
                         if config.AGENT_LITELLM_URL:
                             kwargs["api_base"] = config.AGENT_LITELLM_URL
@@ -1254,6 +1396,33 @@ class EditorCoreAgent:
                 "content": content,
             }
         )
+        # Every system→agent feedback flows through here: emit it so the UI
+        # trace shows verdicts (review rejections, overlap/duplicate warnings,
+        # tool errors) — not just what the model did, but how it was answered.
+        try:
+            c = str(content)
+            cl = c.lower()
+            if "review failed" in cl:
+                verdict = "fail"
+            elif cl.startswith("error") or "❌" in c[:80] or "invalid function" in cl:
+                verdict = "fail"
+            elif (cl.startswith("ok") or "does not overlap" in cl or "no overlap" in cl
+                  or "review passed" in cl or "success" in cl or "saved" in cl
+                  or "you can proceed" in cl):
+                verdict = "ok"
+            elif ("duplicate" in cl or "already analyzed" in cl
+                  or "overlap detected" in cl or "overlap with" in cl or "overlapping" in cl):
+                verdict = "warn"
+            else:
+                verdict = "info"
+            _emit_shot_step(
+                self.current_section_idx, self.current_shot_idx,
+                phase="result", tool=str(name),
+                iter=getattr(self, "_cur_iter", 0), max_iter=self.max_iterations,
+                verdict=verdict, result=c[:600],
+            )
+        except Exception:
+            pass
 
     def _exec_tool(self, tool_call, msgs):
         name = tool_call["function"]["name"]
@@ -1328,6 +1497,20 @@ class EditorCoreAgent:
                 )
                 return False
 
+            # Hard cap on DISTINCT inspections: the agent over-analyzes (seen calling
+            # fine_grained_shot_trimming 9+ times on different ranges before ever
+            # committing, burning the whole iteration budget). After enough candidate
+            # inspections, refuse further analysis and force a decision.
+            _max_inspect = int(getattr(config, "AGENT_MAX_FINE_GRAINED", 2))
+            if normalized_range not in self.attempted_time_ranges and len(self.attempted_time_ranges) >= _max_inspect:
+                self._append_tool_msg(
+                    tool_call["id"], name,
+                    f"You have already analyzed {len(self.attempted_time_ranges)} candidate ranges — that is ENOUGH. "
+                    f"Do NOT analyze more. Choose your best time range from what you've seen and call 'Commit' NOW.",
+                    msgs,
+                )
+                return False
+
             # Reset duplicate counter on new time range
             self.duplicate_call_count = 0
             # Record this time range as attempted
@@ -1390,8 +1573,17 @@ class EditorCoreAgent:
                     "target_length_sec": self.current_target_length or 0.0
                 }
 
-                # Face quality check (optional, controlled by config.ENABLE_FACE_QUALITY_CHECK)
-                if config.ENABLE_FACE_QUALITY_CHECK:
+                # Face quality check — only meaningful when tracking a protagonist:
+                # film mode WITH a named main character. Landscape/vlog footage has
+                # no protagonist; running it there rejects perfectly good shots.
+                _face_check_applicable = (
+                    config.ENABLE_FACE_QUALITY_CHECK
+                    and getattr(config, "VIDEO_TYPE", "film") == "film"
+                    and bool(str(getattr(config, "MAIN_CHARACTER_NAME", "") or "").strip())
+                )
+                if config.ENABLE_FACE_QUALITY_CHECK and not _face_check_applicable:
+                    print("⏭️  [Reviewer] Face quality check skipped (vlog mode / no main character).")
+                if _face_check_applicable:
                     time_match = re.search(r'\[?shot[\s_]*\d*:\s*([0-9:.]+)\s+to\s+([0-9:.]+)\]?', shot_proposal["answer"], re.IGNORECASE)
                     if time_match:
                         time_range = f"{time_match.group(1)} to {time_match.group(2)}"
@@ -1624,6 +1816,13 @@ class EditorCoreAgent:
         self.last_commit_result = None
         self.last_commit_raw = None
 
+        # round divider for the UI trace: initial run vs conflict-rerun
+        _emit_shot_step(
+            sec_idx, shot_idx, phase="round",
+            note=("conflict_rerun" if guidance_text else "initial"),
+            iter=0, max_iter=max_iterations,
+        )
+
         audio_section = self.audio_db['sections'][sec_idx]
         audio_section_info = self._build_audio_section_info(audio_section, shot_idx)
 
@@ -1718,6 +1917,24 @@ class ParallelShotOrchestrator:
         self.max_workers = max_workers or getattr(config, 'PARALLEL_SHOT_MAX_WORKERS', 4)
         self.max_reruns = max_reruns if max_reruns is not None else getattr(config, 'PARALLEL_SHOT_MAX_RERUNS', 2)
         self._output_lock = threading.Lock()
+        # scene → source video, so we can group shots by source: same-source
+        # shots run sequentially (each sees prior picks → no collisions), while
+        # different-source shots run in parallel (independent timelines).
+        self.scene_source_map = _build_scene_source_map(video_scene_path)
+
+    def _shot_source(self, shot) -> str:
+        """Best-guess source video for a shot, from its recommended scene(s).
+        Shots whose source is unknown fall back to the primary video path."""
+        rs = shot.get('related_scene', [])
+        scenes = rs if isinstance(rs, list) else [rs]
+        for s in scenes:
+            try:
+                src = self.scene_source_map.get(int(s))
+            except (TypeError, ValueError):
+                src = None
+            if src:
+                return src
+        return self.video_path or ""
 
     def _compute_quality_score(self, result_data: dict) -> float:
         if not result_data:
@@ -1753,54 +1970,81 @@ class ParallelShotOrchestrator:
                 ))
         return ranges
 
-    def _detect_conflicts(self, results: dict, keep_ranges: list) -> dict:
-        """Return a dict of losers keyed by (sec_idx, shot_idx) with guidance text."""
+    def _detect_conflicts(self, results: dict, keep_ranges: list) -> tuple[dict, set]:
+        """Return (losers, soft_keys). Losers is keyed by (sec_idx, shot_idx) with
+        guidance text. `soft_keys` ⊆ losers are conflicts caused ONLY by same-source
+        spacing (< SHOT_MIN_GAP_SEC), not true overlap — they rerun to spread out
+        but are committed anyway if spacing can't be met (never dropped)."""
         losers = {}
+        soft = set()
+        gap = float(getattr(config, "SHOT_MIN_GAP_SEC", 0.0) or 0.0)
         items = list(results.items())
+
+        def _mark(key, msg, is_soft):
+            if key in losers and key not in soft:
+                return  # already a hard loser — don't downgrade
+            losers[key] = msg
+            (soft.add if is_soft else soft.discard)(key)
 
         # Conflicts with already kept ranges (from prior sections or winners)
         for key, result in items:
             ranges = self._result_ranges(result)
+            hard_hit = False
             for r_src, r_start, r_end in ranges:
                 for k_item in keep_ranges:
                     k_src, k_start, k_end = _norm_range(k_item)
                     if not _same_source(r_src, k_src):
                         continue
-                    if _ranges_overlap(r_start, r_end, k_start, k_end):
-                        losers[key] = "Overlap with already selected clips. Please choose a different time range."
+                    d = _range_gap(r_start, r_end, k_start, k_end)
+                    if d < 0:
+                        _mark(key, "Overlap with already selected clips. Please choose a different time range.", False)
+                        hard_hit = True
                         break
-                if key in losers:
+                    elif gap > 0 and d < gap:
+                        _mark(key, f"Too close (<{gap:g}s) to an already-selected clip on the SAME source video — "
+                                   f"adjacent slices look duplicated. Pick a range farther away on this source, "
+                                   f"or better, choose a DIFFERENT source video.", True)
+                if hard_hit:
                     break
 
         # Pairwise conflicts in the current batch
         for i in range(len(items)):
             key_i, res_i = items[i]
-            if key_i in losers:
+            if key_i in losers and key_i not in soft:
                 continue
             ranges_i = self._result_ranges(res_i)
             for j in range(i + 1, len(items)):
                 key_j, res_j = items[j]
-                if key_j in losers:
+                if key_j in losers and key_j not in soft:
                     continue
                 ranges_j = self._result_ranges(res_j)
-                overlap = False
+                hard = soft_close = False
                 for a_src, a_start, a_end in ranges_i:
                     for b_src, b_start, b_end in ranges_j:
-                        if _same_source(a_src, b_src) and _ranges_overlap(a_start, a_end, b_start, b_end):
-                            overlap = True
+                        if not _same_source(a_src, b_src):
+                            continue
+                        d = _range_gap(a_start, a_end, b_start, b_end)
+                        if d < 0:
+                            hard = True
                             break
-                    if overlap:
+                        elif gap > 0 and d < gap:
+                            soft_close = True
+                    if hard:
                         break
-                if overlap:
-                    score_i = self._compute_quality_score(res_i)
-                    score_j = self._compute_quality_score(res_j)
-                    if score_i >= score_j:
-                        losers[key_j] = f"Overlap with shot {key_i[1] + 1}. Please choose a different time range."
-                    else:
-                        losers[key_i] = f"Overlap with shot {key_j[1] + 1}. Please choose a different time range."
-                        break
+                if not (hard or soft_close):
+                    continue
+                score_i = self._compute_quality_score(res_i)
+                score_j = self._compute_quality_score(res_j)
+                loser, other = (key_j, key_i) if score_i >= score_j else (key_i, key_j)
+                if hard:
+                    _mark(loser, f"Overlap with shot {other[1] + 1}. Please choose a different time range.", False)
+                else:
+                    _mark(loser, f"Too close to shot {other[1] + 1} on the same source video (adjacent slices "
+                                 f"look duplicated). Space it out, or use a different source video.", True)
+                if loser == key_i:
+                    break
 
-        return losers
+        return losers, soft
 
     def _run_worker(self, shot, sec_idx, shot_idx, guidance_text=None, forbidden_time_ranges=None):
         mode = "rerun" if guidance_text else "initial"
@@ -1907,6 +2151,44 @@ class ParallelShotOrchestrator:
         _SHOT_PROG["map"] = _flat_idx
         _SHOT_PROG["total"] = _n_total
 
+        _round_seq = {"n": 0}
+
+        def _emit_round(ev_phase: str, payload: dict):
+            """Structured orchestrator events → the canvas draws fork/join nodes."""
+            try:
+                from src.utils.progress import emit_progress
+                emit_progress("editor_rounds", 0, _round_seq["n"], "step",
+                              phase=ev_phase, iter=_round_seq["n"],
+                              note=json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                pass
+
+        def _run_group(group_shots, base_forbidden, guidance_map):
+            """Run one source's shots SEQUENTIALLY. Each shot's forbidden list
+            grows with the ranges the earlier shots in this same source already
+            took, so two shots on the same video can never pick overlapping
+            ranges — eliminating the conflicts that caused reruns. Different
+            sources are dispatched as separate groups and run in parallel."""
+            local_ranges = []
+            out = {}
+            for (s_idx, shot_idx), shot in group_shots:
+                k = (s_idx, shot_idx)
+                _emit(k, "start")
+                try:
+                    res = self._run_worker(
+                        shot, s_idx, shot_idx,
+                        guidance_text=guidance_map.get(k),
+                        forbidden_time_ranges=base_forbidden + local_ranges,
+                    )
+                except Exception as e:
+                    print(f"Worker failed for shot {k}: {e}")
+                    res = None
+                out[k] = res
+                _emit(k, "done" if res else "fail")
+                if res:
+                    local_ranges.extend(self._result_ranges(res))
+            return out
+
         global_keep_ranges = []
         final_results = {}
         existing = []
@@ -1919,16 +2201,44 @@ class ParallelShotOrchestrator:
             except Exception:
                 existing = []
 
+        # Self-heal pass: legacy concurrent runs could commit overlapping picks
+        # on the same source. Keep the first, drop later overlapping entries —
+        # they get re-selected this run, and the cleaned file is saved at once.
+        cleaned_existing = []
+        dropped_dups = []
         for item in existing:
             if item.get("status") != "success":
+                cleaned_existing.append(item)
                 continue
             sec_idx = item.get("section_idx")
             shot_idx = item.get("shot_idx")
             if sec_idx is None or shot_idx is None:
+                cleaned_existing.append(item)
                 continue
+            dup = False
+            for r_src, r_s, r_e in self._result_ranges(item):
+                for k_item in global_keep_ranges:
+                    k_src, k_s, k_e = _norm_range(k_item)
+                    if _same_source(r_src, k_src) and _ranges_overlap(r_s, r_e, k_s, k_e):
+                        dup = True
+                        break
+                if dup:
+                    break
+            if dup:
+                dropped_dups.append((sec_idx, shot_idx))
+                continue
+            cleaned_existing.append(item)
             completed_shots.add((sec_idx, shot_idx))
             for _r in self._result_ranges(item):
                 global_keep_ranges.append(_r)
+        existing = cleaned_existing
+        if dropped_dups:
+            print(
+                f"🧹 [Parallel] Dropped {len(dropped_dups)} duplicated/overlapping checkpoint shot(s): "
+                f"{[f'S{a + 1}-Shot{b + 1}' for a, b in dropped_dups]} — they will be re-selected",
+                flush=True,
+            )
+            self._save_checkpoint(existing, {})
 
         if completed_shots:
             print(f"📋 [Parallel] Found {len(completed_shots)} completed shots in existing output file")
@@ -1977,40 +2287,56 @@ class ParallelShotOrchestrator:
                     f"{_committed}/{total_shots} shots committed · selecting {len(pending)} now: [{_pending_tags}]",
                     flush=True,
                 )
+                _round_seq["n"] += 1
+                _emit_round("round_start", {
+                    "section": sec_idx,
+                    "round": round_idx,
+                    "max_rounds": max_rounds,
+                    "pending": [_flat_idx.get(k, -1) for k in sorted(pending)],
+                    "committed": _committed,
+                    "total": total_shots,
+                })
                 print(
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
                     f"pending={len(pending)} rerun_count={rerun_count}/{self.max_reruns}"
                 )
 
+                # Group pending shots by source video. Same-source shots go in
+                # one group and run sequentially (no collisions); different
+                # sources become separate groups that run in parallel.
+                source_groups: dict[str, list] = {}
+                for (s_idx, shot_idx), shot in pending.items():
+                    src = self._shot_source(shot)
+                    source_groups.setdefault(src, []).append(((s_idx, shot_idx), shot))
+                _grp_summary = ", ".join(
+                    f"{os.path.basename(src) or '?'}×{len(g)}" for src, g in source_groups.items()
+                )
+                print(f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
+                      f"{len(source_groups)} source group(s): {_grp_summary}", flush=True)
+
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = {}
-                    for (s_idx, shot_idx), shot in pending.items():
-                        key = (s_idx, shot_idx)
-                        _emit(key, "start")
-                        futures[executor.submit(
-                            self._run_worker,
-                            shot,
-                            s_idx,
-                            shot_idx,
-                            guidance_text=pending_guidance.get(key),
-                            forbidden_time_ranges=combined_keep_ranges
-                        )] = key
-
-                    for future in as_completed(futures):
-                        key = futures[future]
+                    gfutures = [
+                        executor.submit(_run_group, gshots, combined_keep_ranges, pending_guidance)
+                        for gshots in source_groups.values()
+                    ]
+                    for gf in as_completed(gfutures):
                         try:
-                            results[key] = future.result()
-                            _emit(key, "done" if results[key] else "fail")
+                            results.update(gf.result())
                         except Exception as e:
-                            print(f"Worker failed for shot {key}: {e}")
-                            results[key] = None
-                            _emit(key, "fail")
+                            print(f"Source-group worker failed: {e}")
 
-                losers = self._detect_conflicts(results, combined_keep_ranges)
+                losers, soft_losers = self._detect_conflicts(results, combined_keep_ranges)
                 print(
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
-                    f"conflicts={len(losers)} winners={len(results) - len(losers)}"
+                    f"conflicts={len(losers)} (soft/spacing={len(soft_losers)}) "
+                    f"winners={len(results) - len(losers)}"
                 )
+                _emit_round("round_result", {
+                    "section": sec_idx,
+                    "round": round_idx,
+                    "winners": [_flat_idx.get(k, -1) for k in results if k not in losers],
+                    "losers": [_flat_idx.get(k, -1) for k in losers],
+                })
                 _committed_after = total_shots - len(losers)
                 _rounds_left = max_rounds - round_idx
                 if losers and rerun_count < self.max_reruns:
@@ -2044,8 +2370,23 @@ class ParallelShotOrchestrator:
                         f"[Parallel][Section {sec_idx + 1}] reached max reruns "
                         f"({self.max_reruns}), stop rerunning unresolved shots"
                     )
+                    _accepted_soft = False
                     for _key in losers:
-                        _emit(_key, "fail")
+                        # Spacing (soft) conflicts must never drop a shot: if a
+                        # crowded/single source couldn't satisfy the min gap after
+                        # all reruns, commit the close pick anyway — an adjacent
+                        # clip still beats a missing one. True overlaps still fail.
+                        _res = results.get(_key)
+                        if _key in soft_losers and _res:
+                            final_results[_key] = _res
+                            for _r in self._result_ranges(_res):
+                                section_keep_ranges.append(_r)
+                            _accepted_soft = True
+                            _emit(_key, "done")
+                        else:
+                            _emit(_key, "fail")
+                    if _accepted_soft:
+                        self._save_checkpoint(existing, final_results)
                     break
 
                 for _key in losers:

@@ -1,181 +1,90 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import {
-  AudioWaveform, ChevronDown, Film, Layers, Loader2, Maximize2,
-  MessageSquareText, RotateCcw, Scissors, Wrench, X, Zap,
-} from "lucide-react";
+import { Loader2, Maximize2, RotateCcw, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { api } from "../api";
+import {
+  TASK_LABEL, STATE_DOT, STATE_TXT, VERDICT_META,
+  entryWorstVerdict, fmtIter, groupSteps, useTrace, type TaskInfo,
+} from "./trace";
 
-const TASK_LABEL: Record<string, ReactNode> = {
-  audio_segments: <><AudioWaveform className="mr-1.5 inline h-3.5 w-3.5 text-violet-400" />音频片段描述</>,
-  editor_shots: <><Scissors className="mr-1.5 inline h-3.5 w-3.5 text-cyan-400" />镜头选择 Agent</>,
-  video_clips: <><Film className="mr-1.5 inline h-3.5 w-3.5 text-sky-400" />视频片段理解</>,
-  video_scenes: <><Layers className="mr-1.5 inline h-3.5 w-3.5 text-emerald-400" />场景分析</>,
-};
+// ── compact inline glance (click a cell) ────────────────────────────────────
 
-interface TaskInfo {
-  total: number;
-  states: Record<string, string>;
-  labels?: Record<string, string>;
-  iters?: Record<string, string>;
-  done?: number;
-  fail?: number;
-  avg?: number;
-  eta?: number;
-}
-
-interface TraceStep {
-  phase: "calling" | "action" | string;
-  iter?: number;
-  max_iter?: number;
-  elapsed?: number;
-  tool?: string;
-  args?: string;
-  reply?: string;
-}
-
-function tryPretty(s: string): string {
-  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
-}
-
-const STATE_TXT: Record<string, string> = { d: "已完成", r: "处理中", f: "失败", p: "等待中" };
-const STATE_DOT: Record<string, string> = {
-  d: "bg-emerald-400", r: "bg-cyan-400 animate-pulse", f: "bg-red-400", p: "bg-white/15",
-};
-
-/** Live per-unit agent trace. `tall` fills the workbench; default is compact inline. */
-function ShotTrace({
-  jobId, task, idx, label, iters, onClose, tall = false,
+function InlineTrace({
+  jobId, task, idx, label, iters, onClose, onOpenWorkbench,
 }: {
   jobId: string; task: string; idx: number;
-  label?: string; iters?: string; onClose?: () => void; tall?: boolean;
+  label?: string; iters?: string; onClose: () => void; onOpenWorkbench: () => void;
 }) {
-  const [steps, setSteps] = useState<TraceStep[] | null>(null);
-  const [open, setOpen] = useState<number | null>(null);
-
-  useEffect(() => {
-    setSteps(null); setOpen(null);
-    let stop = false;
-    let timer = 0;
-    const tick = async () => {
-      try {
-        const r = await api<{ steps: TraceStep[] }>(
-          `/api/jobs/${jobId}/trace?task=${encodeURIComponent(task)}&idx=${idx}`);
-        if (!stop) setSteps(r.steps);
-      } catch { /* ignore */ }
-      if (!stop) timer = window.setTimeout(tick, 1000);
-    };
-    tick();
-    return () => { stop = true; window.clearTimeout(timer); };
-  }, [jobId, task, idx]);
-
-  const visible = useMemo(() => {
-    if (!steps) return [];
-    const out: TraceStep[] = [];
-    steps.forEach((s, i) => {
-      if (s.phase === "calling" && i < steps.length - 1) return;
-      out.push(s);
-    });
-    return out;
-  }, [steps]);
+  const { steps, fromPrev } = useTrace(jobId, task, idx);
+  const entries = useMemo(() => groupSteps(steps ?? []), [steps]);
 
   return (
-    <div className={cn(
-      "flex flex-col rounded-xl border border-cyan-500/20 bg-black/40",
-      tall ? "h-full min-h-0" : "mt-2",
-    )}>
-      <div className="flex shrink-0 items-center gap-2 border-b border-white/[0.07] px-3 py-2">
-        <span className="text-xs font-semibold text-cyan-300">
-          单元 #{idx + 1}{label ? ` · ${label}` : ""}
-        </span>
+    <div className="mt-2 rounded-xl border border-cyan-500/20 bg-black/40">
+      <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.07] px-3 py-2">
+        <span className="text-xs font-semibold text-cyan-300">单元 #{idx + 1}{label ? ` · ${label}` : ""}</span>
         {iters && <Badge variant="outline" className="h-4 border-white/15 bg-white/[0.06] px-1.5 text-[10px] text-slate-300">迭代 {iters}</Badge>}
-        <span className="text-[11px] text-slate-500">{steps?.length ?? 0} 步 · 点击步骤展开完整回复</span>
-        {onClose && (
-          <button className="ml-auto text-slate-500 hover:text-slate-300" onClick={onClose}>
-            <X className="h-3.5 w-3.5" />
-          </button>
+        {fromPrev && (
+          <Badge variant="outline" className="h-4 border-amber-500/30 bg-amber-500/10 px-1.5 text-[10px] text-amber-300">
+            来自先前运行
+          </Badge>
         )}
+        <Button variant="outline" size="sm"
+          className="ml-auto h-6 gap-1 border-cyan-500/25 bg-cyan-500/[0.06] px-2 text-[10px] text-cyan-300 hover:bg-cyan-500/15"
+          onClick={onOpenWorkbench}>
+          <Maximize2 className="h-2.5 w-2.5" /> 工作台查看详情
+        </Button>
+        <button className="text-slate-500 hover:text-slate-300" onClick={onClose}>
+          <X className="h-3.5 w-3.5" />
+        </button>
       </div>
-      <ScrollArea className={tall ? "min-h-0 flex-1" : "max-h-[300px]"}>
+      <ScrollArea className="max-h-[200px]">
         <div className="px-3 py-2">
           {steps === null ? (
-            <div className="py-3 text-xs text-slate-500">加载轨迹…</div>
-          ) : visible.length === 0 ? (
-            <div className="py-3 text-xs text-slate-500">还没有步骤记录（该单元可能尚未开始或来自缓存）</div>
+            <div className="py-2 text-xs text-slate-500">加载轨迹…</div>
+          ) : entries.length === 0 ? (
+            <div className="py-2 text-xs text-slate-500">
+              本轮没有执行该单元（尚未开始，或先前运行已完成、走检查点跳过），历史任务中也没有找到它的轨迹。
+            </div>
           ) : (
-            <AnimatePresence initial={false}>
-              {visible.map((s, i) => {
-                const isCalling = s.phase === "calling";
-                const expanded = tall || open === i;   // workbench: always expanded
+            entries.map((e, i) => {
+              if (e.round) {
+                const rerun = e.round.note === "conflict_rerun";
                 return (
-                  <motion.div
-                    key={i}
-                    layout="position"
-                    initial={{ y: 14, opacity: 0 }}
-                    animate={{ y: 0, opacity: 1 }}
-                    className="border-b border-white/[0.05] py-1.5 last:border-0"
-                  >
-                    <div
-                      className={cn(
-                        "flex flex-wrap items-center gap-1.5 text-xs",
-                        !isCalling && !tall && "cursor-pointer hover:bg-white/[0.03]",
-                      )}
-                      onClick={() => !isCalling && !tall && setOpen(expanded ? null : i)}
-                    >
-                      <Badge variant="outline" className="h-4 border-white/15 bg-white/[0.06] px-1.5 font-mono text-[10px] text-slate-400">
-                        iter {s.iter}/{s.max_iter}
-                      </Badge>
-                      {isCalling ? (
-                        <span className="flex items-center gap-1.5 text-cyan-300">
-                          <Loader2 className="h-3 w-3 animate-spin" /> 模型思考中…
-                        </span>
-                      ) : s.tool ? (
-                        <span className="flex items-center gap-1 font-mono text-emerald-400">
-                          <Wrench className="h-3 w-3" />{s.tool}
-                        </span>
-                      ) : (
-                        <span className="flex items-center gap-1 text-slate-300">
-                          <MessageSquareText className="h-3 w-3" />（无工具调用）
-                        </span>
-                      )}
-                      {s.elapsed !== undefined && <span className="text-slate-500">+{s.elapsed}s</span>}
-                      {!isCalling && !tall && (
-                        <ChevronDown className={cn("h-3 w-3 text-slate-600 transition-transform", expanded && "rotate-180")} />
-                      )}
-                      {!isCalling && !expanded && (s.args || s.reply) && (
-                        <span className="max-w-[380px] truncate text-slate-500">
-                          {s.args || s.reply}
-                        </span>
-                      )}
-                    </div>
-                    {expanded && !isCalling && (
-                      <div>
-                        {s.args && (
-                          <div className="mt-1.5">
-                            <div className="mb-0.5 text-[10px] font-semibold tracking-wider text-emerald-500/80 uppercase">工具参数</div>
-                            <pre className={cn("rawjson", tall ? "!max-h-none" : "!max-h-[160px]")}>{tryPretty(s.args)}</pre>
-                          </div>
-                        )}
-                        {s.reply && (
-                          <div className="mt-1.5">
-                            <div className="mb-0.5 text-[10px] font-semibold tracking-wider text-sky-500/80 uppercase">模型回复</div>
-                            <pre className={cn("rawjson", tall ? "!max-h-none" : "!max-h-[220px]")}>{s.reply}</pre>
-                          </div>
-                        )}
-                        {!s.args && !s.reply && (
-                          <div className="mt-1.5 text-[11px] text-slate-500">该步骤没有记录详情</div>
-                        )}
-                      </div>
-                    )}
-                  </motion.div>
+                  <div key={i} className="flex items-center gap-2 py-1.5">
+                    <div className="h-px flex-1 bg-white/10" />
+                    <span className={cn("text-[9.5px] font-semibold tracking-wider uppercase", rerun ? "text-amber-400/90" : "text-slate-600")}>
+                      第 {e.round.n} 轮{rerun ? " · 冲突重跑" : ""}
+                    </span>
+                    <div className="h-px flex-1 bg-white/10" />
+                  </div>
                 );
-              })}
-            </AnimatePresence>
+              }
+              const vm = VERDICT_META[entryWorstVerdict(e)];
+              return (
+                <div key={i} className="flex flex-wrap items-center gap-1.5 border-b border-white/[0.05] py-1.5 text-xs last:border-0">
+                  <Badge variant="outline" className="h-4 border-white/15 bg-white/[0.06] px-1.5 font-mono text-[10px] text-slate-400">
+                    {fmtIter(e.iter, e.max_iter)}
+                  </Badge>
+                  {e.calling ? (
+                    <span className="flex items-center gap-1.5 text-cyan-300">
+                      <Loader2 className="h-3 w-3 animate-spin" />模型思考中…
+                    </span>
+                  ) : (
+                    <span className="font-mono text-emerald-400">{e.action?.tool || "（无工具调用）"}</span>
+                  )}
+                  {e.results.map((r, j) => (
+                    <span key={j} className={cn("h-2 w-2 rounded-full", (VERDICT_META[r.verdict ?? "info"] ?? VERDICT_META.info).dot)} />
+                  ))}
+                  {e.elapsed !== undefined && <span className="text-slate-600">+{e.elapsed}s</span>}
+                  {e.results[0]?.result && (
+                    <span className={cn("max-w-[320px] truncate", vm.cls)}>{e.results[0].result.split("\n")[0]}</span>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
       </ScrollArea>
@@ -183,74 +92,18 @@ function ShotTrace({
   );
 }
 
-/** Near-fullscreen workbench: unit list on the left, full-height trace on the right. */
-function Workbench({
-  name, t, jobId, onClose,
-}: { name: string; t: TaskInfo; jobId: string; onClose: () => void }) {
-  const total = t.total ?? 0;
-  const states = t.states ?? {};
-  const firstActive = useMemo(() => {
-    for (let i = 0; i < total; i++) if (states[String(i)] === "r") return i;
-    return 0;
-  }, []);
-  const [idx, setIdx] = useState(firstActive);
-
-  return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="flex h-[86vh] w-[94vw] flex-col border-white/10 bg-slate-950/95 backdrop-blur-xl sm:max-w-[1200px]">
-        <DialogHeader className="shrink-0">
-          <DialogTitle className="text-sm">{TASK_LABEL[name] ?? name} — Agent 工作台</DialogTitle>
-        </DialogHeader>
-        <div className="flex min-h-0 flex-1 gap-3">
-          {/* unit list */}
-          <ScrollArea className="w-60 shrink-0 rounded-xl border border-white/[0.08] bg-white/[0.02]">
-            <div className="p-1.5">
-              {Array.from({ length: total }, (_, i) => {
-                const st = states[String(i)] ?? "p";
-                const lab = t.labels?.[String(i)];
-                const iter = t.iters?.[String(i)];
-                return (
-                  <button
-                    key={i}
-                    onClick={() => setIdx(i)}
-                    className={cn(
-                      "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors",
-                      idx === i ? "bg-cyan-500/15 text-cyan-300" : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-200",
-                    )}
-                  >
-                    <span className={cn("h-2 w-2 shrink-0 rounded-full", STATE_DOT[st])} />
-                    <span className="shrink-0 font-mono">#{i + 1}</span>
-                    <span className="truncate">{lab || STATE_TXT[st]}</span>
-                    {iter && <span className="ml-auto shrink-0 font-mono text-[10px] text-slate-600">{iter}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          </ScrollArea>
-          {/* full-height trace */}
-          <div className="min-h-0 min-w-0 flex-1">
-            <ShotTrace
-              key={idx} tall
-              jobId={jobId} task={name} idx={idx}
-              label={t.labels?.[String(idx)]} iters={t.iters?.[String(idx)]}
-            />
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
+// ── segment grid ────────────────────────────────────────────────────────────
 
 function SegGrid({
-  name, t, jobId, jobRunning, sel, onSelect, onRetryFailed,
+  name, t, jobId, jobRunning, sel, onSelect, onRetryFailed, onOpenWorkbench,
 }: {
   name: string; t: TaskInfo; jobId?: string | null; jobRunning?: boolean;
   sel: number | null; onSelect: (idx: number | null) => void;
   onRetryFailed?: () => void;
+  onOpenWorkbench?: (idx?: number) => void;
 }) {
   const total = t.total ?? 0;
   const states = t.states ?? {};
-  const [workbench, setWorkbench] = useState(false);
 
   const cells = useMemo(
     () => Array.from({ length: total }, (_, i) => states[String(i)] ?? "p"),
@@ -268,10 +121,10 @@ function SegGrid({
       <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
         <span className="flex items-center gap-2 text-[13px] font-semibold text-slate-200">
           {TASK_LABEL[name] ?? name}
-          {jobId && (
+          {jobId && onOpenWorkbench && (
             <Button variant="outline" size="sm"
               className="h-5 gap-1 border-cyan-500/25 bg-cyan-500/[0.06] px-1.5 text-[10px] text-cyan-300 hover:bg-cyan-500/15"
-              onClick={() => setWorkbench(true)}>
+              onClick={() => onOpenWorkbench()}>
               <Maximize2 className="h-2.5 w-2.5" /> 工作台
             </Button>
           )}
@@ -296,8 +149,8 @@ function SegGrid({
           {t.eta && running > 0 ? ` · 预计还需 ${(t.eta / 60).toFixed(1)} 分钟` : ""}
         </span>
       </div>
+
       {total <= 24 ? (
-        /* few units → informative chips: what each agent is assigned to */
         <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 xl:grid-cols-3">
           {cells.map((s, i) => {
             const lab = t.labels?.[String(i)];
@@ -319,7 +172,6 @@ function SegGrid({
           })}
         </div>
       ) : (
-        /* many units → dense squares */
         <div className="flex flex-wrap gap-[3px]">
           {cells.map((s, i) => {
             const lab = t.labels?.[String(i)];
@@ -335,6 +187,7 @@ function SegGrid({
           })}
         </div>
       )}
+
       <AnimatePresence>
         {jobId && sel !== null && (
           <motion.div
@@ -344,32 +197,31 @@ function SegGrid({
             exit={{ opacity: 0, height: 0 }}
             className="overflow-hidden"
           >
-            <ShotTrace
+            <InlineTrace
               jobId={jobId} task={name} idx={sel}
               label={t.labels?.[String(sel)]} iters={t.iters?.[String(sel)]}
               onClose={() => onSelect(null)}
+              onOpenWorkbench={() => onOpenWorkbench?.(sel)}
             />
           </motion.div>
         )}
       </AnimatePresence>
-      {workbench && jobId && (
-        <Workbench name={name} t={t} jobId={jobId} onClose={() => setWorkbench(false)} />
-      )}
     </motion.div>
   );
 }
 
 /**
- * Fine-grained execution monitor. Click a cell for its inline trace, or open
- * the near-fullscreen workbench (unit list + full-height expanded trace).
+ * Fine-grained execution monitor. Cells open a quick inline glance; the full
+ * immersive workbench is owned by the parent view (onOpenWorkbench).
  */
 export default function TaskGrids({
-  tasks, jobId, jobRunning, onRetryFailed,
+  tasks, jobId, jobRunning, onRetryFailed, onOpenWorkbench,
 }: {
   tasks: Record<string, TaskInfo>;
   jobId?: string | null;
   jobRunning?: boolean;
   onRetryFailed?: (task: string) => void;
+  onOpenWorkbench?: (task: string, idx?: number) => void;
 }) {
   const [sel, setSel] = useState<{ task: string; idx: number } | null>(null);
   const entries = Object.entries(tasks ?? {});
@@ -382,6 +234,7 @@ export default function TaskGrids({
           sel={sel?.task === name ? sel.idx : null}
           onSelect={(idx) => setSel(idx === null ? null : { task: name, idx })}
           onRetryFailed={onRetryFailed ? () => onRetryFailed(name) : undefined}
+          onOpenWorkbench={onOpenWorkbench ? (idx) => onOpenWorkbench(name, idx) : undefined}
         />
       ))}
     </div>

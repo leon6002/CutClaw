@@ -18,6 +18,8 @@ import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import TaskGrids from "../components/TaskGrids";
+import AgentWorkbench from "../components/AgentWorkbench";
+import WorkflowCanvas from "../components/flow/WorkflowCanvas";
 import type { PipelineStatus, ProjectState } from "../App";
 
 const basename = (p: string) => p.split(/[\\/]/).pop() || p;
@@ -52,6 +54,8 @@ export default function EditorView({
   const [srtFiles, setSrtFiles] = useState<string[]>([]);
   const [customVideo, setCustomVideo] = useState("");
   const [error, setError] = useState("");
+  const [wb, setWb] = useState<{ task: string; idx?: number } | null>(null);
+  const [monitorView, setMonitorView] = useState<"canvas" | "grid">("canvas");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [sugError, setSugError] = useState("");
@@ -67,13 +71,13 @@ export default function EditorView({
     api<string[]>("/api/files?kind=video").then(setVideoFiles).catch(() => {});
     api<string[]>("/api/files?kind=audio").then(setAudioFiles).catch(() => {});
     api<string[]>("/api/files?kind=srt").then(setSrtFiles).catch(() => {});
-    // Reattach to the latest pipeline job after a page refresh — running OR
-    // finished (its stages/grids/logs live in server memory until restart).
-    api<any>("/api/pipeline/current").then((r) => {
+  }, []);
+
+  // Reattach THIS project's latest pipeline run (page refresh / project switch).
+  useEffect(() => {
+    api<any>(`/api/pipeline/current?project_id=${encodeURIComponent(p.id)}`).then((r) => {
       const j = r.job;
       if (!j) return;
-      // don't show another project's run
-      if (j.meta?.project_id && j.meta.project_id !== project.id) return;
       setPipelineJobId(j.id);
       if (j.status === "running") {
         setProject((old) => ({
@@ -83,7 +87,7 @@ export default function EditorView({
         }));
       }
     }).catch(() => {});
-  }, []);
+  }, [p.id]);
 
   const running = pipelineStatus === "running";
   const allVideoOptions = Array.from(new Set([...p.videos, ...videoFiles]));
@@ -112,6 +116,22 @@ export default function EditorView({
 
   const stop = async () => {
     try { await api("/api/pipeline/stop", { method: "POST" }); } catch { /* ignore */ }
+  };
+
+  // Re-generate one shot: drop its pick server-side, then resume the pipeline
+  // (cached analysis/plan → only this shot is redone).
+  const retryShot = async (sectionIdx: number, shotIdx: number) => {
+    if (running) { setError("流水线正在运行，请先停止再重试单个镜头。"); return; }
+    if (!window.confirm(`重新生成镜头 S${sectionIdx + 1}·Shot${shotIdx + 1}？将重跑流水线，仅补选这个镜头。`)) return;
+    setError("");
+    try {
+      const r = await api<any>("/api/pipeline/retry_shot", {
+        method: "POST",
+        body: JSON.stringify({ project_id: p.id, section_idx: sectionIdx, shot_idx: shotIdx }),
+      });
+      if (r.shot_point) set({ shotPoint: r.shot_point });
+      setPipelineJobId(r.job_id);
+    } catch (e: any) { setError(e.message); }
   };
 
   const fetchParamSug = async () => {
@@ -292,13 +312,9 @@ export default function EditorView({
                 onChange={(e) => set({ targetLength: parseFloat(e.target.value) || 30 })}
               />
             </div>
-            <div className="mb-2 flex items-center gap-3">
-              <span className="w-32 text-xs text-slate-400">单镜头长度（秒）</span>
-              <Input
-                type="number" min={0.2} max={30} step={0.1} value={p.shotLength} disabled={running}
-                className="h-8 w-24 border-white/10 bg-black/25"
-                onChange={(e) => set({ shotLength: parseFloat(e.target.value) || 4 })}
-              />
+            <div className="mb-2 flex items-center gap-2 text-[11px] text-slate-500">
+              <span className="w-32 shrink-0" />
+              单镜头时长由 AI 按音乐节奏自动决定（高潮快切、舒缓长留），无需设置。
             </div>
 
             <div className="mb-5">
@@ -316,17 +332,13 @@ export default function EditorView({
                 <div
                   className={cn(
                     "suggestion-chip",
-                    p.targetLength === paramSug.target_length && p.shotLength === paramSug.shot_length && "picked",
+                    p.targetLength === paramSug.target_length && "picked",
                   )}
-                  onClick={() => !running && set({
-                    targetLength: paramSug.target_length,
-                    shotLength: paramSug.shot_length,
-                  })}
+                  onClick={() => !running && set({ targetLength: paramSug.target_length })}
                   title="点击应用建议参数"
                 >
                   <Lightbulb className="mr-1.5 inline h-3.5 w-3.5 -translate-y-px text-amber-400" />
                   目标 <span className="font-semibold text-cyan-300">{paramSug.target_length}s</span>
-                  {" · "}单镜头 <span className="font-semibold text-cyan-300">{paramSug.shot_length}s</span>
                   {paramSug.rationale && <span className="text-slate-400"> — {paramSug.rationale}</span>}
                 </div>
               )}
@@ -372,10 +384,72 @@ export default function EditorView({
           </CardHeader>
           <CardContent>
             <AgentFlow steps={PIPELINE_STEPS} stages={stagesView} />
-            <TaskGrids
-              tasks={job.meta.tasks ?? {}} jobId={pipelineJobId} jobRunning={running}
-              onRetryFailed={(task) => { if (task === "editor_shots") start(); }}
-            />
+
+            {/* monitor view toggle: node canvas (agents) / dense grid */}
+            <div className="mb-2 flex items-center gap-1 text-xs">
+              <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                {(["canvas", "grid"] as const).map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => setMonitorView(v)}
+                    className={cn(
+                      "rounded-md px-2.5 py-1 font-medium transition-colors",
+                      monitorView === v ? "bg-cyan-500/15 text-cyan-300" : "text-slate-400 hover:text-slate-200",
+                    )}
+                  >
+                    {v === "canvas" ? "节点画布" : "密度网格"}
+                  </button>
+                ))}
+              </div>
+              {monitorView === "canvas" && (
+                <span className="text-[11px] text-slate-500">
+                  点击步骤节点展开参数/思考 · 点击编剧节点看提示词 · 拖拽平移，滚轮缩放
+                </span>
+              )}
+            </div>
+
+            {monitorView === "canvas" && pipelineJobId ? (
+              <>
+                <WorkflowCanvas
+                  jobId={pipelineJobId}
+                  tasks={job.meta.tasks ?? {}}
+                  jobRunning={running}
+                  onOpenScreenwriter={() => setWb({ task: "screenwriter_llm" })}
+                  onRetryShot={retryShot}
+                  // workbench renders INSIDE the canvas (also visible in fullscreen)
+                  overlay={wb && (job.meta.tasks ?? {})[wb.task] ? (
+                    <AgentWorkbench
+                      key={`${wb.task}-${wb.idx ?? "auto"}`} embedded
+                      name={wb.task} t={job.meta.tasks[wb.task]} jobId={pipelineJobId}
+                      initialIdx={wb.idx} onClose={() => setWb(null)}
+                    />
+                  ) : undefined}
+                />
+                {/* batch tasks (audio/clip captioning) stay as grids under the canvas */}
+                <TaskGrids
+                  tasks={Object.fromEntries(Object.entries(job.meta.tasks ?? {})
+                    .filter(([k]) => !["editor_shots", "editor_rounds", "screenwriter_llm"].includes(k))) as Record<string, import("../components/trace").TaskInfo>}
+                  jobId={pipelineJobId} jobRunning={running}
+                  onOpenWorkbench={(task, idx) => setWb({ task, idx })}
+                />
+              </>
+            ) : (
+              <>
+                <TaskGrids
+                  tasks={Object.fromEntries(Object.entries(job.meta.tasks ?? {})
+                    .filter(([k]) => k !== "editor_rounds")) as Record<string, import("../components/trace").TaskInfo>}
+                  jobId={pipelineJobId} jobRunning={running}
+                  onRetryFailed={(task) => { if (task === "editor_shots") start(); }}
+                  onOpenWorkbench={(task, idx) => setWb({ task, idx })}
+                />
+                {wb && pipelineJobId && (job.meta.tasks ?? {})[wb.task] && (
+                  <AgentWorkbench
+                    name={wb.task} t={job.meta.tasks[wb.task]} jobId={pipelineJobId}
+                    initialIdx={wb.idx} onClose={() => setWb(null)}
+                  />
+                )}
+              </>
+            )}
             {job.status === "done" && (
               <div className="mb-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-400">
                 流水线完成！切换到「渲染导出」生成视频。
@@ -383,10 +457,12 @@ export default function EditorView({
             )}
             {job.status === "error" && (
               <div className="mb-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">
-                流水线失败 — 查看下方日志。缓存已保存，修复后重新运行会跳过已完成步骤。
+                流水线失败 — 打开右下角「流水线终端」查看日志。缓存已保存，修复后重新运行会跳过已完成步骤。
               </div>
             )}
-            <JobLog lines={job.lines} />
+            <div className="mt-1 text-xs text-slate-500">
+              完整日志在右下角悬浮的「流水线终端」中查看（可拖动 / 最小化）。
+            </div>
           </CardContent>
         </Card>
       )}

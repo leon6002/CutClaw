@@ -88,7 +88,8 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         import litellm
         from src.utils.media_utils import array_to_base64, seconds_to_hhmmss
         from src.video.deconstruction.video_caption import SYSTEM_PROMPT, messages as caption_msgs
-        from src.prompt import DENSE_CAPTION_PROMPT_FILM
+        # One unified, content-adaptive prompt — describes people OR scenery, no toggle.
+        from src.prompt import DENSE_CAPTION_PROMPT_FILM as _dense_tmpl
 
         vr = video_reader
         if vr is None:
@@ -111,7 +112,7 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         # Build prompt
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
         req_dur = end_sec - start_sec
-        prompt = DENSE_CAPTION_PROMPT_FILM.replace(
+        prompt = _dense_tmpl.replace(
             "MAIN_CHARACTER_NAME_PLACEHOLDER", "the subject"
         ).replace("MIN_SEGMENT_DURATION_PLACEHOLDER", str(max(2.0, req_dur / 10)))
         prompt += (
@@ -140,17 +141,71 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         if m:
             content = m.group(1).strip()
         result = json.loads(content)
-        segments = result.get("segments", []) if isinstance(result, dict) else []
-        # Convert relative timestamps to absolute
-        for seg in segments:
+        raw_segments = result.get("segments", []) if isinstance(result, dict) else []
+        # Convert relative timestamps to absolute, with a scale-correction. The VLM
+        # sometimes writes seconds in MM:SS form ("12 seconds" -> "00:12:00" =
+        # 720s), which blows up the timeline: the real 12-18s of an 18s clip get
+        # labeled 720-1080s, so the editor can't find them and only ever picks
+        # from the (correctly-timed) start. Our shots are always < 60s, so any
+        # relative time that overshoots the clip by a large factor is a ×60
+        # mis-slotting -- RECOVER it by /60 (keeping the real description) rather
+        # than discarding the segment. Only genuinely tiny overshoots get clamped.
+        _clip_dur = max(0.0, end_sec - start_sec)
+
+        def _rescale(v: float) -> float:
+            if _clip_dur <= 0:
+                return max(0.0, v)
+            if v <= _clip_dur + 0.5:
+                return max(0.0, v)                       # already valid
+            if v >= _clip_dur * 2 and v / 60.0 <= _clip_dur + 0.5:
+                return v / 60.0                          # ×60 mis-slot -> recover
+            return _clip_dur                             # minor overshoot -> clamp
+
+        segments = []
+        for seg in raw_segments:
             ts = seg.get("timestamp", "")
             rm = _re3.search(r'([\d:.]+)\s+to\s+([\d:.]+)', ts, _re3.IGNORECASE)
-            if rm:
-                s_rel = sum(float(x) * m2 for x, m2 in zip(reversed(rm.group(1).split(":")), [1, 60, 3600]))
-                e_rel = sum(float(x) * m2 for x, m2 in zip(reversed(rm.group(2).split(":")), [1, 60, 3600]))
-                seg["timestamp_absolute"] = f"{seconds_to_hhmmss(start_sec + s_rel)} to {seconds_to_hhmmss(start_sec + e_rel)}"
-                seg["start_sec_abs"] = round(start_sec + s_rel, 2)
-                seg["end_sec_abs"] = round(start_sec + e_rel, 2)
+            if not rm:
+                continue
+            s_rel = _rescale(sum(float(x) * m2 for x, m2 in zip(reversed(rm.group(1).split(":")), [1, 60, 3600])))
+            e_rel = _rescale(sum(float(x) * m2 for x, m2 in zip(reversed(rm.group(2).split(":")), [1, 60, 3600])))
+            if e_rel - s_rel < 0.1:
+                continue  # still degenerate after correction -> drop
+            seg["timestamp_absolute"] = f"{seconds_to_hhmmss(start_sec + s_rel)} to {seconds_to_hhmmss(start_sec + e_rel)}"
+            seg["start_sec_abs"] = round(start_sec + s_rel, 2)
+            seg["end_sec_abs"] = round(start_sec + e_rel, 2)
+            segments.append(seg)
+
+        # Cap segment length: a very long uniform segment (e.g. a static landscape
+        # held for 10s+) is split into equal ~MAX-second anchors carrying the same
+        # description. Cheap (no extra VLM calls) and guarantees the editor's cache
+        # lookup always finds coverage, so it never needs a fresh call.
+        _max_seg = float(getattr(config, "DENSE_CAPTION_MAX_SEGMENT_SEC", 6.0))
+        if _max_seg > 0 and segments:
+            import math as _math_cap
+            capped = []
+            for seg in segments:
+                try:
+                    _s = float(seg.get("start_sec_abs")); _e = float(seg.get("end_sec_abs"))
+                except (TypeError, ValueError):
+                    capped.append(seg); continue
+                _dur = _e - _s
+                if _dur <= _max_seg or _dur <= 0:
+                    capped.append(seg); continue
+                _n = int(_math_cap.ceil(_dur / _max_seg))
+                _step = _dur / _n
+                for _k in range(_n):
+                    _cs = _s + _k * _step
+                    _ce = _e if _k == _n - 1 else _s + (_k + 1) * _step
+                    sub = dict(seg)
+                    sub["start_sec_abs"] = round(_cs, 2)
+                    sub["end_sec_abs"] = round(_ce, 2)
+                    sub["timestamp_absolute"] = f"{seconds_to_hhmmss(_cs)} to {seconds_to_hhmmss(_ce)}"
+                    sub["timestamp"] = f"{seconds_to_hhmmss(_cs - start_sec)} to {seconds_to_hhmmss(_ce - start_sec)}"
+                    if _n > 1:
+                        sub["_split_part"] = f"{_k + 1}/{_n}"
+                    capped.append(sub)
+            segments = capped
         return segments
     except Exception as e:
         print(f"[DenseCaption] Failed for {video_path} [{start_sec:.1f}-{end_sec:.1f}]: {e}")
@@ -213,17 +268,26 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
         with open(shot_scenes_file, "r") as _sf:
             _scontent = _sf.read().strip()
         if not _scontent:
-            # Get total frame count from the video reader
-            _reader = vr.get("video_reader") if isinstance(vr, dict) else None
-            _total_frames = len(_reader) if _reader else int(metadata.get("duration_sec", 0) * config.VIDEO_FPS)
-            if _total_frames > 0:
+            # shot_scenes.txt is in SAMPLED-frame space — video_caption converts
+            # frames→seconds via `frame / SHOT_DETECTION_FPS`. Use the SAMPLED
+            # frame count (num_frames), NOT len(video_reader) (SOURCE frames):
+            # writing source frames here divided by SHOT_DETECTION_FPS inflated a
+            # short single-shot clip to a phantom 30s+ span (e.g. an 11.3s drone
+            # clip → "0-30s"), so the editor sliced one continuous take into
+            # repetitive adjacent windows.
+            _sampled = 0
+            if isinstance(vr, dict):
+                _sampled = vr.get("num_frames") or len(vr.get("frame_indices") or [])
+            if not _sampled:
+                _sampled = int(metadata.get("duration_sec", 0) * config.VIDEO_FPS)
+            if _sampled > 0:
                 with open(shot_scenes_file, "w") as _sf:
-                    _sf.write(f"0 {_total_frames - 1}\n")
+                    _sf.write(f"0 {_sampled - 1}\n")
                 # Update vr dict so process_video picks it up
                 if isinstance(vr, dict) and "scenes" in vr:
-                    vr["scenes"] = [[0, _total_frames - 1]]
+                    vr["scenes"] = [[0, _sampled - 1]]
                 num_scenes = 1
-                print(f"🔧 [Analyze] No shot boundaries — treating entire video as 1 clip ({_total_frames} frames)")
+                print(f"🔧 [Analyze] No shot boundaries — treating entire video as 1 clip ({_sampled} sampled frames)")
 
     _emit("shot_detection", "done", f"{num_scenes} shot boundaries · {time.time() - t0:.1f}s")
 
@@ -397,8 +461,16 @@ def analyze_video(
         return content_hash
 
     _save_metadata(cache_dir, metadata)
-    # If forcing, remove cached shot_scenes to re-detect boundaries
+    # If forcing, clear ALL cached analysis artifacts so every step re-runs.
+    # Removing only shot_scenes.txt left captions/scenes/summaries in place, and
+    # each step skips when its output exists — so a "re-annotate" silently kept
+    # the old captions/scene analysis. Nuke captions/ + shot_scenes for a true
+    # full re-analysis (frames aren't persisted, so nothing else to clear).
     if force:
+        import shutil as _shutil
+        _cap_dir = os.path.join(cache_dir, "captions")
+        if os.path.isdir(_cap_dir):
+            _shutil.rmtree(_cap_dir, ignore_errors=True)
         old_scenes = os.path.join(cache_dir, "frames", "shot_scenes.txt")
         if os.path.exists(old_scenes):
             os.unlink(old_scenes)

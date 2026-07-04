@@ -12,6 +12,33 @@ from src.video.deconstruction.get_character import analyze_subtitles
 # import src.config as config
 
 
+class _SafeStream:
+    """Swallow broken-pipe errors on stdout/stderr.
+
+    When the web backend (our parent) restarts, the stdout pipe dies and the
+    next print() would crash the whole pipeline. With this wrapper the orphaned
+    run keeps going silently and still writes all results/checkpoints to disk.
+    """
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, data):
+        try:
+            return self._s.write(data)
+        except OSError:
+            return len(data)
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
 def _configure_console_encoding() -> None:
     """Avoid UnicodeEncodeError on Windows GBK consoles when printing emojis."""
     for stream in (sys.stdout, sys.stderr):
@@ -21,6 +48,8 @@ def _configure_console_encoding() -> None:
                 reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+    sys.stdout = _SafeStream(sys.stdout)
+    sys.stderr = _SafeStream(sys.stderr)
 
 
 def _ensure_conda_bin_on_path() -> None:
@@ -163,15 +192,10 @@ def main():
     # Generate a safe filename from instruction
     import re
     import hashlib
-    # Create a short hash of the instruction for uniqueness
+    # Hash-only id → always ASCII, no filename sanitization needed. Projects are
+    # tracked by project_id in the app, so a human-readable name adds no value.
     instruction_hash = hashlib.md5(Instruction.encode('utf-8')).hexdigest()[:8]
-    # Create a more readable version (up to 50 characters, sanitized)
-    instruction_safe = re.sub(r'[^\w\s-]', '', Instruction)[:50].strip().replace(' ', '_')
-    # If instruction is too long or empty, use a more informative format
-    if len(instruction_safe) > 0:
-        instruction_id = f"{instruction_safe}_{instruction_hash}"
-    else:
-        instruction_id = f"instruction_{instruction_hash}"
+    instruction_id = f"instruction_{instruction_hash}"
 
     # ===== All Path Definitions =====
     # Project ID is based on the primary video hash + audio
