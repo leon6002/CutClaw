@@ -754,6 +754,12 @@ def render_video_ffmpeg(
     video_fps = get_video_framerate(video_path)
     audio_ar = get_audio_samplerate(video_path)
     print(f"Detected audio sample rate: {audio_ar} Hz")
+    # Cap AAC sample rate at 48 kHz: a 96 kHz music source propagates into
+    # 96 kHz AAC output, which Windows Media Player / Films & TV cannot open
+    # ("unsupported encoding settings") even though browsers play it fine.
+    if audio_ar > 48000:
+        print(f"  → capping output sample rate {audio_ar} Hz → 48000 Hz (player compatibility)")
+        audio_ar = 48000
 
     # Determine label position coordinates
     position_map = {
@@ -1295,6 +1301,7 @@ def render_video_ffmpeg(
                     '-map', '[aout]',
                     '-c:v', *video_codec,
                     '-c:a', 'aac',
+                    '-ar', str(audio_ar),
                     '-t', str(total_duration),
                     output_path
                 ]
@@ -1338,6 +1345,7 @@ def render_video_ffmpeg(
                     '-filter_complex', filter_complex,
                     '-c:v', *video_codec,
                     '-c:a', 'aac',
+                    '-ar', str(audio_ar),
                     '-map', '0:v:0',
                     '-map', '[aout]',
                     '-t', str(total_duration),
