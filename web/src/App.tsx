@@ -1,10 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { Button, ConfigProvider, Input, Layout, Menu, Modal, Select, Tag, theme as antdTheme } from "antd";
+import { motion } from "framer-motion";
 import {
-  FolderOpenOutlined, PlusOutlined, ProjectOutlined, ScissorOutlined,
-  SettingOutlined, VideoCameraOutlined,
-} from "@ant-design/icons";
-import zhCN from "antd/locale/zh_CN";
+  AudioLines, Clapperboard, FolderOpen, PenLine, Plus, Scissors,
+  Settings2, Sparkles, Video,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { api, useJob, type JobState } from "./api";
 import AgentFlow from "./components/AgentFlow";
 import AssetsView from "./views/AssetsView";
@@ -24,25 +35,28 @@ export interface ProjectState {
   targetLength: number;
   shotLength: number;
   selectionRationale: string;
-  shotPoint: string;      // path of shot_point json for rendering
-  effectiveVideo: string; // primary/merged video used by the pipeline
+  shotPoint: string;
+  effectiveVideo: string;
 }
 
 export type PipelineStatus = "idle" | "running" | "done" | "error";
 
-const BADGE: Record<PipelineStatus, [string, string]> = {
-  idle: ["default", "空闲"],
-  running: ["gold", "运行中…"],
-  done: ["green", "已完成"],
-  error: ["red", "失败"],
+const BADGE_CLS: Record<PipelineStatus, string> = {
+  idle: "border-white/15 bg-white/5 text-slate-400",
+  running: "border-cyan-500/40 bg-cyan-500/10 text-cyan-300 shadow-[0_0_10px_rgba(34,211,238,0.2)]",
+  done: "border-emerald-500/40 bg-emerald-500/10 text-emerald-400",
+  error: "border-red-500/40 bg-red-500/10 text-red-400",
+};
+const BADGE_TXT: Record<PipelineStatus, string> = {
+  idle: "空闲", running: "运行中…", done: "已完成", error: "失败",
 };
 
 const WORKFLOW_STEPS = [
-  { key: "select", label: "挑选素材", icon: "✨" },
-  { key: "analyze", label: "素材分析", icon: "🎧" },
-  { key: "screenwriter", label: "AI 编剧", icon: "✍️" },
-  { key: "editor", label: "AI 剪辑", icon: "✂️" },
-  { key: "render", label: "渲染导出", icon: "🎬" },
+  { key: "select", label: "挑选素材", icon: <Sparkles className="h-4 w-4" /> },
+  { key: "analyze", label: "素材分析", icon: <AudioLines className="h-4 w-4" /> },
+  { key: "screenwriter", label: "AI 编剧", icon: <PenLine className="h-4 w-4" /> },
+  { key: "editor", label: "AI 剪辑", icon: <Scissors className="h-4 w-4" /> },
+  { key: "render", label: "渲染导出", icon: <Video className="h-4 w-4" /> },
 ];
 const WORKFLOW_TAB: Record<string, string> = {
   select: "assets", analyze: "editor", screenwriter: "editor", editor: "editor", render: "render",
@@ -54,6 +68,12 @@ const NEXT_HINT: Record<string, string> = {
   editor: "等待编剧完成",
   render: "选择比例渲染成片",
 };
+
+const NAV_TABS = [
+  { key: "assets", label: "素材库", icon: FolderOpen },
+  { key: "editor", label: "项目编辑", icon: Scissors },
+  { key: "render", label: "渲染导出", icon: Video },
+];
 
 function toState(p: any): ProjectState {
   return {
@@ -76,20 +96,17 @@ function toPatch(s: ProjectState): Record<string, any> {
   };
 }
 
-/** Derive the global workflow node states from project + pipeline state. */
 function deriveWorkflow(
   project: ProjectState, pipelineJob: JobState, pipelineStatus: PipelineStatus, outputsCount: number,
 ): Record<string, { status: string; detail?: string }> {
   const stages: Record<string, string> = pipelineJob.meta.stages ?? {};
   const w: Record<string, { status: string; detail?: string }> = {};
 
-  // 1. select
   const hasMaterial = project.videos.length > 0 && !!project.audio;
   w.select = hasMaterial
     ? { status: "done", detail: `${project.videos.length} 视频 · 1 音乐` }
     : { status: "pending" };
 
-  // 2-4. pipeline stages
   const anaKeys = ["shot_detection", "asr", "video_captioning", "audio_analysis"];
   const anaVals = anaKeys.map((k) => stages[k] ?? "pending");
   const sw = stages["screenwriter"] ?? "pending";
@@ -116,12 +133,10 @@ function deriveWorkflow(
     if (w.editor.status !== "error") w.editor = { status: "done" };
   }
 
-  // 5. render
   w.render = outputsCount > 0
     ? { status: "done", detail: `${outputsCount} 个成片` }
     : { status: "pending" };
 
-  // highlight the next actionable step
   const order = ["select", "analyze", "screenwriter", "editor", "render"];
   for (const k of order) {
     const st = w[k].status;
@@ -146,7 +161,6 @@ export default function App() {
   const skipSave = useRef(true);
   const saveTimer = useRef<number>(0);
 
-  // pipeline job state lives here so the global workflow bar can see it
   const [pipelineJobId, setPipelineJobId] = useState<string | null>(null);
   const pipelineJob = useJob(pipelineJobId);
   const [pipelineStatus, setPipelineStatus] = useState<PipelineStatus>("idle");
@@ -180,7 +194,6 @@ export default function App() {
     })();
   }, []);
 
-  // debounced autosave of the active project
   useEffect(() => {
     if (!project) return;
     if (skipSave.current) { skipSave.current = false; return; }
@@ -215,107 +228,131 @@ export default function App() {
     } catch { /* ignore */ }
   };
 
-  const [badgeColor, badgeText] = BADGE[pipelineStatus];
   const workflow = project ? deriveWorkflow(project, pipelineJob, pipelineStatus, outputsCount) : {};
 
   return (
-    <ConfigProvider
-      locale={zhCN}
-      theme={{
-        algorithm: antdTheme.darkAlgorithm,
-        token: {
-          colorPrimary: "#ff6b4a",
-          colorBgBase: "#0d0f13",
-          colorBgContainer: "#171a21",
-          colorBgElevated: "#1d212a",
-          borderRadius: 8,
-          fontSize: 14,
-        },
-        components: {
-          Layout: { headerBg: "#12151b", bodyBg: "#0d0f13", headerHeight: 56 },
-          Menu: { darkItemBg: "transparent" },
-        },
-      }}
-    >
-      <Layout style={{ minHeight: "100vh" }}>
-        <Layout.Header style={{ display: "flex", alignItems: "center", gap: 14, paddingInline: 20, borderBottom: "1px solid #262b36" }}>
-          <div style={{ fontWeight: 700, fontSize: 17, whiteSpace: "nowrap" }}>
-            🎬 Cut<span style={{ color: "#ff6b4a" }}>Claw</span>
+    <TooltipProvider delayDuration={200}>
+      <div className="flex min-h-screen flex-col">
+        {/* ── glass header ── */}
+        <header className="sticky top-0 z-40 border-b border-white/[0.07] bg-slate-950/60 backdrop-blur-xl">
+          <div className="mx-auto flex h-14 max-w-[1320px] items-center gap-3 px-5">
+            <div className="flex items-center gap-2 whitespace-nowrap text-[17px] font-bold">
+              <Clapperboard className="h-5 w-5 text-cyan-400 drop-shadow-[0_0_6px_rgba(34,211,238,0.7)]" />
+              <span>Cut<span className="text-cyan-400">Claw</span></span>
+            </div>
+
+            <Select value={project?.id} onValueChange={switchProject}>
+              <SelectTrigger className="h-8 w-[190px] border-white/10 bg-white/[0.04] text-xs">
+                <SelectValue placeholder="选择项目" />
+              </SelectTrigger>
+              <SelectContent>
+                {projects.map((p) => (
+                  <SelectItem key={p.id} value={p.id} className="text-xs">
+                    {p.name}{p.last_run_status === "done" ? " ✓" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button variant="outline" size="sm" className="h-8 gap-1 border-white/10 bg-white/[0.04] text-xs"
+              onClick={() => setNewModal(true)}>
+              <Plus className="h-3.5 w-3.5" /> 新建
+            </Button>
+
+            {/* nav with neon active glow */}
+            <nav className="ml-2 flex flex-1 items-center gap-1">
+              {NAV_TABS.map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => setTab(t.key)}
+                  className={cn(
+                    "relative flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-[13px] font-medium transition-colors",
+                    tab === t.key ? "text-cyan-300" : "text-slate-400 hover:text-slate-200",
+                  )}
+                >
+                  {tab === t.key && (
+                    <motion.span
+                      layoutId="nav-glow"
+                      className="absolute inset-0 rounded-lg border border-cyan-500/30 bg-cyan-500/10 shadow-[0_0_14px_rgba(34,211,238,0.15)]"
+                      transition={{ type: "spring", stiffness: 400, damping: 32 }}
+                    />
+                  )}
+                  <t.icon className="relative h-3.5 w-3.5" />
+                  <span className="relative">{t.label}</span>
+                </button>
+              ))}
+            </nav>
+
+            <Badge variant="outline" className={cn("px-2.5", BADGE_CLS[pipelineStatus])}>
+              {pipelineStatus === "running" && (
+                <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" />
+              )}
+              {BADGE_TXT[pipelineStatus]}
+            </Badge>
+            <Button variant="outline" size="sm" className="h-8 gap-1 border-white/10 bg-white/[0.04] text-xs"
+              onClick={() => setShowSettings(true)}>
+              <Settings2 className="h-3.5 w-3.5" /> 模型设置
+            </Button>
           </div>
+        </header>
 
-          <Select
-            size="small" style={{ minWidth: 180 }}
-            suffixIcon={<ProjectOutlined />}
-            value={project?.id} onChange={switchProject}
-            options={projects.map((p) => ({
-              value: p.id,
-              label: p.name + (p.last_run_status === "done" ? " ✓" : ""),
-            }))}
-          />
-          <Button size="small" icon={<PlusOutlined />} onClick={() => setNewModal(true)}>新建</Button>
-
-          <Menu
-            mode="horizontal" theme="dark" selectedKeys={[tab]}
-            onClick={(e) => setTab(e.key)}
-            style={{ flex: 1, minWidth: 300, background: "transparent", borderBottom: "none" }}
-            items={[
-              { key: "assets", icon: <FolderOpenOutlined />, label: "素材库" },
-              { key: "editor", icon: <ScissorOutlined />, label: "项目编辑" },
-              { key: "render", icon: <VideoCameraOutlined />, label: "渲染导出" },
-            ]}
-          />
-          <Tag color={badgeColor}>{badgeText}</Tag>
-          <Button size="small" icon={<SettingOutlined />} onClick={() => setShowSettings(true)}>模型设置</Button>
-        </Layout.Header>
-
-        <Layout.Content style={{ padding: 24 }}>
-          <div style={{ maxWidth: 1280, margin: "0 auto" }}>
-            {!loaded || !project ? (
-              <span style={{ color: "#888" }}>正在连接 CutClaw 服务…</span>
-            ) : (
-              <>
-                {/* global workflow: where you are + what's next (click to jump) */}
-                <div className="workflow-bar">
+        {/* ── content ── */}
+        <main className="mx-auto w-full max-w-[1320px] flex-1 px-5 py-5">
+          {!loaded || !project ? (
+            <div className="py-20 text-center text-sm text-slate-500">正在连接 CutClaw 服务…</div>
+          ) : (
+            <>
+              <Card className={cn(
+                "mb-5 rounded-2xl border-white/[0.07] bg-slate-900/50 py-2",
+                pipelineStatus === "running" && "border-beam",
+              )}>
+                <CardContent className="px-4 py-1">
                   <AgentFlow
                     steps={WORKFLOW_STEPS} stages={workflow}
                     onStepClick={(k) => setTab(WORKFLOW_TAB[k] ?? tab)}
                   />
-                </div>
+                </CardContent>
+              </Card>
 
-                <div style={{ display: tab === "assets" ? "block" : "none" }}>
-                  <AssetsView project={project} setProject={setProject} />
-                </div>
-                <div style={{ display: tab === "editor" ? "block" : "none" }}>
-                  <EditorView
-                    project={project} setProject={setProject}
-                    pipelineStatus={pipelineStatus}
-                    pipelineJobId={pipelineJobId} setPipelineJobId={setPipelineJobId}
-                    pipelineJob={pipelineJob}
-                  />
-                </div>
-                <div style={{ display: tab === "render" ? "block" : "none" }}>
-                  <RenderView
-                    project={project} setProject={setProject}
-                    pipelineStatus={pipelineStatus} onOutputsCount={setOutputsCount}
-                  />
-                </div>
-              </>
-            )}
-          </div>
-        </Layout.Content>
-      </Layout>
+              <div style={{ display: tab === "assets" ? "block" : "none" }}>
+                <AssetsView project={project} setProject={setProject} />
+              </div>
+              <div style={{ display: tab === "editor" ? "block" : "none" }}>
+                <EditorView
+                  project={project} setProject={setProject}
+                  pipelineStatus={pipelineStatus}
+                  pipelineJobId={pipelineJobId} setPipelineJobId={setPipelineJobId}
+                  pipelineJob={pipelineJob}
+                />
+              </div>
+              <div style={{ display: tab === "render" ? "block" : "none" }}>
+                <RenderView
+                  project={project} setProject={setProject}
+                  pipelineStatus={pipelineStatus} onOutputsCount={setOutputsCount}
+                />
+              </div>
+            </>
+          )}
+        </main>
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+        {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
 
-      <Modal
-        open={newModal} title="新建项目" okText="创建" cancelText="取消"
-        onOk={createProject} onCancel={() => setNewModal(false)}
-      >
-        <Input
-          placeholder="项目名称（如：新疆草原混剪）" value={newName} autoFocus
-          onChange={(e) => setNewName(e.target.value)} onPressEnter={createProject}
-        />
-      </Modal>
-    </ConfigProvider>
+        <Dialog open={newModal} onOpenChange={(o) => !o && setNewModal(false)}>
+          <DialogContent className="border-white/10 bg-slate-900/90 backdrop-blur-xl sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>新建项目</DialogTitle>
+            </DialogHeader>
+            <Input
+              placeholder="项目名称（如：新疆草原混剪）" value={newName} autoFocus
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && createProject()}
+            />
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setNewModal(false)}>取消</Button>
+              <Button onClick={createProject}>创建</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    </TooltipProvider>
   );
 }

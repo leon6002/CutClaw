@@ -3,21 +3,21 @@
     "name": "Gemini Flash (bboluo)",
     "model": "openai/[L]gemini-3-flash-preview",
     "endpoint": "https://bboluo.com/v1",
-    "api_key": "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3",
+    "api_key": "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL",
     "multimodal": true
   },
   {
     "name": "DeepSeek V4 Pro",
     "model": "deepseek/deepseek-v4-pro",
     "endpoint": "https://api.deepseek.com/v1",
-    "api_key": "",
+    "api_key": "sk-11bedec4d36c44e6b374baa3c55a83dc",
     "multimodal": false
   },
   {
     "name": "DeepSeek V4 Flash",
     "model": "deepseek/deepseek-v4-flash",
     "endpoint": "https://api.deepseek.com/v1",
-    "api_key": "",
+    "api_key": "sk-11bedec4d36c44e6b374baa3c55a83dc",
     "multimodal": false
   },
   {

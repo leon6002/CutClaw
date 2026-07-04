@@ -1,0 +1,224 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── shadcn/ui theme tokens (dark-only, slate base + cyan primary) ── */
+:root, .dark {
+  --radius: 0.625rem;
+  --background: oklch(0.13 0.018 260);
+  --foreground: oklch(0.95 0.008 250);
+  --card: oklch(0.21 0.022 258 / 0.5);
+  --card-foreground: oklch(0.95 0.008 250);
+  --popover: oklch(0.19 0.02 258);
+  --popover-foreground: oklch(0.95 0.008 250);
+  --primary: oklch(0.8 0.13 205);
+  --primary-foreground: oklch(0.16 0.02 258);
+  --secondary: oklch(0.26 0.02 258);
+  --secondary-foreground: oklch(0.9 0.01 250);
+  --muted: oklch(0.24 0.02 258);
+  --muted-foreground: oklch(0.65 0.015 255);
+  --accent: oklch(0.27 0.03 220);
+  --accent-foreground: oklch(0.93 0.01 250);
+  --destructive: oklch(0.62 0.19 25);
+  --destructive-foreground: oklch(0.97 0.01 250);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: oklch(0.72 0.11 205);
+  --chart-1: oklch(0.78 0.13 205);
+  --chart-2: oklch(0.76 0.16 160);
+  --chart-3: oklch(0.8 0.14 85);
+  --chart-4: oklch(0.7 0.17 300);
+  --chart-5: oklch(0.68 0.18 25);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  html, body, #root { height: 100%; }
+  body {
+    @apply text-foreground antialiased;
+    background:
+      radial-gradient(1100px 700px at 15% -10%, rgb(14 60 86 / 0.5), transparent 60%),
+      radial-gradient(900px 600px at 105% 5%, rgb(10 70 66 / 0.4), transparent 60%),
+      radial-gradient(700px 500px at 50% 110%, rgb(40 30 80 / 0.3), transparent 60%),
+      oklch(0.13 0.018 260);
+    background-attachment: fixed;
+    font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 0.12); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(255 255 255 / 0.2); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* glassmorphism for all shadcn cards */
+[data-slot="card"] {
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+/* ── Border Beam: thin gradient glow orbiting a running card ── */
+@property --beam-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+.border-beam {
+  position: relative;
+}
+.border-beam::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--beam-angle),
+    transparent 0deg,
+    transparent 290deg,
+    rgb(34 211 238 / 0.9) 330deg,
+    rgb(52 211 153 / 0.9) 345deg,
+    transparent 360deg
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  animation: beam-rotate 4s linear infinite;
+  pointer-events: none;
+}
+@keyframes beam-rotate { to { --beam-angle: 360deg; } }
+
+/* ── pseudo-terminal ── */
+.term-line { line-height: 1.6; }
+.glow-green { color: #4ade80; text-shadow: 0 0 8px rgb(74 222 128 / 0.45); }
+.glow-cyan { color: #38bdf8; text-shadow: 0 0 8px rgb(56 189 248 / 0.35); }
+.warn-flash { animation: warnFlash 0.9s ease-in-out 3; }
+@keyframes warnFlash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.term-caret {
+  display: inline-block; width: 8px; height: 14px; margin-left: 4px;
+  background: #4ade80; vertical-align: -2px;
+  animation: caretBlink 1s steps(1) infinite;
+}
+@keyframes caretBlink { 50% { opacity: 0; } }
+
+/* ── fine-grained segment execution grid ── */
+.seg {
+  width: 12px; height: 12px; border-radius: 3px;
+  background: rgb(255 255 255 / 0.07);
+  transition: background 0.35s, transform 0.2s, box-shadow 0.35s;
+}
+.seg:hover { transform: scale(1.5); }
+.seg-r {
+  background: #22d3ee;
+  animation: segPulse 1s ease-in-out infinite;
+}
+.seg-d { background: #34d399; animation: segLand 0.3s ease-out; box-shadow: 0 0 5px rgb(52 211 153 / 0.35); }
+.seg-f { background: #f87171; box-shadow: 0 0 6px rgb(248 113 113 / 0.4); }
+@keyframes segPulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 10px rgb(34 211 238 / 0.7); }
+  50% { opacity: 0.4; box-shadow: none; }
+}
+@keyframes segLand { from { transform: scale(1.6); } to { transform: scale(1); } }
+
+/* ── AI suggestion chips ── */
+.suggestion-chip {
+  cursor: pointer;
+  border: 1px dashed rgb(255 255 255 / 0.15);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin-top: 8px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: rgb(203 213 225);
+  transition: border-color 0.2s, background 0.2s, transform 0.15s, box-shadow 0.2s;
+}
+.suggestion-chip:hover {
+  border-color: rgb(34 211 238 / 0.7);
+  background: rgb(34 211 238 / 0.06);
+  transform: translateX(3px);
+  box-shadow: 0 0 14px rgb(34 211 238 / 0.12);
+}
+.suggestion-chip.picked {
+  border-style: solid;
+  border-color: rgb(34 211 238 / 0.8);
+  color: #67e8f9;
+  background: rgb(34 211 238 / 0.09);
+}
+
+/* ── annotation key-value table / raw json / dense segments ── */
+.kv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kv-table td { padding: 7px 10px; border-bottom: 1px solid rgb(255 255 255 / 0.07); vertical-align: top; }
+.kv-table .kv-key { width: 120px; color: rgb(148 163 184); white-space: nowrap; font-weight: 500; }
+.kv-table .kv-val { color: rgb(226 232 240); white-space: pre-wrap; word-break: break-word; }
+
+.rawjson {
+  background: rgb(2 6 12 / 0.8);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 10px;
+  padding: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-height: 380px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: rgb(186 194 208);
+  margin: 0;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+.dense-seg {
+  border-left: 2px solid rgb(255 255 255 / 0.14);
+  margin: 8px 0 8px 4px;
+  padding: 4px 0 4px 12px;
+  transition: border-color 0.2s;
+}
+.dense-seg:hover { border-left-color: #22d3ee; }
+
+/* sticky player at the top of the detail sheet */
+.drawer-player {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgb(10 14 22 / 0.92);
+  backdrop-filter: blur(10px);
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgb(255 255 255 / 0.08);
+}

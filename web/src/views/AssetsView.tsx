@@ -1,12 +1,22 @@
 import { useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import {
-  Alert, Button, Card, Col, Collapse, Drawer, Empty, Input, Progress,
-  Row, Segmented, Space, Tabs, Tag, Tooltip, Typography,
-} from "antd";
+  AudioLines, BookOpen, Bot, Camera, ClipboardList, Code2, Database, Drama,
+  Eye, FileText, Film, FolderOpen, Images, Layers, Lightbulb, Loader2,
+  Music2, Pin, Play, RefreshCw, ScanSearch, Search, SearchCode, Sparkles, Tags,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  CaretRightFilled, EyeOutlined, ScanOutlined, SyncOutlined,
-  TagsOutlined, ThunderboltOutlined,
-} from "@ant-design/icons";
+  Accordion, AccordionContent, AccordionItem, AccordionTrigger,
+} from "@/components/ui/accordion";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
@@ -15,15 +25,13 @@ import TaskGrids from "../components/TaskGrids";
 import type { ProjectState } from "../App";
 
 const SELECT_STEPS = [
-  { key: "load_index", label: "读取素材索引", icon: "📚" },
-  { key: "build_prompt", label: "构建选材任务", icon: "📋" },
-  { key: "llm_select", label: "Agent 决策", icon: "🧠" },
-  { key: "parse", label: "解析选择", icon: "🔍" },
-  { key: "slideshow", label: "图片幻灯片", icon: "🖼️" },
-  { key: "apply", label: "应用到项目", icon: "📌" },
+  { key: "load_index", label: "读取素材索引", icon: <Database className="h-4 w-4" /> },
+  { key: "build_prompt", label: "构建选材任务", icon: <FileText className="h-4 w-4" /> },
+  { key: "llm_select", label: "Agent 决策", icon: <Bot className="h-4 w-4" /> },
+  { key: "parse", label: "解析选择", icon: <SearchCode className="h-4 w-4" /> },
+  { key: "slideshow", label: "图片幻灯片", icon: <Images className="h-4 w-4" /> },
+  { key: "apply", label: "应用到项目", icon: <Pin className="h-4 w-4" /> },
 ];
-
-const { Text, Paragraph } = Typography;
 
 export interface Asset {
   file_path: string;
@@ -41,7 +49,6 @@ export interface Asset {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/** "00:01:23.5" | "01:23" | "83.5" | "00:01:23 - 00:01:30" → seconds of the first ts */
 export function parseTs(raw: any): number | null {
   if (raw === null || raw === undefined) return null;
   let s = String(raw).trim();
@@ -55,12 +62,15 @@ export function parseTs(raw: any): number | null {
   return null;
 }
 
-function qColor(q: number): string {
-  if (q >= 8) return "green";
-  if (q >= 6) return "gold";
-  if (q >= 4) return "orange";
-  return "red";
+function qBadgeCls(q: number): string {
+  if (q >= 8) return "border-emerald-500/40 bg-emerald-500/10 text-emerald-400";
+  if (q >= 6) return "border-amber-500/40 bg-amber-500/10 text-amber-400";
+  if (q >= 4) return "border-orange-500/40 bg-orange-500/10 text-orange-400";
+  return "border-red-500/40 bg-red-500/10 text-red-400";
 }
+
+const TAG_CLS = "border-white/15 bg-white/[0.06] text-slate-300";
+const NEW_CLS = "border-amber-500/40 bg-amber-500/10 text-amber-400";
 
 const FIELD_LABELS: Record<string, string> = {
   summary: "摘要", emotion: "情绪", tags: "标签", visual_tags: "视觉标签",
@@ -80,13 +90,16 @@ function fmtVal(v: any): string {
   return String(v);
 }
 
-/** Render EVERY annotation field — known ones with Chinese labels first, unknown ones after. */
+function EmptyHint({ children }: { children: React.ReactNode }) {
+  return <div className="py-10 text-center text-sm text-slate-500">{children}</div>;
+}
+
 function AnnotationTable({ ann }: { ann: Record<string, any> }) {
   const entries = Object.entries(ann).filter(([, v]) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0));
   const known = entries.filter(([k]) => FIELD_LABELS[k]);
   const unknown = entries.filter(([k]) => !FIELD_LABELS[k]);
   const rows = [...known, ...unknown];
-  if (rows.length === 0) return <Empty description="没有标注字段" />;
+  if (rows.length === 0) return <EmptyHint>没有标注字段</EmptyHint>;
   return (
     <table className="kv-table">
       <tbody>
@@ -104,16 +117,17 @@ function AnnotationTable({ ann }: { ann: Record<string, any> }) {
 // ── per-clip detail (the annotation inspector core) ───────────────────────
 
 function SeekBtn({ label, sec, onSeek }: { label: string; sec: number | null; onSeek: (s: number) => void }) {
-  if (sec === null) return <Text type="secondary">{label}</Text>;
+  if (sec === null) return <span className="text-xs text-slate-500">{label}</span>;
   return (
-    <Tooltip title="跳转播放器到此时间点">
-      <Button
-        size="small" icon={<CaretRightFilled />}
-        style={{ fontFamily: "monospace", fontSize: 12 }}
-        onClick={() => onSeek(sec)}
-      >
-        {label}
-      </Button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button variant="outline" size="sm"
+          className="h-6 gap-1 border-white/10 bg-white/[0.04] px-2 font-mono text-[11px]"
+          onClick={() => onSeek(sec)}>
+          <Play className="h-3 w-3 text-cyan-400" />{label}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>跳转播放器到此时间点</TooltipContent>
     </Tooltip>
   );
 }
@@ -126,28 +140,33 @@ function DenseSegment({ seg, onSeek }: { seg: any; onSeek: (s: number) => void }
   const emo = typeof seg.emotion === "object" ? seg.emotion?.mood : seg.emotion;
   return (
     <div className="dense-seg">
-      <Space size={6} wrap>
+      <div className="flex flex-wrap items-center gap-1.5">
         <SeekBtn label={String(tsAbs || ts)} sec={sec} onSeek={onSeek} />
-        {vq !== undefined && vq !== null && <Tag color={qColor(Number(vq))}>画质 {vq}</Tag>}
-        {emo && <Tag color="purple">🎭 {emo}</Tag>}
-      </Space>
-      {seg.content_description && <Paragraph style={{ margin: "4px 0 0" }}>{seg.content_description}</Paragraph>}
+        {vq !== undefined && vq !== null && (
+          <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(vq)))}>画质 {vq}</Badge>
+        )}
+        {emo && (
+          <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
+            <Drama className="mr-1 h-3 w-3" />{emo}
+          </Badge>
+        )}
+      </div>
+      {seg.content_description && <p className="mt-1 text-[13px] text-slate-300">{seg.content_description}</p>}
       {seg.editor_recommendation && (
-        <Paragraph type="secondary" style={{ margin: "2px 0 0", fontSize: 12 }}>💡 {seg.editor_recommendation}</Paragraph>
+        <p className="mt-0.5 text-xs text-slate-400">
+          <Lightbulb className="mr-1 inline h-3 w-3 -translate-y-px text-amber-400" />{seg.editor_recommendation}
+        </p>
       )}
-      {/* any extra fields the VLM produced */}
       {Object.entries(seg)
         .filter(([k]) => !["timestamp", "timestamp_absolute", "content_description", "visual_quality", "emotion", "editor_recommendation"].includes(k))
         .map(([k, v]) => (
-          <Paragraph key={k} type="secondary" style={{ margin: "2px 0 0", fontSize: 12 }}>
-            {k}: {fmtVal(v)}
-          </Paragraph>
+          <p key={k} className="mt-0.5 text-xs text-slate-500">{k}: {fmtVal(v)}</p>
         ))}
     </div>
   );
 }
 
-function ClipPanel({ clip, idx, onSeek }: { clip: any; idx: number; onSeek: (s: number) => void }) {
+function ClipPanel({ clip, onSeek }: { clip: any; onSeek: (s: number) => void }) {
   const dur = clip.duration ?? {};
   const start = dur.clip_start_time ?? clip.start_time ?? "?";
   const end = dur.clip_end_time ?? clip.end_time ?? "?";
@@ -159,33 +178,41 @@ function ClipPanel({ clip, idx, onSeek }: { clip: any; idx: number; onSeek: (s: 
 
   return (
     <div>
-      <Space size={6} wrap style={{ marginBottom: 6 }}>
+      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
         <SeekBtn label={`${start} → ${end}`} sec={startSec} onSeek={onSeek} />
-        {cine.shot_scale && <Tag>{cine.shot_scale}</Tag>}
-        {cine.camera_movement && <Tag>📷 {cine.camera_movement}</Tag>}
-        {narrative.mood && <Tag color="purple">🎭 {narrative.mood}</Tag>}
-      </Space>
-      {action.event_summary && <Paragraph style={{ margin: "0 0 6px" }}>{action.event_summary}</Paragraph>}
+        {cine.shot_scale && <Badge variant="outline" className={cn("text-[11px]", TAG_CLS)}>{cine.shot_scale}</Badge>}
+        {cine.camera_movement && (
+          <Badge variant="outline" className={cn("text-[11px]", TAG_CLS)}>
+            <Camera className="mr-1 h-3 w-3" />{cine.camera_movement}
+          </Badge>
+        )}
+        {narrative.mood && (
+          <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
+            <Drama className="mr-1 h-3 w-3" />{narrative.mood}
+          </Badge>
+        )}
+      </div>
+      {action.event_summary && <p className="mb-1.5 text-[13px] text-slate-300">{action.event_summary}</p>}
       {narrative.narrative_role && (
-        <Paragraph type="secondary" style={{ margin: "0 0 6px", fontSize: 12 }}>叙事角色：{narrative.narrative_role}</Paragraph>
+        <p className="mb-1.5 text-xs text-slate-400">叙事角色：{narrative.narrative_role}</p>
       )}
       {dense.length > 0 && (
         <>
-          <Text type="secondary" style={{ fontSize: 12 }}>⏱️ {dense.length} 个时间片段：</Text>
+          <div className="text-xs text-slate-400">{dense.length} 个时间片段：</div>
           {dense.map((seg, i) => <DenseSegment key={i} seg={seg} onSeek={onSeek} />)}
         </>
       )}
-      <Collapse
-        ghost size="small" style={{ marginTop: 6 }}
-        items={[{ key: "raw", label: <Text type="secondary" style={{ fontSize: 12 }}>原始 JSON</Text>, children: <pre className="rawjson">{JSON.stringify(clip, null, 2)}</pre> }]}
-      />
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-300">原始 JSON</summary>
+        <pre className="rawjson mt-1.5">{JSON.stringify(clip, null, 2)}</pre>
+      </details>
     </div>
   );
 }
 
-// ── detail drawer ───────────────────────────────────────────────────────────
+// ── detail sheet ────────────────────────────────────────────────────────────
 
-function DetailDrawer({
+function DetailSheet({
   asset, onClose, onReannotate, busy,
 }: { asset: Asset | null; onClose: () => void; onReannotate: (a: Asset) => void; busy: boolean }) {
   const [details, setDetails] = useState<{ clips: any[]; scenes: any[] } | null>(null);
@@ -211,104 +238,158 @@ function DetailDrawer({
   const ann = asset.annotation ?? {};
 
   return (
-    <Drawer
-      open onClose={onClose} width={Math.min(920, window.innerWidth - 40)}
-      title={<Space><span>{asset.file_name || asset.file_path}</span>
-        {asset.annotated
-          ? <Tag color={qColor(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Tag>
-          : <Tag color="gold">未标注</Tag>}
-      </Space>}
-      extra={<Button size="small" icon={<SyncOutlined />} loading={busy} onClick={() => onReannotate(asset)}>重新标注</Button>}
-    >
-      {/* sticky player so you can verify annotations against footage */}
-      <div className="drawer-player">
-        {asset.asset_type === "video" && <video ref={videoRef} src={src} controls style={{ width: "100%", maxHeight: 340, background: "#000", borderRadius: 8 }} />}
-        {asset.asset_type === "image" && <img src={src} style={{ width: "100%", maxHeight: 340, objectFit: "contain", background: "#000", borderRadius: 8 }} />}
-        {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls style={{ width: "100%" }} />}
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
-          {asset.width ? `${asset.width}×${asset.height} · ` : ""}
-          {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
-          {asset.absolute_path || asset.file_path}
-        </Text>
-      </div>
+    <Sheet open onOpenChange={(o) => !o && onClose()}>
+      <SheetContent side="right" className="w-full overflow-y-auto border-white/10 bg-slate-950/95 p-5 backdrop-blur-xl sm:max-w-[920px]">
+        <SheetHeader className="p-0 pb-3">
+          <SheetTitle className="flex flex-wrap items-center gap-2 pr-8 text-sm">
+            <span className="truncate">{asset.file_name || asset.file_path}</span>
+            {asset.annotated
+              ? <Badge variant="outline" className={qBadgeCls(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Badge>
+              : <Badge variant="outline" className={NEW_CLS}>未标注</Badge>}
+            <Button variant="outline" size="sm"
+              className="ml-auto h-7 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+              disabled={busy} onClick={() => onReannotate(asset)}>
+              {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+              重新标注
+            </Button>
+          </SheetTitle>
+        </SheetHeader>
 
-      <Tabs
-        defaultActiveKey={asset.asset_type === "video" ? "clips" : "overview"}
-        items={[
-          {
-            key: "overview", label: `📋 标注总览`,
-            children: asset.annotated ? <AnnotationTable ann={ann} /> : <Empty description="尚未标注 — 点击右上角「重新标注」" />,
-          },
-          ...(asset.asset_type === "video" ? [
-            {
-              key: "clips", label: `🎬 片段分析 (${clips.length})`,
-              children: loading ? <Text type="secondary">加载中…</Text> :
-                clips.length === 0 ? <Empty description="没有检测到片段 — VLM 可能超时，试试重新标注" /> :
-                <><QualityCurve clips={clips} onSeek={seek} /><Collapse
-                  defaultActiveKey={clips.map((_, i) => String(i))}
-                  items={clips.map((clip, i) => {
-                    const d = clip.duration ?? {};
-                    return {
-                      key: String(i),
-                      label: <Text strong>Clip {i + 1}　<Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>{d.clip_start_time ?? "?"} → {d.clip_end_time ?? "?"}</Text></Text>,
-                      children: <ClipPanel clip={clip} idx={i} onSeek={seek} />,
-                    };
-                  })}
-                /></>,
-            },
-            {
-              key: "scenes", label: `🎞️ 场景 (${scenes.length})`,
-              children: scenes.length === 0 ? <Empty description="没有场景分析" /> :
-                <div>
-                  {scenes.map((scene, i) => {
-                    const va = scene.video_analysis?.scene_caption ?? {};
-                    const sc = va.scene_summary ?? va.visual_analysis ?? {};
-                    const summary = typeof sc === "object" ? (sc.summary ?? sc.narrative ?? "") : String(sc);
-                    const cls = va.scene_classification ?? {};
-                    const tr = scene.time_range ?? {};
-                    const sec = parseTs(tr.start_seconds);
-                    return (
-                      <Card size="small" key={i} style={{ marginBottom: 10 }}>
-                        <Space size={6} wrap>
-                          <Text strong>Scene {i + 1}</Text>
-                          <SeekBtn label={`${tr.start_seconds ?? "?"}s → ${tr.end_seconds ?? "?"}s`} sec={sec} onSeek={seek} />
-                          {cls.is_usable !== undefined && <Tag color={cls.is_usable ? "green" : "red"}>{cls.is_usable ? "可用" : "不可用"}</Tag>}
-                          {cls.importance_score !== undefined && <Tag color={qColor(Number(cls.importance_score))}>重要度 {cls.importance_score}</Tag>}
-                        </Space>
-                        {summary && <Paragraph style={{ margin: "6px 0 0" }}>{String(summary)}</Paragraph>}
-                        <Collapse ghost size="small" style={{ marginTop: 4 }}
-                          items={[{ key: "raw", label: <Text type="secondary" style={{ fontSize: 12 }}>原始 JSON</Text>, children: <pre className="rawjson">{JSON.stringify(scene, null, 2)}</pre> }]} />
-                      </Card>
-                    );
-                  })}
-                </div>,
-            },
-          ] : []),
-          ...(asset.asset_type === "audio" ? [
-            {
-              key: "beats", label: "🎵 节奏关键点",
-              children: (
-                <AudioKeypointsChart
-                  path={asset.absolute_path || asset.file_path}
-                  duration={asset.duration_sec} onSeek={seek}
-                />
-              ),
-            },
-          ] : []),
-          {
-            key: "raw", label: "🧾 原始标注",
-            children: <pre className="rawjson">{JSON.stringify(ann, null, 2)}</pre>,
-          },
-        ]}
-      />
-    </Drawer>
+        <div className="drawer-player">
+          {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[340px] w-full rounded-lg bg-black" />}
+          {asset.asset_type === "image" && <img src={src} className="max-h-[340px] w-full rounded-lg bg-black object-contain" />}
+          {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls className="w-full" />}
+          <div className="mt-1 text-xs text-slate-500">
+            {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
+            {asset.width ? `${asset.width}×${asset.height} · ` : ""}
+            {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
+            {asset.absolute_path || asset.file_path}
+          </div>
+        </div>
+
+        <Tabs defaultValue={asset.asset_type === "video" ? "clips" : "overview"}>
+          <TabsList className="bg-white/[0.05]">
+            <TabsTrigger value="overview" className="gap-1.5 text-xs">
+              <ClipboardList className="h-3.5 w-3.5" />标注总览
+            </TabsTrigger>
+            {asset.asset_type === "video" && (
+              <>
+                <TabsTrigger value="clips" className="gap-1.5 text-xs">
+                  <Film className="h-3.5 w-3.5" />片段分析 ({clips.length})
+                </TabsTrigger>
+                <TabsTrigger value="scenes" className="gap-1.5 text-xs">
+                  <Layers className="h-3.5 w-3.5" />场景 ({scenes.length})
+                </TabsTrigger>
+              </>
+            )}
+            {asset.asset_type === "audio" && (
+              <TabsTrigger value="beats" className="gap-1.5 text-xs">
+                <Music2 className="h-3.5 w-3.5" />节奏关键点
+              </TabsTrigger>
+            )}
+            <TabsTrigger value="raw" className="gap-1.5 text-xs">
+              <Code2 className="h-3.5 w-3.5" />原始标注
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="overview" className="pt-3">
+            {asset.annotated ? <AnnotationTable ann={ann} /> : <EmptyHint>尚未标注 — 点击右上角「重新标注」</EmptyHint>}
+          </TabsContent>
+
+          {asset.asset_type === "video" && (
+            <>
+              <TabsContent value="clips" className="pt-3">
+                {loading ? <EmptyHint>加载中…</EmptyHint> :
+                  clips.length === 0 ? <EmptyHint>没有检测到片段 — VLM 可能超时，试试重新标注</EmptyHint> : (
+                    <>
+                      <QualityCurve clips={clips} onSeek={seek} />
+                      <Accordion type="multiple" defaultValue={clips.map((_, i) => String(i))}>
+                        {clips.map((clip, i) => {
+                          const d = clip.duration ?? {};
+                          return (
+                            <AccordionItem key={i} value={String(i)} className="border-white/[0.07]">
+                              <AccordionTrigger className="py-2.5 text-[13px] hover:no-underline">
+                                <span>
+                                  <span className="font-semibold text-slate-200">Clip {i + 1}</span>
+                                  <span className="ml-2 font-mono text-xs text-slate-500">
+                                    {d.clip_start_time ?? "?"} → {d.clip_end_time ?? "?"}
+                                  </span>
+                                </span>
+                              </AccordionTrigger>
+                              <AccordionContent>
+                                <ClipPanel clip={clip} onSeek={seek} />
+                              </AccordionContent>
+                            </AccordionItem>
+                          );
+                        })}
+                      </Accordion>
+                    </>
+                  )}
+              </TabsContent>
+
+              <TabsContent value="scenes" className="pt-3">
+                {scenes.length === 0 ? <EmptyHint>没有场景分析</EmptyHint> : (
+                  <div>
+                    {scenes.map((scene, i) => {
+                      const va = scene.video_analysis?.scene_caption ?? {};
+                      const sc = va.scene_summary ?? va.visual_analysis ?? {};
+                      const summary = typeof sc === "object" ? (sc.summary ?? sc.narrative ?? "") : String(sc);
+                      const cls = va.scene_classification ?? {};
+                      const tr = scene.time_range ?? {};
+                      const sec = parseTs(tr.start_seconds);
+                      return (
+                        <div key={i} className="mb-2.5 rounded-xl border border-white/[0.07] bg-white/[0.03] p-3">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[13px] font-semibold text-slate-200">Scene {i + 1}</span>
+                            <SeekBtn label={`${tr.start_seconds ?? "?"}s → ${tr.end_seconds ?? "?"}s`} sec={sec} onSeek={seek} />
+                            {cls.is_usable !== undefined && (
+                              <Badge variant="outline" className={cls.is_usable
+                                ? "border-emerald-500/40 bg-emerald-500/10 text-[11px] text-emerald-400"
+                                : "border-red-500/40 bg-red-500/10 text-[11px] text-red-400"}>
+                                {cls.is_usable ? "可用" : "不可用"}
+                              </Badge>
+                            )}
+                            {cls.importance_score !== undefined && (
+                              <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(cls.importance_score)))}>
+                                重要度 {cls.importance_score}
+                              </Badge>
+                            )}
+                          </div>
+                          {summary && <p className="mt-1.5 text-[13px] text-slate-300">{String(summary)}</p>}
+                          <details className="mt-1.5">
+                            <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-300">原始 JSON</summary>
+                            <pre className="rawjson mt-1.5">{JSON.stringify(scene, null, 2)}</pre>
+                          </details>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </TabsContent>
+            </>
+          )}
+
+          {asset.asset_type === "audio" && (
+            <TabsContent value="beats" className="pt-3">
+              <AudioKeypointsChart
+                path={asset.absolute_path || asset.file_path}
+                duration={asset.duration_sec} onSeek={seek}
+              />
+            </TabsContent>
+          )}
+
+          <TabsContent value="raw" className="pt-3">
+            <pre className="rawjson">{JSON.stringify(ann, null, 2)}</pre>
+          </TabsContent>
+        </Tabs>
+      </SheetContent>
+    </Sheet>
   );
 }
 
 // ── asset card ──────────────────────────────────────────────────────────────
 
-function AssetCard({ a, onOpen }: { a: Asset; onOpen: () => void }) {
+function AssetCard({ a, onOpen, index }: { a: Asset; onOpen: () => void; index: number }) {
   const ann = a.annotation ?? {};
   const src = mediaUrl(a.absolute_path || a.file_path);
   const tags: string[] = [
@@ -317,52 +398,66 @@ function AssetCard({ a, onOpen }: { a: Asset; onOpen: () => void }) {
   ].slice(0, 4);
 
   return (
-    <Card
-      hoverable size="small" onClick={onOpen}
-      cover={
-        <div className="card-media" onClick={(e) => e.stopPropagation()}>
-          {a.asset_type === "video" && <video src={src} controls preload="metadata" />}
-          {a.asset_type === "image" && <img src={src} loading="lazy" />}
-          {a.asset_type === "audio" && <div className="audio-wrap"><span style={{ fontSize: 34 }}>🎵</span><audio src={src} controls preload="none" /></div>}
-        </div>
-      }
+    <motion.div
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, delay: Math.min(index * 0.04, 0.5) }}
     >
-      <Card.Meta
-        title={
-          <Tooltip title={a.absolute_path || a.file_path}>
-            <span className="text-[13px]">{a.file_name || a.file_path}</span>
-          </Tooltip>
-        }
-        description={
-          <div>
-            <Text type="secondary" className="text-[11.5px]">
-              {a.duration_sec ? `${Math.round(a.duration_sec)}s · ` : ""}
-              {a.width ? `${a.width}×${a.height} · ` : ""}
-              {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
-            </Text>
-            <div className="mt-1.5 flex flex-wrap gap-y-1">
-              {a.annotated
-                ? <Tag color={qColor(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Tag>
-                : <Tag color="gold">未标注</Tag>}
-              {tags.map((t, i) => <Tag key={i}>{t}</Tag>)}
+      <Card
+        className="cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]"
+        onClick={onOpen}
+      >
+        <div
+          className="flex aspect-video items-center justify-center overflow-hidden bg-black"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {a.asset_type === "video" && <video src={src} controls preload="metadata" className="h-full w-full object-contain" />}
+          {a.asset_type === "image" && <img src={src} loading="lazy" className="h-full w-full object-contain" />}
+          {a.asset_type === "audio" && (
+            <div className="flex w-full flex-col items-center gap-2 px-3">
+              <AudioLines className="h-8 w-8 text-sky-400" />
+              <audio src={src} controls preload="none" className="w-11/12" />
             </div>
-            {ann.summary && (
-              <Paragraph type="secondary" ellipsis={{ rows: 2 }} className="!mt-1.5 !mb-0 text-xs">
-                {ann.summary}
-              </Paragraph>
-            )}
+          )}
+        </div>
+        <CardContent className="p-3">
+          <div className="truncate text-[13px] font-semibold text-slate-200" title={a.absolute_path || a.file_path}>
+            {a.file_name || a.file_path}
           </div>
-        }
-      />
-      <Button block ghost type="primary" size="small" icon={<EyeOutlined />}
-        className="!mt-3" onClick={onOpen}>
-        查看完整标注
-      </Button>
-    </Card>
+          <div className="mt-0.5 text-[11.5px] text-slate-500">
+            {a.duration_sec ? `${Math.round(a.duration_sec)}s · ` : ""}
+            {a.width ? `${a.width}×${a.height} · ` : ""}
+            {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {a.annotated
+              ? <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(ann.quality_score ?? 0)))}>Q {fmtVal(ann.quality_score)}</Badge>
+              : <Badge variant="outline" className={cn("text-[11px]", NEW_CLS)}>未标注</Badge>}
+            {tags.map((t, i) => (
+              <Badge key={i} variant="outline" className={cn("text-[11px]", TAG_CLS)}>{t}</Badge>
+            ))}
+          </div>
+          {ann.summary && (
+            <p className="mt-1.5 line-clamp-2 text-xs text-slate-400">{ann.summary}</p>
+          )}
+          <Button variant="outline" size="sm"
+            className="mt-3 h-7 w-full gap-1.5 border-cyan-500/25 bg-cyan-500/[0.06] text-xs text-cyan-300 hover:bg-cyan-500/15"
+            onClick={onOpen}>
+            <Eye className="h-3.5 w-3.5" /> 查看完整标注
+          </Button>
+        </CardContent>
+      </Card>
+    </motion.div>
   );
 }
 
 // ── main view ───────────────────────────────────────────────────────────────
+
+const TYPE_TABS = [
+  { key: "video", label: "视频", icon: Film },
+  { key: "image", label: "图片", icon: Images },
+  { key: "audio", label: "音频", icon: Music2 },
+];
 
 export default function AssetsView({
   project, setProject,
@@ -391,7 +486,6 @@ export default function AssetsView({
       });
       setAssets(r.assets); setScanned(true);
       if (!root) setRoot(r.root);
-      // keep detail drawer in sync after re-annotation
       setDetail((d) => d ? r.assets.find((a) => a.content_hash === d.content_hash) ?? d : null);
     } catch (e: any) { setError(e.message); }
     setScanning(false);
@@ -423,7 +517,6 @@ export default function AssetsView({
     } catch (e: any) { setError(e.message); }
   };
 
-  // apply selection into the active project when the agent finishes
   useEffect(() => {
     if (selJob.status === "done" && selJobId) {
       const m = selJob.meta;
@@ -452,123 +545,175 @@ export default function AssetsView({
       JSON.stringify(a.annotation ?? {}).toLowerCase().includes(q))
     .sort((a, b) => (b.annotation?.quality_score ?? -1) - (a.annotation?.quality_score ?? -1));
 
+  const selSel = selJob.meta.selection;
+  const glass = "rounded-2xl border-white/[0.07] bg-slate-900/50";
+
   return (
     <div>
-      <Card size="small">
-        <Space wrap style={{ width: "100%" }}>
-          <Input
-            style={{ width: 340 }} placeholder="素材文件夹（默认 resource/imports/）"
-            value={root} onChange={(e) => setRoot(e.target.value)} onPressEnter={scan}
-          />
-          <Button icon={<ScanOutlined />} onClick={scan} loading={scanning}>扫描</Button>
-          <Button icon={<TagsOutlined />} onClick={() => annotate()} disabled={!scanned || newCount === 0} loading={busy}>
-            全部标注{newCount > 0 ? ` (${newCount})` : ""}
-          </Button>
-          <Button type="primary" icon={<ThunderboltOutlined />} onClick={autoSelect} loading={selecting}
-            disabled={assets.every((a) => !a.annotated)}>
-            智能选材
-          </Button>
-        </Space>
-
-        {error && <Alert type="error" showIcon message={error} style={{ marginTop: 10 }} />}
-
-        {busy && (
-          <div style={{ marginTop: 12 }}>
-            <Progress
-              percent={Math.round(((annJob.meta.current ?? 0) / Math.max(annJob.meta.total ?? 1, 1)) * 100)}
-              status="active"
-              format={() => `${annJob.meta.current ?? 0}/${annJob.meta.total ?? "?"}`}
+      <Card className={cn(glass, (busy || selecting) && "border-beam")}>
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <FolderOpen className="h-4 w-4 text-cyan-400" /> 素材库
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              className="h-9 w-[340px] border-white/10 bg-black/25 text-xs"
+              placeholder="素材文件夹（默认 resource/imports/）"
+              value={root} onChange={(e) => setRoot(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && scan()}
             />
-            <Text type="secondary" style={{ fontSize: 12 }}>📹 {annJob.meta.filename || "…"}</Text>
-            <TaskGrids tasks={annJob.meta.tasks ?? {}} />
-            <JobLog lines={annJob.lines.slice(-80)} height={180} />
+            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04]"
+              onClick={scan} disabled={scanning}>
+              {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
+              扫描
+            </Button>
+            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04]"
+              onClick={() => annotate()} disabled={!scanned || newCount === 0 || busy}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Tags className="h-4 w-4" />}
+              全部标注{newCount > 0 ? ` (${newCount})` : ""}
+            </Button>
+            <Button
+              className="h-9 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_16px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
+              onClick={autoSelect} disabled={selecting || assets.every((a) => !a.annotated)}>
+              {selecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+              智能选材
+            </Button>
           </div>
-        )}
-        {annJob.status === "error" && (
-          <div style={{ marginTop: 10 }}>
-            <Alert type="error" showIcon message="标注失败 — 查看日志" />
-            <JobLog lines={annJob.lines.slice(-40)} height={180} />
-          </div>
-        )}
 
-        {/* Agent selection flow — live animated stages */}
-        {selJobId && (
-          <div style={{ marginTop: 6 }}>
-            <AgentFlow steps={SELECT_STEPS} stages={selJob.meta.stages ?? {}} />
-            {selJob.status === "error" && (
-              <>
-                <Alert type="error" showIcon message="选材失败 — 查看日志" />
-                <JobLog lines={selJob.lines.slice(-30)} height={140} />
-              </>
-            )}
-          </div>
-        )}
-        {selJob.status === "done" && selJob.meta.selection && (
-          <Alert
-            type="success" showIcon style={{ marginTop: 4 }}
-            message={
-              <>
-                <b>已选素材：</b>{" "}
-                {(selJob.meta.selection.selected_videos ?? []).map((v: string) => `📹${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
-                {(selJob.meta.selection.selected_images ?? []).map((v: string) => `🖼️${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
-                {(selJob.meta.selection.selected_audio ?? []).slice(0, 1).map((v: string) => `🎵${v.split(/[\\/]/).pop()}`).join("")}
-              </>
-            }
-            description={
-              <>
-                {selJob.meta.selection.rationale && <div>💡 {selJob.meta.selection.rationale}</div>}
-                {selJob.meta.selection.narrative_idea && <div>📖 {selJob.meta.selection.narrative_idea}</div>}
-                <Text type="secondary">已写入项目 — 切换到「✂️ 项目编辑」运行流水线。</Text>
-              </>
-            }
-          />
-        )}
-        {/* persisted selection summary from a previous session */}
-        {!selJobId && project.selectionRationale && (
-          <Alert
-            type="info" showIcon style={{ marginTop: 10 }}
-            message={<><b>本项目已有选材</b>（{project.videos.length} 视频{project.audio ? " · 1 音乐" : ""}）</>}
-            description={<Text type="secondary">💡 {project.selectionRationale}</Text>}
-          />
-        )}
+          {error && (
+            <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">{error}</div>
+          )}
+
+          {busy && (
+            <div className="mt-3">
+              <Progress
+                value={Math.round(((annJob.meta.current ?? 0) / Math.max(annJob.meta.total ?? 1, 1)) * 100)}
+                className="h-2 bg-white/[0.06]"
+              />
+              <div className="mt-1 text-xs text-slate-400">
+                {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
+              </div>
+              <TaskGrids tasks={annJob.meta.tasks ?? {}} />
+              <JobLog lines={annJob.lines.slice(-80)} height={180} />
+            </div>
+          )}
+          {annJob.status === "error" && (
+            <div className="mt-3">
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">标注失败 — 查看日志</div>
+              <JobLog lines={annJob.lines.slice(-40)} height={180} />
+            </div>
+          )}
+
+          {selJobId && (
+            <div className="mt-2">
+              <AgentFlow steps={SELECT_STEPS} stages={selJob.meta.stages ?? {}} />
+              {selJob.status === "error" && (
+                <>
+                  <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">选材失败 — 查看日志</div>
+                  <JobLog lines={selJob.lines.slice(-30)} height={140} />
+                </>
+              )}
+            </div>
+          )}
+          {selJob.status === "done" && selSel && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+              className="mt-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-4 py-3"
+            >
+              <div className="flex flex-wrap items-center gap-1.5 text-sm">
+                <span className="font-semibold text-emerald-400">已选素材：</span>
+                {(selSel.selected_videos ?? []).map((v: string, i: number) => (
+                  <Badge key={`v${i}`} variant="outline" className="border-sky-500/40 bg-sky-500/10 text-[11px] text-sky-300">
+                    <Film className="mr-1 h-3 w-3" />{v.split(/[\\/]/).pop()}
+                  </Badge>
+                ))}
+                {(selSel.selected_images ?? []).map((v: string, i: number) => (
+                  <Badge key={`i${i}`} variant="outline" className="border-cyan-500/40 bg-cyan-500/10 text-[11px] text-cyan-300">
+                    <Images className="mr-1 h-3 w-3" />{v.split(/[\\/]/).pop()}
+                  </Badge>
+                ))}
+                {(selSel.selected_audio ?? []).slice(0, 1).map((v: string, i: number) => (
+                  <Badge key={`a${i}`} variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
+                    <Music2 className="mr-1 h-3 w-3" />{v.split(/[\\/]/).pop()}
+                  </Badge>
+                ))}
+              </div>
+              {selSel.rationale && (
+                <p className="mt-1.5 text-xs text-slate-300">
+                  <Lightbulb className="mr-1 inline h-3 w-3 -translate-y-px text-amber-400" />{selSel.rationale}
+                </p>
+              )}
+              {selSel.narrative_idea && (
+                <p className="mt-1 text-xs text-slate-400">
+                  <BookOpen className="mr-1 inline h-3 w-3 -translate-y-px" />{selSel.narrative_idea}
+                </p>
+              )}
+              <p className="mt-1 text-xs text-slate-500">已写入项目 — 切换到「项目编辑」运行流水线。</p>
+            </motion.div>
+          )}
+          {!selJobId && project.selectionRationale && (
+            <div className="mt-3 rounded-xl border border-sky-500/25 bg-sky-500/[0.06] px-4 py-3">
+              <div className="text-sm font-semibold text-sky-300">
+                本项目已有选材（{project.videos.length} 视频{project.audio ? " · 1 音乐" : ""}）
+              </div>
+              <p className="mt-1 text-xs text-slate-400">
+                <Lightbulb className="mr-1 inline h-3 w-3 -translate-y-px text-amber-400" />{project.selectionRationale}
+              </p>
+            </div>
+          )}
+        </CardContent>
       </Card>
 
       {scanned ? (
         <>
-          <Space style={{ margin: "16px 0 12px" }} wrap>
-            <Segmented
-              value={typeTab}
-              onChange={(v) => setTypeTab(String(v))}
-              options={[
-                { label: `📹 视频 (${byType("video").length})`, value: "video" },
-                { label: `🖼️ 图片 (${byType("image").length})`, value: "image" },
-                { label: `🎵 音频 (${byType("audio").length})`, value: "audio" },
-              ]}
-            />
-            <Input.Search allowClear placeholder="搜索文件名 / 标注内容…" style={{ width: 260 }}
-              onSearch={setQuery} onChange={(e) => !e.target.value && setQuery("")} />
-            <Text type="secondary">
+          <div className="my-4 flex flex-wrap items-center gap-3">
+            <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-1">
+              {TYPE_TABS.map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => setTypeTab(t.key)}
+                  className={cn(
+                    "flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                    typeTab === t.key
+                      ? "bg-cyan-500/15 text-cyan-300 shadow-[0_0_10px_rgba(34,211,238,0.1)]"
+                      : "text-slate-400 hover:text-slate-200",
+                  )}
+                >
+                  <t.icon className="h-3.5 w-3.5" />
+                  {t.label} ({byType(t.key).length})
+                </button>
+              ))}
+            </div>
+            <div className="relative">
+              <Search className="absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+              <Input
+                className="h-8 w-[240px] border-white/10 bg-black/25 pl-8 text-xs"
+                placeholder="搜索文件名 / 标注内容…"
+                value={query} onChange={(e) => setQuery(e.target.value)}
+              />
+            </div>
+            <span className="text-xs text-slate-500">
               共 {assets.length} 个素材 · {assets.length - newCount} 已标注 · {newCount} 新
-            </Text>
-          </Space>
+            </span>
+          </div>
 
           {shown.length === 0 ? (
-            <Empty description="该类型下没有素材" />
+            <EmptyHint>该类型下没有素材</EmptyHint>
           ) : (
-            <Row gutter={[14, 14]}>
-              {shown.map((a) => (
-                <Col key={a.content_hash} xs={24} sm={12} md={8} lg={6}>
-                  <AssetCard a={a} onOpen={() => setDetail(a)} />
-                </Col>
+            <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
+              {shown.map((a, i) => (
+                <AssetCard key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)} />
               ))}
-            </Row>
+            </div>
           )}
         </>
       ) : (
-        <Empty style={{ marginTop: 40 }} description="点击「扫描」发现素材文件" />
+        <EmptyHint>点击「扫描」发现素材文件</EmptyHint>
       )}
 
-      <DetailDrawer
+      <DetailSheet
         asset={detail} busy={busy}
         onClose={() => setDetail(null)}
         onReannotate={(a) => annotate([a.content_hash], a.annotated)}
