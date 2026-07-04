@@ -1112,15 +1112,33 @@ def caption_audio_with_madmom_segments(
     # energy spread is small. (~0.15 of normalized intensity = "clearly dynamic".)
     _pace_conf = min(1.0, _e_spread / 0.15) if _e_spread > 0 else 0.0
 
+    # ── ABSOLUTE musical anchor (the fix for "calm song, frantic cuts") ─────
+    # Relative energy alone maps every track's loudest section to the global
+    # fastest cut — a 70 BPM ballad's chorus got the same 1.2-1.7s treatment
+    # as an EDM drop. Shot length must be anchored to the MEASURED bar length:
+    # peaks cut at ~1 bar, calm parts hold ~2 bars. Relative energy then only
+    # interpolates BETWEEN those two musically-meaningful lengths.
+    import statistics as _stats
+    _db_times = sorted(kp['time'] for kp in keypoints
+                       if str(kp.get('type', '')).lower().startswith('down'))
+    _bar_gaps = [b - a for a, b in zip(_db_times, _db_times[1:]) if 0.8 <= b - a <= 8.0]
+    _bar = _stats.median(_bar_gaps) if len(_bar_gaps) >= 4 else 0.0
+    if _bar > 0:
+        _fast_len = min(max(_bar, _MIN_CUT), _MAX_HOLD)                 # peak: 1 bar
+        _slow_len = min(max(2.0 * _bar, _fast_len + 0.5), _MAX_HOLD)    # calm: 2 bars
+        print(f"\n🎚️  [Pacing] bar ≈ {_bar:.2f}s (≈{240.0 / _bar:.0f} BPM) → "
+              f"shots {_fast_len:.1f}s (peak, 1 bar) … {_slow_len:.1f}s (calm, 2 bars)")
+    else:
+        _fast_len, _slow_len = _MIN_CUT, _MAX_HOLD                      # no beat grid → legacy
+        print(f"\n🎚️  [Pacing] no reliable beat grid — energy-relative range "
+              f"{_MIN_CUT:.1f}s … {_MAX_HOLD:.1f}s")
+
     def _section_target(idx: int) -> float:
         """Target shot length for a section from its energy relative to the track."""
         e = _sec_energy[idx] if idx < len(_sec_energy) else 0.0
         raw = (e - _e_lo) / _e_spread if _e_spread > 0 else 0.5       # 0=calmest, 1=peak
         rel = 0.5 + (raw - 0.5) * _pace_conf                         # damp on flat tracks
-        return _MAX_HOLD - rel * (_MAX_HOLD - _MIN_CUT)              # peak → short, calm → long
-
-    print(f"\n🎚️  [Pacing] Energy-adaptive shot length {_MIN_CUT:.1f}s (peak) … "
-          f"{_MAX_HOLD:.1f}s (calm) — self-calibrated to this track")
+        return _slow_len - rel * (_slow_len - _fast_len)             # peak → 1 bar, calm → 2 bars
 
     for section_idx, stage1_sec in enumerate(stage1_sections):
         # Parse section times
