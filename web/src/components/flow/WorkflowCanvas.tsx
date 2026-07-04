@@ -375,6 +375,23 @@ function CanvasInner({
     return () => window.clearTimeout(id);
   }, [fullscreen, rf]);
 
+  // Initial fit: nodes stream in AFTER mount (rfNodes starts empty), so the
+  // built-in `fitView` prop fires on an empty canvas and the graph appears
+  // tiny in a corner. Fit when content first arrives, and again when the
+  // topology jumps from the 2-node skeleton (sw + editor) to the full
+  // shot-lane graph.
+  const prevCount = useRef(0);
+  useEffect(() => {
+    const prev = prevCount.current;
+    prevCount.current = nodes.length;
+    if (nodes.length === 0) return;
+    if (prev === 0 || (prev <= 3 && nodes.length > 3)) {
+      // small delay so React Flow has measured the freshly-added nodes
+      const id = window.setTimeout(() => rf.fitView({ duration: 300, maxZoom: 0.95 }), 80);
+      return () => window.clearTimeout(id);
+    }
+  }, [nodes.length, rf]);
+
   // auto-follow the newest active node
   useEffect(() => {
     if (!follow.current || !latestActiveId || latestActiveId === lastCentered.current) return;
