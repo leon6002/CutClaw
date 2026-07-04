@@ -11,8 +11,33 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
+
+
+def _ensure_ffmpeg_on_path() -> None:
+    """Make ffmpeg/ffprobe discoverable on Windows when not activated via conda.
+
+    Searches the same locations as local_run.py so ffmpeg subprocess calls
+    don't fail with FileNotFoundError (WinError 2).
+    """
+    project_ffmpeg = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "tools", "ffmpeg"
+    )
+    candidates = [
+        project_ffmpeg,
+        os.path.join(sys.prefix, "Library", "bin"),
+        os.path.join(sys.prefix, "Library", "mingw-w64", "bin"),
+        os.path.join(sys.prefix, "Library", "usr", "bin"),
+        os.path.join(sys.prefix, "Scripts"),
+        sys.prefix,
+    ]
+    existing = os.environ.get("PATH", "")
+    parts = existing.split(os.pathsep)
+    prepend = [p for p in candidates if os.path.isdir(p) and p not in parts]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + parts)
 from typing import List, Dict, Any
 
 
@@ -308,9 +333,19 @@ def calculate_optimal_crop_center(
     for frame_det in protagonist_detection['frame_detections']:
         if frame_det.get('protagonist_detected') and frame_det.get('bounding_box'):
             bbox = frame_det['bounding_box']
-            center_x = bbox['x'] + bbox['width'] / 2
-            center_y = bbox['y'] + bbox['height'] / 2
-            valid_boxes.append((center_x, center_y, bbox['width'], bbox['height']))
+            # Defensive: VLM may return bounding boxes with missing or malformed keys.
+            try:
+                bx = float(bbox.get('x', bbox.get('x1', 0)))
+                by = float(bbox.get('y', bbox.get('y1', 0)))
+                bw = float(bbox.get('width', 0))
+                bh = float(bbox.get('height', 0))
+            except (TypeError, ValueError):
+                continue
+            if bw <= 0 or bh <= 0:
+                continue
+            center_x = bx + bw / 2
+            center_y = by + bh / 2
+            valid_boxes.append((center_x, center_y, bw, bh))
 
     if not valid_boxes:
         return None
@@ -397,11 +432,20 @@ def extract_all_clips(
             for frame_det in shot['protagonist_detection']['frame_detections']:
                 if frame_det.get('protagonist_detected') and frame_det.get('bounding_box'):
                     bbox = frame_det['bounding_box']
+                    try:
+                        bx = float(bbox.get('x', bbox.get('x1', 0)))
+                        by = float(bbox.get('y', bbox.get('y1', 0)))
+                        bw = float(bbox.get('width', 0))
+                        bh = float(bbox.get('height', 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if bw <= 0 or bh <= 0:
+                        continue
                     scaled_bbox = {
-                        'x': int(bbox['x'] * scale_x),
-                        'y': int(bbox['y'] * scale_y),
-                        'width': int(bbox['width'] * scale_x),
-                        'height': int(bbox['height'] * scale_y)
+                        'x': int(bx * scale_x),
+                        'y': int(by * scale_y),
+                        'width': int(bw * scale_x),
+                        'height': int(bh * scale_y)
                     }
                     scaled_detections.append({
                         'time_sec': frame_det['time_sec'],
@@ -436,8 +480,9 @@ def extract_all_clips(
                 'original_start': original_start,
                 'original_end': original_end,
                 'adjusted': (start_sec != original_start or end_sec != original_end),
-                'crop_center': crop_center,  # Add crop center information
-                'scaled_detections': scaled_detections  # Add scaled detection info for visualization
+                'crop_center': crop_center,
+                'scaled_detections': scaled_detections,
+                'video_path': clip.get('video_path', shot.get('video_path', '')),
             })
 
     return all_clips
@@ -628,6 +673,7 @@ def render_video_ffmpeg(
                 continue
 
             start = clip['start_sec']
+            source_video = clip.get('video_path') or video_path
 
             # Generate crop filter for this clip (if crop ratio is provided)
             crop_filter = None
@@ -702,7 +748,9 @@ def render_video_ffmpeg(
                         det_start = max(0.0, det_start)
                         det_end = min(duration, det_end)
 
-                        bbox = det['bounding_box']
+                        bbox = det.get('bounding_box', {})
+                        if not all(k in bbox for k in ('x', 'y', 'width', 'height')):
+                            continue
                         viz_filters.append(
                             f"drawbox=x={bbox['x']}:y={bbox['y']}:w={bbox['width']}:h={bbox['height']}:color=yellow:t=3:enable='between(t,{det_start:.3f},{det_end:.3f})'"
                         )
@@ -770,7 +818,7 @@ def render_video_ffmpeg(
                     'ffmpeg',
                     '-y',  # Overwrite output
                     '-ss', str(start),
-                    '-i', video_path,
+                    '-i', source_video,
                     '-t', str(duration),
                     '-vf', video_filter,
                     '-r', str(video_fps),
@@ -832,7 +880,7 @@ def render_video_ffmpeg(
                         'ffmpeg',
                         '-y',  # Overwrite output
                         '-ss', str(start),
-                        '-i', video_path,
+                        '-i', source_video,
                         '-t', str(duration),
                         '-vf', video_filter,
                         '-c:v', 'libx264',  # Re-encode for consistent format
@@ -849,7 +897,7 @@ def render_video_ffmpeg(
                         'ffmpeg',
                         '-y',  # Overwrite output
                         '-ss', str(start),
-                        '-i', video_path,
+                        '-i', source_video,
                         '-t', str(duration),
                         '-r', str(video_fps),
                         '-c:v', 'libx264',  # Re-encode for consistent format
@@ -1195,8 +1243,8 @@ def main():
     parser.add_argument(
         '--video',
         type=str,
-        required=True,
-        help='Path to source video file'
+        default="",
+        help='Path to source video file (optional if clips carry per-clip video_path)'
     )
     parser.add_argument(
         '--audio',
@@ -1354,6 +1402,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Ensure ffmpeg/ffprobe are discoverable on Windows
+    _ensure_ffmpeg_on_path()
+
     # Validate original audio volume
     if args.original_audio_volume < 0.0:
         print(f"Error: --original-audio-volume must be 0.0 or higher (got {args.original_audio_volume})")
@@ -1479,12 +1530,16 @@ def main():
                 clips = [hook_clip] + clips
 
     if args.ending_video:
-        probe = subprocess.run(
-            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', args.ending_video],
-            capture_output=True, text=True
-        )
-        ending_video_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 4.0
+        try:
+            probe = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', args.ending_video],
+                capture_output=True, text=True
+            )
+            ending_video_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 4.0
+        except Exception as e:
+            print(f"Warning: Could not probe ending video: {e}")
+            ending_video_duration = 4.0
         ending_clip = {
             'section_idx': 9999,
             'shot_idx': -1,

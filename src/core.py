@@ -221,7 +221,8 @@ def commit(
             "shot": i + 1,
             "start": seconds_to_hhmmss(clip['start_sec']),
             "end": seconds_to_hhmmss(clip['end_sec']),
-            "duration": round(clip['duration'], 2)
+            "duration": round(clip['duration'], 2),
+            "video_path": video_path or "",
         })
 
     result_data = {
@@ -232,7 +233,8 @@ def commit(
         "target_duration": target_length_sec,
         "num_clips": len(clips),
         "is_stitched": len(clips) > 1,
-        "clips": result_clips
+        "clips": result_clips,
+        "video_path": video_path or "",
     }
 
     # Add protagonist frame detection data if available
@@ -945,6 +947,11 @@ class EditorCoreAgent:
         should_restart = False
         section_completed = False
 
+        # Progress tag + timer so interleaved parallel logs are readable and it is
+        # obvious whether a shot is still running (elapsed grows) or stuck.
+        tag = f"S{(self.current_section_idx or 0) + 1}·Shot{(self.current_shot_idx or 0) + 1}"
+        loop_start = time.time()
+
         for i in range(max_iterations):
             if i == max_iterations - 1:
                 msgs.append(
@@ -978,6 +985,12 @@ class EditorCoreAgent:
                             kwargs["api_base"] = config.AGENT_LITELLM_URL
                         if config.AGENT_LITELLM_API_KEY:
                             kwargs["api_key"] = config.AGENT_LITELLM_API_KEY
+                        _hb = f" (retry {model_retry + 1}/{max_model_retries})" if model_retry else ""
+                        print(
+                            f"⏳ [{tag}] iter {i + 1}/{max_iterations} · calling model…{_hb} "
+                            f"(+{time.time() - loop_start:.0f}s)",
+                            flush=True,
+                        )
                         raw = litellm.completion(**kwargs)
                         msg = raw.choices[0].message
                         tool_calls_raw = getattr(msg, "tool_calls", None)
@@ -1043,8 +1056,20 @@ class EditorCoreAgent:
 
                 response.setdefault("role", "assistant")
                 msgs.append(response)
-                print("#### Iteration: ", i, f"(Tool retry: {tool_retry + 1}/{max_tool_retries})" if tool_retry > 0 else "")
-                print(response)
+                _tcs = response.get("tool_calls") or []
+                if _tcs:
+                    _fn = _tcs[0]["function"]["name"]
+                    _raw_arg = _tcs[0]["function"].get("arguments") or ""
+                    _arg = (_raw_arg[:80] + "…") if len(_raw_arg) > 80 else _raw_arg
+                    _action = f"{_fn} {_arg}".strip()
+                else:
+                    _think = (response.get("reasoning_content") or response.get("content") or "").strip().replace("\n", " ")
+                    _action = ("(thinking) " + (_think[:80] + "…" if len(_think) > 80 else _think)) if _think else "(no tool call)"
+                _tr = f" [tool-retry {tool_retry + 1}/{max_tool_retries}]" if tool_retry > 0 else ""
+                print(
+                    f"✅ [{tag}] iter {i + 1}/{max_iterations}{_tr} · +{time.time() - loop_start:.0f}s → {_action}",
+                    flush=True,
+                )
 
                 tool_execution_failed = False
 
@@ -1766,11 +1791,20 @@ class ParallelShotOrchestrator:
             section_keep_ranges = []
             rerun_count = 0
             round_idx = 0
+            total_shots = len(shots)
+            max_rounds = self.max_reruns + 1
 
             while pending:
                 round_idx += 1
                 results = {}
                 combined_keep_ranges = global_keep_ranges + section_keep_ranges
+                _committed = total_shots - len(pending)
+                _pending_tags = ", ".join(f"Shot{k[1] + 1}" for k in sorted(pending))
+                print(
+                    f"\n🎬 [Section {sec_idx + 1}] Round {round_idx}/{max_rounds} · "
+                    f"{_committed}/{total_shots} shots committed · selecting {len(pending)} now: [{_pending_tags}]",
+                    flush=True,
+                )
                 print(
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
                     f"pending={len(pending)} rerun_count={rerun_count}/{self.max_reruns}"
@@ -1802,6 +1836,15 @@ class ParallelShotOrchestrator:
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
                     f"conflicts={len(losers)} winners={len(results) - len(losers)}"
                 )
+                _committed_after = total_shots - len(losers)
+                _rounds_left = max_rounds - round_idx
+                if losers and rerun_count < self.max_reruns:
+                    print(
+                        f"   ↳ [Section {sec_idx + 1}] Round {round_idx}/{max_rounds} done · "
+                        f"{_committed_after}/{total_shots} committed · {len(losers)} conflict(s) → "
+                        f"retrying next round ({_rounds_left} round(s) left)",
+                        flush=True,
+                    )
 
                 # Keep winners
                 round_has_updates = False

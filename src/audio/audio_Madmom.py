@@ -262,7 +262,8 @@ def detect_pitch(audio_path, samplerate=0, tolerance=0.8):
     p = Path(audio_path)
     if p.suffix.lower() not in {".wav", ".wave"}:
         # Create a temporary WAV file
-        wav_path = p.with_name(f"{p.stem}__vca_pitch.wav")
+        from src.audio.wav_cache import derived_wav_path
+        wav_path = derived_wav_path(p, "pitch")
 
         # Check if WAV already exists and is newer than source
         if not wav_path.exists() or wav_path.stat().st_mtime < p.stat().st_mtime:
@@ -334,7 +335,8 @@ def compute_mel_energies(audio_path, samplerate=0, win_s=512, n_filters=40):
     p = Path(audio_path)
     if p.suffix.lower() not in {".wav", ".wave"}:
         # Create a temporary WAV file
-        wav_path = p.with_name(f"{p.stem}__vca_mel.wav")
+        from src.audio.wav_cache import derived_wav_path
+        wav_path = derived_wav_path(p, "mel")
 
         # Check if WAV already exists and is newer than source
         if not wav_path.exists() or wav_path.stat().st_mtime < p.stat().st_mtime:
@@ -1628,5 +1630,5 @@ if __name__ == "__main__":
         print("用法: python audio_Madmom.py <音频文件路径> [选项]")
         print("使用 --help 查看详细帮助")
         sys.exit(0)
-    
+
     main()

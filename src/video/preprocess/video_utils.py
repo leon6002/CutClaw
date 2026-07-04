@@ -7,7 +7,7 @@ from tqdm import tqdm
 from decord import VideoReader, cpu, gpu
 from decord._ffi.base import DECORDError
 from PIL import Image
-from scenedetect import AdaptiveDetector, SceneManager, open_video
+from scenedetect import AdaptiveDetector, ContentDetector, SceneManager, open_video
 from scenedetect.backends.pyav import VideoStreamAv
 
 
@@ -157,9 +157,14 @@ def _run_scenedetect(
 
     video = VideoStreamAv(video_path)
     manager = SceneManager()
+    # ContentDetector works with frame_skip and with handheld/vlog footage where
+    # AdaptiveDetector (ratio-based) can return 0 cuts. The `threshold` from config
+    # is on the AdaptiveDetector scale (~1.5-3); ContentDetector expects a 0-255
+    # content-difference scale (default ~27), so remap small adaptive-scale values.
+    content_threshold = threshold if threshold >= 10 else 27.0
     manager.add_detector(
-        AdaptiveDetector(
-            adaptive_threshold=threshold,
+        ContentDetector(
+            threshold=content_threshold,
             min_scene_len=min_scene_len,
         )
     )
@@ -369,7 +374,7 @@ def decode_video_to_frames(
     save_frames_to_disk: bool = False,
     image_format: str = "jpg",
     jpeg_quality: int = 80,
-    num_workers: int = 16,
+    num_workers: int = 1,
 ) -> Dict[str, Any]:
     fps = float(target_fps) if target_fps is not None else 2.0
     if fps <= 0:

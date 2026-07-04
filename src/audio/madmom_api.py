@@ -31,8 +31,9 @@ def _ensure_wav_for_aubio(audio_path: str) -> str:
     if p.suffix.lower() in {".wav", ".wave"}:
         return audio_path
 
-    # Write next to the input (Gradio's /tmp directory is writable and scoped)
-    out_path = p.with_name(f"{p.stem}__vca.wav")
+    # Write into Output/tmp_wav (NOT next to the input, so asset folders stay clean)
+    from src.audio.wav_cache import derived_wav_path
+    out_path = derived_wav_path(p)
 
     try:
         src_mtime = p.stat().st_mtime

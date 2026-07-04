@@ -43,3 +43,10 @@ src/config_my.py
 asset/demo_compressed
 ProVideo
 CLAUDE.md
+
+/resource/imports/
+/tools/
+# Web UI
+web/node_modules/
+web/dist/
+/resource/

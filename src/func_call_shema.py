@@ -2,7 +2,12 @@
 
 import inspect
 from collections.abc import Callable
-from typing import Any, Final, Required, TypedDict, TypeVar
+from typing import Any, Final, TypedDict, TypeVar
+
+try:
+    from typing import Required
+except ImportError:  # Python < 3.11
+    from typing_extensions import Required
 
 import pydantic
 import pydantic.json_schema

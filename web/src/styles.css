@@ -1,0 +1,70 @@
+/* Tailwind v4 — theme + utilities only (preflight skipped so antd styles stay intact) */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: #0d0f13;
+  font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #384050; border-radius: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* asset card media area */
+.card-media {
+  background: #000;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 8px 8px 0 0;
+}
+.card-media video, .card-media img { width: 100%; height: 100%; object-fit: contain; }
+.audio-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 100%; padding: 0 10px; }
+.audio-wrap audio { width: 100%; }
+
+/* annotation key-value table */
+.kv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kv-table td { padding: 7px 10px; border-bottom: 1px solid #262b36; vertical-align: top; }
+.kv-table .kv-key { width: 120px; color: #9aa3b2; white-space: nowrap; font-weight: 500; }
+.kv-table .kv-val { color: #e6e9ef; white-space: pre-wrap; word-break: break-word; }
+
+/* raw JSON blocks */
+.rawjson {
+  background: #0a0c10;
+  border: 1px solid #262b36;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-height: 380px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #c6cbd4;
+  margin: 0;
+}
+
+/* dense time segment rows in the annotation inspector */
+.dense-seg {
+  border-left: 2px solid #384050;
+  margin: 8px 0 8px 4px;
+  padding: 4px 0 4px 12px;
+}
+.dense-seg:hover { border-left-color: #ff6b4a; }
+
+/* sticky player at the top of the detail drawer */
+.drawer-player {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #1d212a; /* matches antd colorBgElevated (drawer bg) */
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #262b36;
+}

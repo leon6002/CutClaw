@@ -1119,19 +1119,29 @@ class Screenwriter:
                 "Failed to generate a valid shot plan after retries — "
                 "check API connectivity / model availability / prompt output format."
             )
-        # Select hook dialogue
+        # Select hook dialogue — only when the video actually has dialogue subtitles.
+        # Scenery / no-speech videos produce an empty SRT (0 bytes); skip the hook
+        # gracefully instead of failing the whole pipeline.
         hook_dialogue = None
-        if self.subtitle_path and os.path.exists(self.subtitle_path):
+        if (
+            self.subtitle_path
+            and os.path.exists(self.subtitle_path)
+            and os.path.getsize(self.subtitle_path) > 0
+        ):
             partial_output = {
                 "video_structure": [{**structure_proposal, "shot_plan": shot_plan}]
             }
-            hook_dialogue = select_hook_dialogue(
-                self.subtitle_path,
-                partial_output,
-                instruction,
-                target_duration_sec=15.0,
-                main_character=self.main_character,
-            )
+            try:
+                hook_dialogue = select_hook_dialogue(
+                    self.subtitle_path,
+                    partial_output,
+                    instruction,
+                    target_duration_sec=15.0,
+                    main_character=self.main_character,
+                )
+            except HookDialogueSelectionError as e:
+                print(f"⚠️ [Screenwriter] No usable dialogue for hook, skipping: {e}")
+                hook_dialogue = None
         else:
             hook_dialogue = None
 

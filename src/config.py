@@ -17,8 +17,8 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = ""
-AUDIO_PATH = ""
+VIDEO_PATH = "E:\\apps\\CutClaw\\resource/imports/DJI_20260619162056_0786_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615120557_0642_D.MP4"
+AUDIO_PATH = "E:\\apps\\CutClaw\\resource/imports/JINBAO - Long Journey.mp3"
 INSTRUCTION = ""
 SRT_PATH = ""
 
@@ -134,7 +134,7 @@ ASR_LANGUAGE = "English"
 # Option 1: whisper.cpp (local)
 # ───────────────────────────────────────────────────────────────────────────────
 
-ASR_DEVICE = "cuda:0" if __import__('torch').cuda.is_available() else "cpu"
+ASR_DEVICE = "cuda:0"  # default; actual detection deferred to asr.py runtime
 # Device for local ASR. Uses cuda:0 when available, otherwise cpu.
 
 ASR_WHISPER_CPP_MODEL = "base.en"
@@ -176,13 +176,13 @@ SCENE_PROMPT_TYPE = VIDEO_TYPE
 VIDEO_ANALYSIS_MODEL_MAX_TOKEN = 16384 
 # Max output token count for the video analysis model.
 
-VIDEO_ANALYSIS_MODEL = ""
+VIDEO_ANALYSIS_MODEL = "openai/[L]gemini-3-flash-preview"
 # Video semantic analysis model name (called via OpenAI-compatible endpoint).
 
-VIDEO_ANALYSIS_ENDPOINT = ""  
+VIDEO_ANALYSIS_ENDPOINT = "https://bboluo.com/v1"
 # API base URL for the video analysis model.
 
-VIDEO_ANALYSIS_API_KEY = ""
+VIDEO_ANALYSIS_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
 # API key for the video analysis model.
 
 CAPTION_BATCH_SIZE = 64
@@ -196,13 +196,13 @@ SCENE_ANALYSIS_MIN_FRAMES = 6
 # ------------------ Audio Model ------------------ #
 # Analyzes musical beat/energy/structure and outputs editing keypoints.
 
-AUDIO_LITELLM_MODEL = ""
+AUDIO_LITELLM_MODEL = "openai/[L]gemini-3-flash-preview"
 # Cloud model used for audio captioning and structure analysis.
 
-AUDIO_LITELLM_API_KEY = ""
+AUDIO_LITELLM_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
 # API key for the audio model.
 
-AUDIO_LITELLM_BASE_URL = ""
+AUDIO_LITELLM_BASE_URL = "https://bboluo.com/v1"
 # API base URL for the audio model.
 
 AUDIO_DETECTION_METHODS = ["downbeat", "pitch", "mel_energy"]
@@ -276,10 +276,10 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Segments below this level are treated as too quiet and filtered.
 
 # ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 0.1
+AUDIO_MIN_SEGMENT_DURATION = 1.0
 # Minimum segment duration (seconds). Smaller values create faster cuts.
 
-AUDIO_MAX_SEGMENT_DURATION = 2.0
+AUDIO_MAX_SEGMENT_DURATION = 3.0
 # Maximum segment duration (seconds). Larger values create slower pacing.
 
 # ----- Music structure analysis (Level-1) -----
@@ -321,15 +321,23 @@ AUDIO_KEYPOINT_MAX_TOKENS = 4096
 AGENT_MODEL_MAX_TOKEN = 8192
 # Maximum generated tokens per agent response (not total context size).
 
-AGENT_MODEL_MAX_RETRIES = 4
-# Max retries per agent step when model calls fail.
+AGENT_MAX_ITERATIONS = 12
+# Max tool-use iterations per shot in the editor agent loop. Each iteration is
+# one LLM round-trip carrying the full (growing) message history, so this is the
+# single biggest lever on token cost. Lower = cheaper; too low may cut off hard
+# shots before they commit. 12 keeps room for normal shots while trimming the
+# wasteful tail of failing ones.
+
+AGENT_MODEL_MAX_RETRIES = 2
+# Max retries per agent step when model calls fail. Each retry re-sends the whole
+# history, so fewer retries also reduces wasted tokens on flaky relay errors.
 
 AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 5.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 15.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 25.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 35.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3
@@ -344,13 +352,13 @@ ENABLE_TRIM_SHOT_CHARACTER_ANALYSIS = True
 CORE_MAX_FRAMES = 60
 # Maximum sampled frames per clip for core + reviewer analysis.
 
-AGENT_LITELLM_URL = ""
+AGENT_LITELLM_URL = "https://bboluo.com/v1"
 # API base URL for the agent LLM.
 
-AGENT_LITELLM_API_KEY = ""
+AGENT_LITELLM_API_KEY = "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3"
 # API key for the agent LLM.
 
-AGENT_LITELLM_MODEL = ""
+AGENT_LITELLM_MODEL = "openai/[L]gemini-3-flash-preview"
 # Primary model for the agent.
 
 PARALLEL_SHOT_ENABLED = True
@@ -359,8 +367,9 @@ PARALLEL_SHOT_ENABLED = True
 PARALLEL_SHOT_MAX_WORKERS = 4
 # Number of parallel workers.
 
-PARALLEL_SHOT_MAX_RERUNS = 2
-# Maximum rerun rounds for conflicted shots.
+PARALLEL_SHOT_MAX_RERUNS = 1
+# Maximum rerun rounds for conflicted shots. Each rerun re-runs a full agent loop
+# for every losing shot, so keeping this at 1 avoids a second expensive round.
 
 
 
@@ -414,5 +423,28 @@ SCENE_EXPLORATION_RANGE = 3
 # Extra exploration range around recommended scenes (±N scenes).
 # Example: if recommended scene is 8 and range=3, search scene 5~11.
 # Set to 0 to strictly limit selection to recommended scenes only.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Asset Manager — automated media scanning, annotation, and selection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ASSET_ROOT_DIR = "resource/imports/"
+# Default directory scanned for media assets (videos / images / audio).
+
+ASSET_ANNOTATION_MODEL = VIDEO_ANALYSIS_MODEL
+# Model used for asset annotation. Defaults to same as video analysis model.
+# Set to a cheaper/faster model for cataloging to save costs.
+
+ASSET_SELECTOR_MODEL = AGENT_LITELLM_MODEL
+# Model used by the selector Agent. Defaults to the same Agent model.
+
+ASSET_MAX_VIDEOS_TO_SELECT = 5
+# Maximum number of videos the selector can pick.
+
+ASSET_MAX_IMAGES_TO_SELECT = 10
+# Maximum number of images the selector can pick (converted to slideshow).
+
+ASSET_IMAGE_DURATION_SEC = 3.0
+# Duration per still image when converting to slideshow video.
 
 

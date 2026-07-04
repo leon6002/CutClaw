@@ -42,3 +42,7 @@ matplotlib
 
 # External system dependency:
 # ffmpeg must be installed and available in PATH.
+
+# Web backend (React UI)
+fastapi
+uvicorn[standard]

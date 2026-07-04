@@ -1,0 +1,30 @@
+[
+  {
+    "name": "Gemini Flash (bboluo)",
+    "model": "openai/[L]gemini-3-flash-preview",
+    "endpoint": "https://bboluo.com/v1",
+    "api_key": "sk-utv0tmPgHffWbuU7rgE7tmbQMwy48juvTdxsVBV86m6tkVm3",
+    "multimodal": true
+  },
+  {
+    "name": "DeepSeek V4 Pro",
+    "model": "deepseek/deepseek-v4-pro",
+    "endpoint": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "multimodal": false
+  },
+  {
+    "name": "DeepSeek V4 Flash",
+    "model": "deepseek/deepseek-v4-flash",
+    "endpoint": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "multimodal": false
+  },
+  {
+    "name": "GLM-5.2 (Z.ai)",
+    "model": "openai/glm-5.2",
+    "endpoint": "https://api.z.ai/api/paas/v4",
+    "api_key": "",
+    "multimodal": false
+  }
+]
