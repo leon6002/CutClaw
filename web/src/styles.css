@@ -58,6 +58,136 @@ body {
 }
 .dense-seg:hover { border-left-color: #ff6b4a; }
 
+/* ── animated agent flow diagram ── */
+.flow-wrap {
+  display: flex;
+  align-items: flex-start;
+  margin: 18px 0 10px;
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+.flow-node { width: 118px; flex-shrink: 0; text-align: center; }
+.flow-dot {
+  width: 46px; height: 46px; border-radius: 50%;
+  border: 2px solid #384050; background: #14171d;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; margin: 0 auto; color: #6b7383;
+  transition: border-color .3s, color .3s;
+}
+.flow-node.running .flow-dot {
+  border-color: #ff6b4a; color: #ff6b4a;
+  animation: flowPulse 1.6s ease-out infinite;
+}
+.flow-node.done .flow-dot {
+  border-color: #4ade80; color: #4ade80;
+  animation: flowPop .35s cubic-bezier(.34,1.56,.64,1);
+}
+.flow-node.error .flow-dot { border-color: #f87171; color: #f87171; animation: flowShake .4s; }
+.flow-node.skip { opacity: .45; }
+.flow-label { font-size: 12px; font-weight: 600; margin-top: 7px; color: #e6e9ef; }
+.flow-node.pending .flow-label { color: #6b7383; }
+.flow-detail {
+  font-size: 11px; color: #9aa3b2; margin: 3px auto 0; max-width: 116px;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  line-height: 1.35; min-height: 15px;
+}
+.flow-node.error .flow-detail { color: #f87171; }
+.flow-conn {
+  flex: 1; min-width: 26px; height: 2px; margin-top: 23px;
+  background: #2a303c; position: relative; overflow: hidden; border-radius: 1px;
+}
+.flow-conn.done { background: #4ade8055; }
+.flow-conn.error { background: #f8717155; }
+.flow-conn.active {
+  background: #2a303c;
+}
+.flow-conn.active::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(90deg, #ff6b4a 0 10px, transparent 10px 20px);
+  animation: flowDash .7s linear infinite;
+}
+@keyframes flowDash { to { transform: translateX(20px); } }
+@keyframes flowPulse {
+  0% { box-shadow: 0 0 0 0 rgba(255, 107, 74, .45); }
+  70% { box-shadow: 0 0 0 12px rgba(255, 107, 74, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 107, 74, 0); }
+}
+@keyframes flowPop { from { transform: scale(.55); } to { transform: scale(1); } }
+@keyframes flowShake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+.flow-node.next .flow-dot {
+  border-style: dashed; border-color: #ff6b4a; color: #ff6b4a;
+  animation: flowPulse 2.2s ease-out infinite;
+}
+.flow-node.next .flow-label { color: #ff6b4a; }
+.flow-next-tag {
+  display: inline-block; margin-left: 4px; padding: 0 5px;
+  font-size: 10px; font-weight: 700; border-radius: 999px;
+  background: #ff6b4a22; color: #ff6b4a; vertical-align: 1px;
+}
+.flow-node.clickable { cursor: pointer; border-radius: 10px; padding: 4px 2px; }
+.flow-node.clickable:hover { background: #ffffff08; }
+
+/* ── AI instruction suggestion chips ── */
+.suggestion-chip {
+  cursor: pointer;
+  border: 1px dashed #384050;
+  border-radius: 8px;
+  padding: 7px 11px;
+  margin-top: 7px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #c6cbd4;
+  transition: border-color .2s, background .2s, transform .15s;
+  animation: chipIn .3s ease-out;
+}
+.suggestion-chip:hover {
+  border-color: #ff6b4a;
+  background: #ff6b4a11;
+  transform: translateX(3px);
+}
+.suggestion-chip.picked {
+  border-style: solid;
+  border-color: #ff6b4a;
+  color: #ff6b4a;
+  background: #ff6b4a14;
+}
+@keyframes chipIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+
+/* ── fine-grained segment execution grid ── */
+.seg-task { margin: 10px 0 14px; }
+.seg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 7px; }
+.seg-running-txt { color: #fbbf24; font-weight: 600; }
+.seg-grid { display: flex; flex-wrap: wrap; gap: 3px; }
+.seg {
+  width: 12px; height: 12px; border-radius: 3px;
+  background: #2a303c;
+  transition: background .35s, transform .2s;
+}
+.seg:hover { transform: scale(1.5); }
+.seg-r { background: #fbbf24; animation: segPulse 1s ease-in-out infinite; }
+.seg-d { background: #4ade80; animation: segLand .3s ease-out; }
+.seg-f { background: #f87171; }
+@keyframes segPulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 6px #fbbf2488; }
+  50% { opacity: .45; box-shadow: none; }
+}
+@keyframes segLand { from { transform: scale(1.6); } to { transform: scale(1); } }
+
+/* global workflow bar */
+.workflow-bar {
+  background: #12151b;
+  border: 1px solid #262b36;
+  border-radius: 12px;
+  padding: 6px 16px 2px;
+  margin-bottom: 18px;
+}
+.workflow-bar .flow-wrap { margin: 8px 0 4px; }
+
 /* sticky player at the top of the detail drawer */
 .drawer-player {
   position: sticky;

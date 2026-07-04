@@ -3,6 +3,7 @@ import { Alert, Button, Card, Checkbox, Empty, Select, Space, Typography } from 
 import { DownloadOutlined, PlayCircleOutlined, ReloadOutlined } from "@ant-design/icons";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
+import { ShotTimeline } from "../components/Charts";
 import type { PipelineStatus, ProjectState } from "../App";
 
 const { Text } = Typography;
@@ -19,11 +20,12 @@ const RATIOS = ["9:16", "16:9", "1:1"];
 const WIDTH: Record<string, number> = { "9:16": 240, "16:9": 480, "1:1": 320 };
 
 export default function RenderView({
-  project, setProject, pipelineStatus,
+  project, setProject, pipelineStatus, onOutputsCount,
 }: {
   project: ProjectState;
   setProject: (fn: (p: ProjectState) => ProjectState) => void;
   pipelineStatus: PipelineStatus;
+  onOutputsCount?: (n: number) => void;
 }) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [outputs, setOutputs] = useState<Output[]>([]);
@@ -37,19 +39,17 @@ export default function RenderView({
   const shotPoint = project.shotPoint;
 
   const refreshRecent = () => {
-    api<RecentProject[]>("/api/project/recent").then((r) => {
-      setRecent(r);
-      if (r.length > 0) {
-        setProject((p) => (p.shotPoint ? p : { ...p, shotPoint: r[0].shot_point }));
-      }
-    }).catch(() => {});
+    // recent results on disk — offered for manual attach only; the project's
+    // own shot_point (set when its pipeline runs) always takes priority
+    api<RecentProject[]>("/api/project/recent").then(setRecent).catch(() => {});
   };
 
   const refreshOutputs = (sp: string) => {
-    if (!sp) { setOutputs([]); return; }
+    if (!sp) { setOutputs([]); onOutputsCount?.(0); return; }
     api<any>(`/api/render/outputs?shot_point=${encodeURIComponent(sp)}`).then((r) => {
       setOutputs(r.outputs);
       setHasEnding(r.has_ending_video);
+      onOutputsCount?.(r.outputs.length);
     }).catch(() => {});
   };
 
@@ -84,14 +84,15 @@ export default function RenderView({
   return (
     <div>
       <Card size="small" title="🎬 渲染导出">
-        {recent.length === 0 ? (
-          <Empty description="还没有可渲染的结果 — 先在「✂️ 项目编辑」中运行流水线" />
+        {recent.length === 0 && !shotPoint ? (
+          <Empty description="本项目还没有可渲染的结果 — 先在「✂️ 项目编辑」中运行流水线" />
         ) : (
           <>
             <div className="mb-3">
-              <Text type="secondary" className="mb-1 block text-xs">选择剪辑结果（shot_point）</Text>
+              <Text type="secondary" className="mb-1 block text-xs">剪辑结果（本项目运行流水线后自动填入，也可手动挂载历史结果）</Text>
               <Select
                 style={{ width: "100%" }} value={shotPoint || undefined}
+                placeholder="— 选择一个剪辑结果 —"
                 onChange={(v) => setProject((p) => ({ ...p, shotPoint: v as string }))}
                 options={[
                   ...(!recent.some((r) => r.shot_point === shotPoint) && shotPoint
@@ -127,6 +128,12 @@ export default function RenderView({
         {job.status === "done" && <Alert type="success" showIcon message="✅ 渲染完成！" className="mt-3" />}
         {(rendering || job.status === "error") && <JobLog lines={job.lines} height={240} />}
       </Card>
+
+      {shotPoint && (
+        <Card size="small" title="🎞️ 成片时间轴" className="mt-4">
+          <ShotTimeline shotPoint={shotPoint} />
+        </Card>
+      )}
 
       {outputs.length > 0 && (
         <>

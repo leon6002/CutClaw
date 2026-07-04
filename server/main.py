@@ -91,10 +91,11 @@ class Job:
             self.lines.append(line)
 
     def to_dict(self, since: int = 0):
+        import copy
         with self.lock:
             return {
                 "id": self.id, "kind": self.kind, "status": self.status,
-                "returncode": self.returncode, "meta": dict(self.meta),
+                "returncode": self.returncode, "meta": copy.deepcopy(self.meta),
                 "lines": self.lines[since:], "total": len(self.lines),
             }
 
@@ -107,13 +108,22 @@ def _reader_thread(job: Job, on_line=None):
     try:
         for line in job.proc.stdout:
             line = line.rstrip()
-            job.add(line)
             if on_line:
                 on_line(job, line)
+            if "@@PROGRESS" not in line:   # progress events go to meta, not the log
+                job.add(line)
     finally:
         job.proc.wait()
         job.returncode = job.proc.returncode
         job.status = "done" if job.proc.returncode == 0 else "error"
+        pid = job.meta.get("project_id")
+        if pid:
+            try:
+                p = _load_project(pid)
+                p["last_run_status"] = job.status
+                _save_project(p)
+            except Exception:
+                pass
 
 
 def _spawn(job: Job, cmd: list[str], on_line=None):
@@ -326,6 +336,9 @@ def annotate(body: AnnotateRequest):
     JOBS[job.id] = job
 
     def _run():
+        # feed fine-grained segment events (e.g. audio captioning) into this job
+        from src.utils import progress as _progress
+        _progress.HOOK = lambda ev: _apply_progress_ev(job, ev)
         try:
             from src.asset_manager.annotator import batch_annotate, annotate_asset
             from src.asset_manager.index_store import upsert_annotations
@@ -358,6 +371,8 @@ def annotate(body: AnnotateRequest):
             import traceback
             job.add(f"ERROR: {e}\n{traceback.format_exc()[-800:]}")
             job.status = "error"
+        finally:
+            _progress.HOOK = None
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job.id}
@@ -365,33 +380,318 @@ def annotate(body: AnnotateRequest):
 
 class SelectRequest(BaseModel):
     instruction: str = ""
+    project_id: str = ""
+    target_length: float = 0.0
 
 
 @app.post("/api/assets/auto-select")
 def auto_select(body: SelectRequest):
-    from src.asset_manager.selector import select_assets
-    from src.utils.video_concat import create_slideshow_video
+    """Agent asset selection as a staged background job (poll via /api/jobs)."""
     root = SCANNED["root"] or _resolve(cfg("ASSET_ROOT_DIR", "resource/imports/"))
     instr = body.instruction.strip() or cfg("INSTRUCTION", "").strip() or "travel montage"
-    target_dur = float(cfg("AUDIO_SEGMENT_MAX_DURATION_SEC", "20.0")) - 5.0
-    sel = select_assets(instruction=instr, target_duration_sec=max(15.0, target_dur))
+    target_dur = body.target_length or (float(cfg("AUDIO_SEGMENT_MAX_DURATION_SEC", "20.0")) - 5.0)
 
-    def _abs(p):
-        return p if os.path.isabs(p) else os.path.join(root, p)
+    job = Job("select")
+    job.meta["stages"] = {}
+    JOBS[job.id] = job
 
-    abs_videos = [_abs(p) for p in sel.selected_videos]
-    if sel.selected_images:
-        ss = create_slideshow_video(
-            [_abs(p) for p in sel.selected_images],
-            duration_per_image=float(cfg("ASSET_IMAGE_DURATION_SEC", "3.0")))
-        if ss:
-            abs_videos.append(ss)
-    if abs_videos:
-        save_config("VIDEO_PATH", "||".join(abs_videos))
-    if sel.selected_audio:
-        save_config("AUDIO_PATH", _abs(sel.selected_audio[0]))
-    return {"selection": _dump(sel), "videos": abs_videos,
-            "audio": _abs(sel.selected_audio[0]) if sel.selected_audio else ""}
+    _STATUS_MAP = {"start": "running"}
+
+    def _st(stage: str, status: str, detail: str = ""):
+        status = _STATUS_MAP.get(status, status)
+        job.meta["stages"] = {**job.meta.get("stages", {}), stage: {"status": status, "detail": detail}}
+        job.add(f"[{stage}] {status} {detail}".rstrip())
+
+    def _run():
+        try:
+            from src.asset_manager.selector import select_assets
+            from src.utils.video_concat import create_slideshow_video
+
+            sel = select_assets(
+                instruction=instr,
+                target_duration_sec=max(15.0, target_dur),
+                stage_callback=_st,
+            )
+
+            if not (sel.selected_videos or sel.selected_images or sel.selected_audio):
+                job.add(f"选材失败：{sel.rationale}")
+                job.meta["selection"] = _dump(sel)
+                job.status = "error"
+                return
+
+            def _abs(p):
+                return p if os.path.isabs(p) else os.path.join(root, p)
+
+            abs_videos = [_abs(p) for p in sel.selected_videos]
+
+            if sel.selected_images:
+                _st("slideshow", "running", f"{len(sel.selected_images)} 张图片")
+                ss = create_slideshow_video(
+                    [_abs(p) for p in sel.selected_images],
+                    duration_per_image=float(cfg("ASSET_IMAGE_DURATION_SEC", "3.0")))
+                if ss:
+                    abs_videos.append(ss)
+                    _st("slideshow", "done", "Ken Burns 幻灯片已生成")
+                else:
+                    _st("slideshow", "error", "幻灯片生成失败")
+            else:
+                _st("slideshow", "skip", "没有选中图片")
+
+            _st("apply", "running")
+            if abs_videos:
+                save_config("VIDEO_PATH", "||".join(abs_videos))
+            audio_abs = _abs(sel.selected_audio[0]) if sel.selected_audio else ""
+            if audio_abs:
+                save_config("AUDIO_PATH", audio_abs)
+            if body.project_id:
+                try:
+                    p = _load_project(body.project_id)
+                    if abs_videos:
+                        p["videos"] = abs_videos
+                    if audio_abs:
+                        p["audio"] = audio_abs
+                    p["selection_rationale"] = sel.rationale or ""
+                    _save_project(p)
+                except Exception:
+                    pass
+            _st("apply", "done", "已写入当前项目")
+
+            job.meta["selection"] = _dump(sel)
+            job.meta["videos"] = abs_videos
+            job.meta["audio"] = audio_abs
+            job.status = "done"
+        except Exception as e:
+            import traceback
+            job.add(f"ERROR: {e}\n{traceback.format_exc()[-600:]}")
+            job.status = "error"
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"job_id": job.id}
+
+
+# ── AI instruction suggestions ─────────────────────────────────────────────
+
+class SuggestRequest(BaseModel):
+    project_id: str = ""
+
+
+@app.post("/api/instruction/suggestions")
+def instruction_suggestions(body: SuggestRequest):
+    """Generate a few diverse editing-instruction suggestions from asset annotations."""
+    import re as _re
+    import litellm
+    from src.asset_manager.index_store import get_all_summaries
+
+    summaries = get_all_summaries()
+    if summaries.startswith("(No annotated"):
+        raise HTTPException(400, "没有已标注素材 — 先在素材库扫描并标注。")
+
+    project_ctx = ""
+    if body.project_id:
+        try:
+            p = _load_project(body.project_id)
+            names = [os.path.basename(v) for v in p.get("videos", [])]
+            if names:
+                project_ctx = "当前项目已选视频素材：" + "、".join(names)
+            if p.get("audio"):
+                project_ctx += f"；音乐：{os.path.basename(p['audio'])}"
+        except HTTPException:
+            pass
+
+    prompt = (
+        "你是短视频混剪的创意顾问。根据下面的素材标注摘要"
+        + ("和当前项目已选素材" if project_ctx else "")
+        + "，提出 4 条风格差异明显的剪辑指令建议"
+        "（每条一句话、20~40 个字、中文；风格覆盖如：情感叙事、快节奏卡点、氛围沉浸、旅行记录等）。\n\n"
+        + (project_ctx + "\n\n" if project_ctx else "")
+        + f"素材库摘要：\n{summaries[:6000]}\n\n"
+        '只返回 JSON 数组，例如 ["建议一","建议二","建议三","建议四"]，不要其他内容。'
+    )
+
+    kwargs: dict = dict(
+        model=cfg("AGENT_LITELLM_MODEL", ""),
+        messages=[{"role": "user", "content": prompt}],
+        # reasoning models (e.g. gemini-flash thinking) burn budget on thought
+        # tokens first — a small max_tokens yields EMPTY content
+        temperature=0.9, max_tokens=8192,
+    )
+    if cfg("AGENT_LITELLM_URL", ""):
+        kwargs["api_base"] = cfg("AGENT_LITELLM_URL", "")
+    if cfg("AGENT_LITELLM_API_KEY", ""):
+        kwargs["api_key"] = cfg("AGENT_LITELLM_API_KEY", "")
+
+    finish_reason = ""
+    try:
+        raw = litellm.completion(**kwargs)
+        msg = raw.choices[0].message
+        finish_reason = str(getattr(raw.choices[0], "finish_reason", "") or "")
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
+    except Exception as e:
+        raise HTTPException(502, f"LLM 调用失败：{str(e)[:200]}")
+
+    text = content.strip()
+    m = _re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, _re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    arr: list = []
+    try:
+        arr = json.loads(text)
+    except Exception:
+        s, e2 = text.find("["), text.rfind("]")
+        if s >= 0 and e2 > s:
+            try:
+                arr = json.loads(text[s:e2 + 1])
+            except Exception:
+                arr = []
+    arr = [str(x).strip() for x in arr if str(x).strip()][:6]
+    if not arr:
+        raise HTTPException(
+            502,
+            f"无法解析模型返回（finish_reason={finish_reason or '?'}，长度={len(content)}）：{content[:150]}")
+    return {"suggestions": arr}
+
+
+# ── Analysis data (for chart visualizations) ───────────────────────────────
+
+@app.get("/api/json")
+def get_json_file(path: str):
+    """Serve a JSON artifact (shot_point / captions / …) under Output/."""
+    abs_path = os.path.abspath(_resolve(path))
+    out_root = os.path.abspath(os.path.join(PROJECT_ROOT, "Output"))
+    if not abs_path.startswith(out_root):
+        raise HTTPException(403, "only files under Output/ are allowed")
+    if not os.path.isfile(abs_path):
+        raise HTTPException(404, f"not found: {path}")
+    with open(abs_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/audio/keypoints")
+def audio_keypoints(path: str):
+    """Raw madmom keypoints for an audio file (from the shared keypoint cache)."""
+    abs_path = _resolve(path)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(404, f"not found: {path}")
+    from src.asset_manager.scanner import compute_content_hash
+    import src.config as config
+    ch = compute_content_hash(abs_path)
+    kp_dir = os.path.join(_resolve(getattr(config, "VIDEO_DATABASE_FOLDER", "./Output/")),
+                          "analyzed", "keypoints")
+    out: dict = {}
+    if os.path.isdir(kp_dir):
+        for fn in os.listdir(kp_dir):
+            if fn.startswith(ch[:16]) and fn.endswith(".json"):
+                parts = fn[:-5].split("_")
+                method = parts[1] if len(parts) > 1 else fn
+                try:
+                    with open(os.path.join(kp_dir, fn), "r", encoding="utf-8") as f:
+                        out[method] = json.load(f)
+                except Exception:
+                    pass
+    return out
+
+
+# ── Projects ────────────────────────────────────────────────────────────────
+# A project = one edit: selected assets, instruction, params, pipeline result.
+# Asset annotations stay asset-level (hash-cached), independent of projects.
+
+PROJECTS_DIR = os.path.join(PROJECT_ROOT, "Output", "projects")
+
+_PROJECT_DEFAULTS = {
+    "name": "",
+    "videos": [], "audio": "", "instruction": "",
+    "has_dialogue": False, "main_character": "", "srt": "",
+    "target_length": 30.0, "shot_length": 4.0,
+    "selection_rationale": "",
+    "shot_point": "", "effective_video": "",
+    "last_run_at": None, "last_run_status": "",
+}
+
+
+def _project_file(pid: str) -> str:
+    return os.path.join(PROJECTS_DIR, pid, "project.json")
+
+
+def _load_project(pid: str) -> dict:
+    fp = _project_file(pid)
+    if not os.path.exists(fp):
+        raise HTTPException(404, f"project not found: {pid}")
+    with open(fp, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_project(p: dict) -> dict:
+    p["updated_at"] = time.time()
+    os.makedirs(os.path.dirname(_project_file(p["id"])), exist_ok=True)
+    with open(_project_file(p["id"]), "w", encoding="utf-8") as f:
+        json.dump(p, f, ensure_ascii=False, indent=2)
+    return p
+
+
+@app.get("/api/projects")
+def list_projects():
+    out = []
+    if os.path.isdir(PROJECTS_DIR):
+        for pid in os.listdir(PROJECTS_DIR):
+            fp = _project_file(pid)
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        out.append(json.load(f))
+                except Exception:
+                    pass
+    out.sort(key=lambda p: p.get("updated_at", 0), reverse=True)
+    return out
+
+
+class ProjectCreate(BaseModel):
+    name: str = ""
+    from_config: bool = False   # seed with legacy config.py values
+
+
+@app.post("/api/projects")
+def create_project(body: ProjectCreate):
+    pid = "p_" + uuid.uuid4().hex[:8]
+    p = dict(_PROJECT_DEFAULTS)
+    p["id"] = pid
+    p["name"] = body.name.strip() or f"项目 {time.strftime('%m-%d %H:%M')}"
+    p["created_at"] = time.time()
+    if body.from_config:
+        p["videos"] = [v for v in cfg("VIDEO_PATH", "").split("||") if v]
+        p["audio"] = cfg("AUDIO_PATH", "")
+        p["instruction"] = cfg("INSTRUCTION", "")
+    return _save_project(p)
+
+
+@app.get("/api/projects/{pid}")
+def get_project(pid: str):
+    return _load_project(pid)
+
+
+class ProjectPatch(BaseModel):
+    patch: dict
+
+
+@app.put("/api/projects/{pid}")
+def update_project(pid: str, body: ProjectPatch):
+    p = _load_project(pid)
+    allowed = set(_PROJECT_DEFAULTS.keys())
+    for k, v in body.patch.items():
+        if k in allowed:
+            p[k] = v
+    return _save_project(p)
+
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: str):
+    fp = _project_file(pid)
+    if os.path.exists(fp):
+        os.remove(fp)
+        try:
+            os.rmdir(os.path.dirname(fp))
+        except OSError:
+            pass
+    return {"ok": True}
 
 
 # ── Pipeline ────────────────────────────────────────────────────────────────
@@ -434,6 +734,48 @@ def _parse_stage(job: Job, line: str):
                 ss[stage] = "error"
 
 
+_EVENT_STATE = {"start": "r", "done": "d", "fail": "f"}
+
+
+def _apply_progress_ev(job: Job, ev: dict):
+    """Fold one fine-grained progress event into job.meta['tasks']."""
+    with job.lock:
+        tasks = job.meta.setdefault("tasks", {})
+        name = str(ev.get("task", "task"))
+        t = tasks.setdefault(name, {"total": 0, "states": {}})
+        total = ev.get("total")
+        if isinstance(total, int) and total > 0:
+            t["total"] = total
+        idx = ev.get("idx", -1)
+        event = ev.get("event", "")
+        if isinstance(idx, int) and idx >= 0:
+            if event == "retry":
+                t["states"].pop(str(idx), None)   # back to pending
+            elif event in _EVENT_STATE:
+                t["states"][str(idx)] = _EVENT_STATE[event]
+        t["done"] = sum(1 for v in t["states"].values() if v == "d")
+        t["fail"] = sum(1 for v in t["states"].values() if v == "f")
+        for k in ("avg", "eta"):
+            if k in ev:
+                t[k] = ev[k]
+
+
+def _parse_progress_line(job: Job, line: str):
+    pos = line.find("@@PROGRESS ")
+    if pos < 0:
+        return
+    try:
+        ev = json.loads(line[pos + len("@@PROGRESS "):])
+    except Exception:
+        return
+    _apply_progress_ev(job, ev)
+
+
+def _on_pipeline_line(job: Job, line: str):
+    _parse_stage(job, line)
+    _parse_progress_line(job, line)
+
+
 def _derive_shot_point_path(video_path: str, audio_path: str, instruction: str) -> str:
     import src.config as config
     video_id = os.path.splitext(os.path.basename(video_path))[0].replace('.', '_').replace(' ', '_')
@@ -453,6 +795,7 @@ class PipelineRequest(BaseModel):
     srt_path: str = ""
     target_length: float = 30.0
     shot_length: float = 4.0
+    project_id: str = ""
 
 
 MIN_SHOT = 0.2
@@ -474,6 +817,8 @@ def pipeline_start(body: PipelineRequest):
     videos = [p for p in body.video_paths if p and p.strip()]
     if not videos:
         raise HTTPException(400, "No videos selected.")
+    if not body.instruction.strip():
+        raise HTTPException(400, "剪辑指令为空 — 请先填写你想要的剪辑效果。")
     video_type = "film" if body.has_dialogue else "vlog"
     min_d = max(5.0, body.target_length - 5.0)
     max_d = body.target_length + 5.0
@@ -519,9 +864,25 @@ def pipeline_start(body: PipelineRequest):
         "stages": {s: "pending" for s in _STAGE_NAMES},
         "stage_times": {}, "start_time": time.time(),
         "shot_point": shot_point, "effective_video": effective,
+        "project_id": body.project_id,
     })
+    # snapshot settings + result location into the project record
+    if body.project_id:
+        try:
+            p = _load_project(body.project_id)
+            p.update(
+                videos=videos, audio=body.audio_path, instruction=body.instruction,
+                has_dialogue=body.has_dialogue, main_character=body.main_character,
+                srt=body.srt_path, target_length=body.target_length,
+                shot_length=body.shot_length, shot_point=shot_point,
+                effective_video=effective,
+                last_run_at=time.time(), last_run_status="running",
+            )
+            _save_project(p)
+        except HTTPException:
+            pass
     try:
-        _spawn(job, cmd, on_line=_parse_stage)
+        _spawn(job, cmd, on_line=_on_pipeline_line)
     except Exception as e:
         raise HTTPException(500, str(e))
     PIPELINE_JOB_ID = job.id

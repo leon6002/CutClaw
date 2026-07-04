@@ -9,7 +9,19 @@ import {
 } from "@ant-design/icons";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
+import AgentFlow from "../components/AgentFlow";
+import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
+import TaskGrids from "../components/TaskGrids";
 import type { ProjectState } from "../App";
+
+const SELECT_STEPS = [
+  { key: "load_index", label: "读取素材索引", icon: "📚" },
+  { key: "build_prompt", label: "构建选材任务", icon: "📋" },
+  { key: "llm_select", label: "Agent 决策", icon: "🧠" },
+  { key: "parse", label: "解析选择", icon: "🔍" },
+  { key: "slideshow", label: "图片幻灯片", icon: "🖼️" },
+  { key: "apply", label: "应用到项目", icon: "📌" },
+];
 
 const { Text, Paragraph } = Typography;
 
@@ -212,7 +224,7 @@ function DetailDrawer({
       <div className="drawer-player">
         {asset.asset_type === "video" && <video ref={videoRef} src={src} controls style={{ width: "100%", maxHeight: 340, background: "#000", borderRadius: 8 }} />}
         {asset.asset_type === "image" && <img src={src} style={{ width: "100%", maxHeight: 340, objectFit: "contain", background: "#000", borderRadius: 8 }} />}
-        {asset.asset_type === "audio" && <audio src={src} controls style={{ width: "100%" }} />}
+        {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls style={{ width: "100%" }} />}
         <Text type="secondary" style={{ fontSize: 12 }}>
           {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
           {asset.width ? `${asset.width}×${asset.height} · ` : ""}
@@ -233,7 +245,7 @@ function DetailDrawer({
               key: "clips", label: `🎬 片段分析 (${clips.length})`,
               children: loading ? <Text type="secondary">加载中…</Text> :
                 clips.length === 0 ? <Empty description="没有检测到片段 — VLM 可能超时，试试重新标注" /> :
-                <Collapse
+                <><QualityCurve clips={clips} onSeek={seek} /><Collapse
                   defaultActiveKey={clips.map((_, i) => String(i))}
                   items={clips.map((clip, i) => {
                     const d = clip.duration ?? {};
@@ -243,7 +255,7 @@ function DetailDrawer({
                       children: <ClipPanel clip={clip} idx={i} onSeek={seek} />,
                     };
                   })}
-                />,
+                /></>,
             },
             {
               key: "scenes", label: `🎞️ 场景 (${scenes.length})`,
@@ -271,6 +283,17 @@ function DetailDrawer({
                     );
                   })}
                 </div>,
+            },
+          ] : []),
+          ...(asset.asset_type === "audio" ? [
+            {
+              key: "beats", label: "🎵 节奏关键点",
+              children: (
+                <AudioKeypointsChart
+                  path={asset.absolute_path || asset.file_path}
+                  duration={asset.duration_sec} onSeek={seek}
+                />
+              ),
             },
           ] : []),
           {
@@ -348,11 +371,12 @@ export default function AssetsView({
   const [assets, setAssets] = useState<Asset[]>([]);
   const [scanned, setScanned] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [selecting, setSelecting] = useState(false);
   const [error, setError] = useState("");
-  const [selection, setSelection] = useState<any>(null);
   const [annJobId, setAnnJobId] = useState<string | null>(null);
   const annJob = useJob(annJobId);
+  const [selJobId, setSelJobId] = useState<string | null>(null);
+  const selJob = useJob(selJobId);
+  const selecting = selJob.status === "running";
   const [typeTab, setTypeTab] = useState<string>("video");
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
@@ -385,16 +409,32 @@ export default function AssetsView({
   };
 
   const autoSelect = async () => {
-    setError(""); setSelecting(true);
+    setError("");
     try {
-      const r = await api<any>("/api/assets/auto-select", {
-        method: "POST", body: JSON.stringify({ instruction: project.instruction }),
+      const r = await api<{ job_id: string }>("/api/assets/auto-select", {
+        method: "POST",
+        body: JSON.stringify({
+          instruction: project.instruction,
+          project_id: project.id,
+          target_length: project.targetLength,
+        }),
       });
-      setSelection(r.selection);
-      setProject((p) => ({ ...p, videos: r.videos, audio: r.audio || p.audio }));
+      setSelJobId(r.job_id);
     } catch (e: any) { setError(e.message); }
-    setSelecting(false);
   };
+
+  // apply selection into the active project when the agent finishes
+  useEffect(() => {
+    if (selJob.status === "done" && selJobId) {
+      const m = selJob.meta;
+      setProject((p) => ({
+        ...p,
+        videos: (m.videos as string[])?.length ? m.videos : p.videos,
+        audio: (m.audio as string) || p.audio,
+        selectionRationale: m.selection?.rationale ?? p.selectionRationale,
+      }));
+    }
+  }, [selJob.status]);
 
   useEffect(() => {
     if (annJob.status === "done" && annJobId) {
@@ -440,6 +480,7 @@ export default function AssetsView({
               format={() => `${annJob.meta.current ?? 0}/${annJob.meta.total ?? "?"}`}
             />
             <Text type="secondary" style={{ fontSize: 12 }}>📹 {annJob.meta.filename || "…"}</Text>
+            <TaskGrids tasks={annJob.meta.tasks ?? {}} />
             <JobLog lines={annJob.lines.slice(-80)} height={180} />
           </div>
         )}
@@ -450,23 +491,44 @@ export default function AssetsView({
           </div>
         )}
 
-        {selection && (
+        {/* Agent selection flow — live animated stages */}
+        {selJobId && (
+          <div style={{ marginTop: 6 }}>
+            <AgentFlow steps={SELECT_STEPS} stages={selJob.meta.stages ?? {}} />
+            {selJob.status === "error" && (
+              <>
+                <Alert type="error" showIcon message="选材失败 — 查看日志" />
+                <JobLog lines={selJob.lines.slice(-30)} height={140} />
+              </>
+            )}
+          </div>
+        )}
+        {selJob.status === "done" && selJob.meta.selection && (
           <Alert
-            type="success" showIcon style={{ marginTop: 10 }}
+            type="success" showIcon style={{ marginTop: 4 }}
             message={
               <>
                 <b>已选素材：</b>{" "}
-                {(selection.selected_videos ?? []).map((v: string) => `📹${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
-                {(selection.selected_images ?? []).map((v: string) => `🖼️${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
-                {(selection.selected_audio ?? []).slice(0, 1).map((v: string) => `🎵${v.split(/[\\/]/).pop()}`).join("")}
+                {(selJob.meta.selection.selected_videos ?? []).map((v: string) => `📹${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
+                {(selJob.meta.selection.selected_images ?? []).map((v: string) => `🖼️${v.split(/[\\/]/).pop()}`).join("  ")}{" "}
+                {(selJob.meta.selection.selected_audio ?? []).slice(0, 1).map((v: string) => `🎵${v.split(/[\\/]/).pop()}`).join("")}
               </>
             }
             description={
               <>
-                {selection.rationale && <div>💡 {selection.rationale}</div>}
+                {selJob.meta.selection.rationale && <div>💡 {selJob.meta.selection.rationale}</div>}
+                {selJob.meta.selection.narrative_idea && <div>📖 {selJob.meta.selection.narrative_idea}</div>}
                 <Text type="secondary">已写入项目 — 切换到「✂️ 项目编辑」运行流水线。</Text>
               </>
             }
+          />
+        )}
+        {/* persisted selection summary from a previous session */}
+        {!selJobId && project.selectionRationale && (
+          <Alert
+            type="info" showIcon style={{ marginTop: 10 }}
+            message={<><b>本项目已有选材</b>（{project.videos.length} 视频{project.audio ? " · 1 音乐" : ""}）</>}
+            description={<Text type="secondary">💡 {project.selectionRationale}</Text>}
           />
         )}
       </Card>

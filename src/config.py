@@ -17,9 +17,9 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "E:\\apps\\CutClaw\\resource/imports/DJI_20260619162056_0786_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615120557_0642_D.MP4"
+VIDEO_PATH = "E:\\apps\\CutClaw\\resource/imports/DJI_20260615120557_0642_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource/imports/DJI_20260619162056_0786_D.MP4"
 AUDIO_PATH = "E:\\apps\\CutClaw\\resource/imports/JINBAO - Long Journey.mp3"
-INSTRUCTION = ""
+INSTRUCTION = "遵循长途旅行视角，从宏大航拍切换到女孩嬉戏的纪实瞬间，记录一场逃离城市的山海之旅。"
 SRT_PATH = ""
 
 
@@ -276,10 +276,10 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Segments below this level are treated as too quiet and filtered.
 
 # ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 1.0
+AUDIO_MIN_SEGMENT_DURATION = 3.0
 # Minimum segment duration (seconds). Smaller values create faster cuts.
 
-AUDIO_MAX_SEGMENT_DURATION = 3.0
+AUDIO_MAX_SEGMENT_DURATION = 5.0
 # Maximum segment duration (seconds). Larger values create slower pacing.
 
 # ----- Music structure analysis (Level-1) -----

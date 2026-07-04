@@ -162,9 +162,16 @@ def call_audio_api_batch(
     count_lock = threading.Lock()
     t0 = time.time()
 
+    try:
+        from src.utils.progress import emit_progress
+    except Exception:
+        def emit_progress(*a, **k):  # type: ignore
+            pass
+
     def _worker(idx: int, path: str):
         nonlocal done_count
         ts = time.time()
+        emit_progress("audio_segments", total, idx, "start")
         try:
             text = _call_audio_api_sync(path, prompt, temperature, top_p, max_tokens)
             ok = True
@@ -178,6 +185,8 @@ def call_audio_api_batch(
         elapsed = time.time() - t0
         avg = elapsed / n
         eta = avg * (total - n) / max(max_workers, 1)
+        emit_progress("audio_segments", total, idx, "done" if ok else "fail",
+                      elapsed=round(time.time() - ts, 1), avg=round(avg, 1), eta=round(eta, 1))
         mark = "✓" if ok else "✗"
         print(
             f"  [{n}/{total}] {mark} segment {idx + 1} in {time.time() - ts:.1f}s"

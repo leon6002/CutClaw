@@ -684,49 +684,80 @@ def caption_audio_with_madmom_segments(
     # Import madmom_api to ensure 100% alignment with interactive version
     from src.audio.madmom_api import detect_keypoints_madmom
 
+    # Detection kwargs — identical for the annotation path and the pipeline
+    # path (segmentation params are NOT part of detection).
+    _det_kwargs = dict(
+        # Downbeat parameters (used only if method="downbeat")
+        beats_per_bar=beats_per_bar[0] if beats_per_bar else 4,  # Convert list to int
+        min_bpm=min_bpm,
+        max_bpm=max_bpm,
+        num_tempi=60,
+        transition_lambda=100,
+        observation_lambda=16,
+        dbn_threshold=0.05,
+        correct_beats=True,
+        fps=100,
+        # Pitch parameters (used only if method="pitch")
+        pitch_tolerance=pitch_tolerance,
+        pitch_threshold=pitch_threshold,
+        pitch_min_distance=pitch_min_distance,
+        pitch_nms_method=pitch_nms_method,
+        pitch_max_points=pitch_max_points,
+        # Mel energy parameters (used only if method="mel_energy")
+        mel_win_s=mel_win_s,
+        mel_n_filters=mel_n_filters,
+        mel_threshold_ratio=mel_threshold_ratio,
+        mel_min_distance=mel_min_distance,
+        mel_nms_method=mel_nms_method,
+        mel_max_points=mel_max_points,
+        # Silence filtering (from config)
+        silence_filter=True,
+        silence_threshold_db=getattr(config, 'AUDIO_SILENCE_THRESHOLD_DB', -45.0),
+        # Disable post-filtering here (will apply later in unified manner)
+        min_interval=0.0,
+        top_k=0,
+        energy_percentile=0.0,
+        return_python_types=True,
+    )
+
+    def _cached_detect(method: str) -> list:
+        """Raw madmom keypoints, disk-cached by (content hash, method, params).
+
+        Shared by asset annotation AND the project pipeline, so the expensive
+        RNN detection only ever runs once per audio file per method.
+        Cache: Output/analyzed/keypoints/{hash}_{method}_{params}.json
+        """
+        cache_fp = None
+        try:
+            import hashlib as _hl
+            from src.asset_manager.scanner import compute_content_hash
+            ch = compute_content_hash(audio_path)
+            sig = _hl.md5(json.dumps(_det_kwargs, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:10]
+            kp_dir = os.path.join(getattr(config, "VIDEO_DATABASE_FOLDER", "./Output/"), "analyzed", "keypoints")
+            os.makedirs(kp_dir, exist_ok=True)
+            cache_fp = os.path.join(kp_dir, f"{ch[:16]}_{method}_{sig}.json")
+            if os.path.exists(cache_fp):
+                with open(cache_fp, "r", encoding="utf-8") as f:
+                    kps = json.load(f)
+                print(f"    ♻ Loaded {len(kps)} {method} keypoints from cache")
+                return kps
+        except Exception:
+            cache_fp = None
+        result = detect_keypoints_madmom(audio_path=audio_path, detection_method=method, **_det_kwargs)
+        kps = result.get('keypoints', [])
+        if cache_fp:
+            try:
+                with open(cache_fp, "w", encoding="utf-8") as f:
+                    json.dump(kps, f, ensure_ascii=False)
+            except Exception:
+                pass
+        return kps
+
     # Run selected methods and merge keypoints (using madmom_api for consistency)
     merged_keypoints = []
     for method in detection_methods:
         print(f"\n  → Running {method} detection...")
-
-        # Use madmom_api (same as interactive interface)
-        result = detect_keypoints_madmom(
-            audio_path=audio_path,
-            detection_method=method,
-            # Downbeat parameters (used only if method="downbeat")
-            beats_per_bar=beats_per_bar[0] if beats_per_bar else 4,  # Convert list to int
-            min_bpm=min_bpm,
-            max_bpm=max_bpm,
-            num_tempi=60,
-            transition_lambda=100,
-            observation_lambda=16,
-            dbn_threshold=0.05,
-            correct_beats=True,
-            fps=100,
-            # Pitch parameters (used only if method="pitch")
-            pitch_tolerance=pitch_tolerance,
-            pitch_threshold=pitch_threshold,
-            pitch_min_distance=pitch_min_distance,
-            pitch_nms_method=pitch_nms_method,
-            pitch_max_points=pitch_max_points,
-            # Mel energy parameters (used only if method="mel_energy")
-            mel_win_s=mel_win_s,
-            mel_n_filters=mel_n_filters,
-            mel_threshold_ratio=mel_threshold_ratio,
-            mel_min_distance=mel_min_distance,
-            mel_nms_method=mel_nms_method,
-            mel_max_points=mel_max_points,
-            # Silence filtering (from config)
-            silence_filter=True,
-            silence_threshold_db=getattr(config, 'AUDIO_SILENCE_THRESHOLD_DB', -45.0),
-            # Disable post-filtering here (will apply later in unified manner)
-            min_interval=0.0,
-            top_k=0,
-            energy_percentile=0.0,
-            return_python_types=True,
-        )
-
-        method_keypoints = result.get('keypoints', [])
+        method_keypoints = _cached_detect(method)
         merged_keypoints.extend(method_keypoints)
         print(f"    ✓ Detected {len(method_keypoints)} {method} keypoints")
 

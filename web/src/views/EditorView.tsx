@@ -2,32 +2,46 @@ import { useEffect, useState } from "react";
 import {
   Alert, Button, Card, Checkbox, Input, InputNumber, Select, Space, Typography,
 } from "antd";
-import { CaretRightOutlined, StopOutlined } from "@ant-design/icons";
-import { api, useJob } from "../api";
+import { BulbOutlined, CaretRightOutlined, StopOutlined } from "@ant-design/icons";
+import { api, fmtDuration, type JobState } from "../api";
 import JobLog from "../components/JobLog";
-import StagePipeline from "../components/StagePipeline";
+import AgentFlow from "../components/AgentFlow";
+import TaskGrids from "../components/TaskGrids";
 import type { PipelineStatus, ProjectState } from "../App";
 
 const { Text } = Typography;
 
 const basename = (p: string) => p.split(/[\\/]/).pop() || p;
 
+const PIPELINE_STEPS = [
+  { key: "shot_detection", label: "镜头检测", icon: "🎞️" },
+  { key: "asr", label: "语音识别", icon: "🎙️" },
+  { key: "video_captioning", label: "视频理解", icon: "🎬" },
+  { key: "audio_analysis", label: "音频分析", icon: "🎵" },
+  { key: "screenwriter", label: "AI 编剧", icon: "✍️" },
+  { key: "editor", label: "AI 剪辑", icon: "✂️" },
+];
+
 export default function EditorView({
-  project, setProject, pipelineStatus, setPipelineStatus,
+  project, setProject, pipelineStatus, pipelineJobId, setPipelineJobId, pipelineJob,
 }: {
   project: ProjectState;
   setProject: (fn: (p: ProjectState) => ProjectState) => void;
   pipelineStatus: PipelineStatus;
-  setPipelineStatus: (s: PipelineStatus) => void;
+  pipelineJobId: string | null;
+  setPipelineJobId: (id: string | null) => void;
+  pipelineJob: JobState;
 }) {
   const [videoFiles, setVideoFiles] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<string[]>([]);
   const [srtFiles, setSrtFiles] = useState<string[]>([]);
   const [error, setError] = useState("");
-  const [jobId, setJobId] = useState<string | null>(null);
-  const job = useJob(jobId);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [suggesting, setSuggesting] = useState(false);
+  const [sugError, setSugError] = useState("");
 
   const p = project;
+  const job = pipelineJob;
   const set = (patch: Partial<ProjectState>) => setProject((old) => ({ ...old, ...patch }));
 
   useEffect(() => {
@@ -37,7 +51,7 @@ export default function EditorView({
     // reattach to a pipeline that is already running (e.g. page refresh)
     api<any>("/api/pipeline/current").then((r) => {
       if (r.job && r.job.status === "running") {
-        setJobId(r.job.id);
+        setPipelineJobId(r.job.id);
         setProject((old) => ({
           ...old,
           shotPoint: r.job.meta.shot_point || old.shotPoint,
@@ -47,12 +61,7 @@ export default function EditorView({
     }).catch(() => {});
   }, []);
 
-  useEffect(() => {
-    if (!jobId) return;
-    setPipelineStatus(job.status === "idle" ? "running" : job.status);
-  }, [job.status, jobId]);
-
-  const running = job.status === "running";
+  const running = pipelineStatus === "running";
   const videoOptions = Array.from(new Set([...p.videos, ...videoFiles]))
     .map((v) => ({ value: v, label: basename(v) }));
   const audioOptions = Array.from(new Set([p.audio, ...audioFiles].filter(Boolean)))
@@ -67,17 +76,36 @@ export default function EditorView({
           video_paths: p.videos, audio_path: p.audio, instruction: p.instruction,
           has_dialogue: p.hasDialogue, main_character: p.mainCharacter, srt_path: p.srt,
           target_length: p.targetLength, shot_length: p.shotLength,
+          project_id: p.id,
         }),
       });
       set({ shotPoint: r.shot_point, effectiveVideo: r.effective_video });
-      setJobId(r.job_id);
-      setPipelineStatus("running");
+      setPipelineJobId(r.job_id);
     } catch (e: any) { setError(e.message); }
   };
 
   const stop = async () => {
     try { await api("/api/pipeline/stop", { method: "POST" }); } catch { /* ignore */ }
   };
+
+  const fetchSuggestions = async () => {
+    setSugError(""); setSuggesting(true);
+    try {
+      const r = await api<{ suggestions: string[] }>("/api/instruction/suggestions", {
+        method: "POST", body: JSON.stringify({ project_id: p.id }),
+      });
+      setSuggestions(r.suggestions);
+    } catch (e: any) { setSugError(e.message); }
+    setSuggesting(false);
+  };
+
+  // merge stage status + timing into AgentFlow's {status, detail} shape
+  const stageTimes: Record<string, number> = job.meta.stage_times ?? {};
+  const stagesView: Record<string, any> = {};
+  for (const s of PIPELINE_STEPS) {
+    const status = (job.meta.stages ?? {})[s.key] ?? "pending";
+    stagesView[s.key] = { status, detail: stageTimes[s.key] ? fmtDuration(stageTimes[s.key]) : "" };
+  }
 
   return (
     <div>
@@ -109,6 +137,23 @@ export default function EditorView({
               placeholder="描述你想要的剪辑效果…"
               onChange={(e) => set({ instruction: e.target.value })}
             />
+            <div className="mt-2">
+              <Button size="small" icon={<BulbOutlined />} loading={suggesting}
+                disabled={running} onClick={fetchSuggestions}>
+                AI 生成指令建议
+              </Button>
+              {sugError && <Text type="danger" className="ml-2 text-xs">{sugError}</Text>}
+              {suggestions.map((s, i) => (
+                <div
+                  key={i}
+                  className={`suggestion-chip${p.instruction === s ? " picked" : ""}`}
+                  onClick={() => !running && set({ instruction: s })}
+                  title="点击填充为剪辑指令"
+                >
+                  💡 {s}
+                </div>
+              ))}
+            </div>
           </div>
         </Card>
 
@@ -153,14 +198,17 @@ export default function EditorView({
 
           <Space.Compact block>
             <Button type="primary" block icon={<CaretRightOutlined />} onClick={start}
-              disabled={running || p.videos.length === 0 || !p.audio} loading={running}>
+              disabled={running || p.videos.length === 0 || !p.audio || !p.instruction.trim()}
+              loading={running}>
               {running ? "运行中…" : "运行流水线"}
             </Button>
             <Button danger icon={<StopOutlined />} onClick={stop} disabled={!running}>停止</Button>
           </Space.Compact>
-          {p.videos.length === 0 && (
+          {(p.videos.length === 0 || !p.audio || !p.instruction.trim()) && (
             <Text type="secondary" className="mt-2 block text-xs">
-              请先选择视频素材（或在素材库中「智能选材」）。
+              {p.videos.length === 0 ? "请先选择视频素材（或在素材库中「智能选材」）。"
+                : !p.audio ? "请选择一首音乐。"
+                : "请填写剪辑指令。"}
             </Text>
           )}
         </Card>
@@ -168,9 +216,10 @@ export default function EditorView({
 
       {error && <Alert type="error" showIcon message={error} className="mt-4" />}
 
-      {(jobId || job.lines.length > 0) && (
+      {(pipelineJobId || job.lines.length > 0) && (
         <Card size="small" title="🖥️ 流水线状态" className="mt-4">
-          <StagePipeline stages={job.meta.stages ?? {}} times={job.meta.stage_times ?? {}} />
+          <AgentFlow steps={PIPELINE_STEPS} stages={stagesView} />
+          <TaskGrids tasks={job.meta.tasks ?? {}} />
           {job.status === "done" && (
             <Alert type="success" showIcon className="mb-2"
               message="✅ 流水线完成！切换到「🎬 渲染导出」生成视频。" />

@@ -1737,6 +1737,23 @@ class ParallelShotOrchestrator:
         with open(shot_plan_path, 'r', encoding='utf-8') as f:
             structure_proposal = json.load(f)
 
+        # Flat index for every (section, shot) pair → fine-grained UI progress
+        _flat_idx: dict = {}
+        _n_total = 0
+        for _si, _sec in enumerate(structure_proposal.get('video_structure', [])):
+            _sp = _sec.get('shot_plan') or {}
+            for _hi in range(len(_sp.get('shots', []))):
+                _flat_idx[(_si, _hi)] = _n_total
+                _n_total += 1
+
+        def _emit(key, event):
+            try:
+                from src.utils.progress import emit_progress
+                if key in _flat_idx:
+                    emit_progress("editor_shots", _n_total, _flat_idx[key], event)
+            except Exception:
+                pass
+
         global_keep_ranges = []
         final_results = {}
         existing = []
@@ -1763,6 +1780,8 @@ class ParallelShotOrchestrator:
         if completed_shots:
             print(f"📋 [Parallel] Found {len(completed_shots)} completed shots in existing output file")
             print(f"   Completed: {sorted(completed_shots)}")
+            for _key in completed_shots:
+                _emit(_key, "done")
 
         for sec_idx, sec_cur in enumerate(structure_proposal['video_structure']):
             shot_plan = sec_cur.get('shot_plan')
@@ -1814,6 +1833,7 @@ class ParallelShotOrchestrator:
                     futures = {}
                     for (s_idx, shot_idx), shot in pending.items():
                         key = (s_idx, shot_idx)
+                        _emit(key, "start")
                         futures[executor.submit(
                             self._run_worker,
                             shot,
@@ -1827,9 +1847,11 @@ class ParallelShotOrchestrator:
                         key = futures[future]
                         try:
                             results[key] = future.result()
+                            _emit(key, "done" if results[key] else "fail")
                         except Exception as e:
                             print(f"Worker failed for shot {key}: {e}")
                             results[key] = None
+                            _emit(key, "fail")
 
                 losers = self._detect_conflicts(results, combined_keep_ranges)
                 print(
@@ -1869,8 +1891,12 @@ class ParallelShotOrchestrator:
                         f"[Parallel][Section {sec_idx + 1}] reached max reruns "
                         f"({self.max_reruns}), stop rerunning unresolved shots"
                     )
+                    for _key in losers:
+                        _emit(_key, "fail")
                     break
 
+                for _key in losers:
+                    _emit(_key, "retry")
                 pending = {key: shots[key[1]] for key in losers}
                 pending_guidance = losers
                 rerun_count += 1

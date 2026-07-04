@@ -479,13 +479,30 @@ def analyze_audio(
     cache_dir = get_analysis_path(content_hash)
     caption_path = os.path.join(cache_dir, "captions.json")
 
+    from src import config
+
+    # Cache is param-aware: fine-grained captions depend on segment bounds
+    # (derived from the project's shot length). Same file + different params
+    # → re-analyze instead of silently reusing the old granularity.
+    seg_min = float(getattr(config, "AUDIO_MIN_SEGMENT_DURATION", 3.0))
+    seg_max = float(getattr(config, "AUDIO_MAX_SEGMENT_DURATION", 30.0))
+    params_sig = f"seg{seg_min:g}-{seg_max:g}"
+
     if os.path.exists(caption_path) and not force:
-        print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
-        return content_hash
+        old_sig = None
+        try:
+            with open(os.path.join(cache_dir, "metadata.json"), "r", encoding="utf-8") as f:
+                old_sig = json.load(f).get("caption_params")
+        except Exception:
+            pass
+        # old_sig is None for legacy caches (params unknown) — grandfather them
+        if old_sig is None or old_sig == params_sig:
+            print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
+            return content_hash
+        print(f"🔁 [Analyze] Segment params changed ({old_sig} → {params_sig}), re-analyzing audio captions...")
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    from src import config
     from src.asset_manager.scanner import probe_audio_metadata
 
     file_size = os.path.getsize(abs_path)
@@ -501,6 +518,7 @@ def analyze_audio(
         "duration_sec": meta.duration_sec,
         "sample_rate": meta.sample_rate,
         "channels": meta.channels,
+        "caption_params": params_sig,
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     _save_metadata(cache_dir, metadata)

@@ -139,6 +139,10 @@ def main():
     Instruction = args.Instruction
     instruction_type = args.instruction_type
 
+    if not (Instruction or "").strip():
+        print("❌ Instruction is empty — please provide an editing instruction (剪辑指令为空).")
+        sys.exit(1)
+
     # Per-file analysis: each source video is analyzed independently and cached
     # by content hash. Merging is deferred to render time.
     from src.analyzer import analyze_video, analyze_audio, merge_scene_summaries, get_scene_summaries_dir, get_analysis_path
@@ -180,6 +184,19 @@ def main():
     # Audio paths (audio analysis is cached per-file by analyze_audio)
     audio_captions_dir = os.path.join(config.VIDEO_DATABASE_FOLDER, 'Audio', audio_id, "captions")
     audio_caption_file = os.path.join(audio_captions_dir, "captions.json")
+
+    # Bridge: per-file cache (Output/analyzed/{hash}/captions.json) → legacy
+    # project path expected by Screenwriter/Editor. Without this, cached audio
+    # analysis silently never reaches the agents. Refresh when cache is newer.
+    if Audio_Path and audio_hash:
+        _src_caption = os.path.join(get_analysis_path(audio_hash), "captions.json")
+        if os.path.exists(_src_caption):
+            os.makedirs(audio_captions_dir, exist_ok=True)
+            if (not os.path.exists(audio_caption_file)
+                    or os.path.getmtime(_src_caption) > os.path.getmtime(audio_caption_file)):
+                import shutil as _sh
+                _sh.copy(_src_caption, audio_caption_file)
+                print(f"🔗 [Audio] Synced captions cache → {audio_caption_file}")
 
     # Build merged scene summaries dir for Screenwriter + Editor
     merged_scenes_dir = os.path.join(
@@ -405,13 +422,17 @@ def main():
         if config.VIDEO_TYPE == "film":
             from src.core import EditorCoreAgent, ParallelShotOrchestrator
         elif config.VIDEO_TYPE == "vlog":
-            from src.core_vlog import EditorCoreAgent
+            try:
+                from src.core_vlog import EditorCoreAgent  # optional specialization
+                from src.core import ParallelShotOrchestrator
+            except ImportError:
+                print("ℹ️  src.core_vlog not found — using the standard editor core for vlog mode.")
+                from src.core import EditorCoreAgent, ParallelShotOrchestrator
 
         os.makedirs(os.path.dirname(shot_point_output_path), exist_ok=True)
 
         max_iterations = config.AGENT_MAX_ITERATIONS if hasattr(config, 'AGENT_MAX_ITERATIONS') else 20
         use_parallel_shot = (
-            config.VIDEO_TYPE == "film" and
             getattr(config, "PARALLEL_SHOT_ENABLED", True)
         )
 

@@ -49,7 +49,15 @@ def _parse_json_strict(content: str | None) -> dict | None:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return None
+        pass
+    # Fallback: extract the outermost {...} block (models often wrap JSON in prose)
+    s, e = text.find("{"), text.rfind("}")
+    if s >= 0 and e > s:
+        try:
+            return json.loads(text[s:e + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def select_assets(
@@ -59,6 +67,7 @@ def select_assets(
     model: str | None = None,
     endpoint: str | None = None,
     api_key: str | None = None,
+    stage_callback=None,
 ) -> AssetSelection:
     """Select the best asset combination for the given instruction.
 
@@ -73,29 +82,53 @@ def select_assets(
     Returns:
         AssetSelection with the chosen files and rationale.
     """
+    import time as _time
+
     import litellm
+
+    def _st(stage: str, status: str, detail: str = ""):
+        if stage_callback:
+            try:
+                stage_callback(stage, status, detail)
+            except Exception:
+                pass
 
     model = model or _default_agent_model()
     endpoint = endpoint or _default_agent_endpoint()
     api_key = api_key or _default_agent_api_key()
 
+    _st("load_index", "running")
     summaries = get_all_summaries(index_dir)
 
     if summaries.startswith("(No annotated"):
+        _st("load_index", "error", "没有已标注的素材")
         return AssetSelection(
             instruction=instruction,
             rationale="No annotated assets available. Please scan and annotate assets first.",
             target_duration_sec=target_duration_sec,
         )
 
+    try:
+        from .index_store import count_by_type
+        counts = count_by_type(index_dir)
+        counts_str = f"{counts.get('video', 0)} 视频 · {counts.get('image', 0)} 图片 · {counts.get('audio', 0)} 音乐"
+    except Exception:
+        counts_str = ""
+    _st("load_index", "done", counts_str)
+
+    _st("build_prompt", "running")
     prompt = SELECTOR_PROMPT.format(
         instruction=instruction,
         asset_summaries=summaries,
         target_duration_sec=int(target_duration_sec),
     )
+    _st("build_prompt", "done", f"目标时长 {int(target_duration_sec)}s · 素材目录 {len(summaries)} 字符")
 
     for attempt in range(2):
         try:
+            _st("llm_select", "running",
+                f"{model}" + (f"（第 {attempt + 1} 次尝试）" if attempt > 0 else ""))
+            t0 = _time.time()
             kwargs: dict = dict(
                 model=model,
                 messages=[
@@ -103,17 +136,23 @@ def select_assets(
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
-                max_tokens=2048,
+                # reasoning models spend budget on thought tokens first —
+                # too small a max_tokens returns EMPTY content
+                max_tokens=8192,
             )
             if endpoint:
                 kwargs["api_base"] = endpoint
             if api_key:
                 kwargs["api_key"] = api_key
             raw = litellm.completion(**kwargs)
-            content = raw.choices[0].message.content
+            _msg = raw.choices[0].message
+            content = _msg.content or getattr(_msg, "reasoning_content", None) or ""
+            _st("llm_select", "done", f"{model} · {_time.time() - t0:.1f}s")
+
+            _st("parse", "running")
             parsed = _parse_json_strict(content)
             if parsed and isinstance(parsed, dict):
-                return AssetSelection(
+                sel = AssetSelection(
                     instruction=instruction,
                     selected_videos=parsed.get("selected_videos", []),
                     selected_images=parsed.get("selected_images", []),
@@ -124,9 +163,14 @@ def select_assets(
                     target_duration_sec=float(parsed.get("target_duration_sec", target_duration_sec)),
                     narrative_idea=parsed.get("narrative_idea", ""),
                 )
+                _st("parse", "done",
+                    f"{len(sel.selected_videos)} 视频 · {len(sel.selected_images)} 图片 · {len(sel.selected_audio)} 音乐")
+                return sel
+            _st("parse", "error", f"LLM 返回的不是有效 JSON：{(content or '')[:150]}")
+            print(f"[AssetSelector] Unparseable LLM response (attempt {attempt + 1}): {(content or '')[:500]}")
         except Exception as e:
-            if attempt == 1:
-                print(f"[AssetSelector] LLM call failed: {e}")
+            _st("llm_select", "error", f"第 {attempt + 1} 次调用失败：{str(e)[:150]}")
+            print(f"[AssetSelector] LLM call failed (attempt {attempt + 1}): {e}")
 
     # Fallback: empty selection
     return AssetSelection(
