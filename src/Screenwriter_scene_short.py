@@ -255,18 +255,37 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
             "Start_Time": sec.get('Start_Time', ''),
             "End_Time": sec.get('End_Time', ''),
             "duration_seconds": dur,
-            "duration_ok": "✓" if dur >= min_dur else "✗ too short",
+            # the chosen section anchors the START of the window; the window
+            # extends across following sections up to the target duration
+            "enough_music_after_start": "✓" if (
+                max((_to_audio_seconds(s.get('End_Time', 0)) for s in sections), default=0.0)
+                - _to_audio_seconds(sec.get('Start_Time', 0)) >= min_dur
+            ) else "✗ near track end",
         })
 
     def _apply_section(idx: int) -> tuple[str, str]:
+        """The chosen section is an ANCHOR, not a cage: music is continuous, so a
+        target longer than one section extends across the following sections.
+        (Previously the window was clamped to the section end — a 100s target on
+        a track segmented into ~30s sections silently produced a ~30s video.)"""
         sec = sections[idx]
         sec_start = _to_audio_seconds(sec.get('Start_Time', 0))
         sec_end = _to_audio_seconds(sec.get('End_Time', 0))
         sec_dur = max(0.0, sec_end - sec_start)
         if min_dur <= sec_dur <= max_dur:
             return str(sec.get('Start_Time', _seconds_to_mmss(sec_start))), str(sec.get('End_Time', _seconds_to_mmss(sec_end)))
-        # Trim from section start to target_dur, but never exceed section end
-        trim_end = min(sec_start + target_dur, sec_end)
+        track_end = max((_to_audio_seconds(s.get('End_Time', 0)) for s in sections), default=sec_end)
+        if sec_dur > max_dur:
+            # single long section: trim to target
+            return _seconds_to_mmss(sec_start), _seconds_to_mmss(sec_start + target_dur)
+        # section shorter than target: extend forward across following sections
+        trim_end = min(sec_start + target_dur, track_end)
+        if trim_end - sec_start < min_dur:
+            # not enough music left after this anchor — slide the window back
+            sec_start = max(0.0, track_end - target_dur)
+            trim_end = track_end
+            print(f"🎵 [Audio] anchor too late for {target_dur:.0f}s target — window slid back to "
+                  f"{sec_start:.1f}s–{trim_end:.1f}s")
         return _seconds_to_mmss(sec_start), _seconds_to_mmss(trim_end)
 
     feedback = None

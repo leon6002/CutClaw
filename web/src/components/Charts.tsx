@@ -1,5 +1,5 @@
 /** ECharts-based visualizations (canvas), themed for the dark neon UI. */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "@/api";
 
@@ -22,8 +22,25 @@ function Label({ children }: { children: React.ReactNode }) {
 export function Chart({ option, height = 220, onEvents }: {
   option: any; height?: number; onEvents?: Record<string, (p: any) => void>;
 }) {
+  const ref = useRef<ReactECharts>(null);
+
+  // echarts-for-react only listens to WINDOW resize. When the chart mounts
+  // before its flex container settles (e.g. while a sibling <video> is still
+  // loading), the canvas is initialized at the tiny provisional width and
+  // stays collapsed. Observe the actual container and resize the instance.
+  useEffect(() => {
+    const el = (ref.current as any)?.ele as HTMLElement | undefined;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      try { ref.current?.getEchartsInstance()?.resize(); } catch { /* disposed */ }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   return (
     <ReactECharts
+      ref={ref}
       option={{ backgroundColor: "transparent", color: PALETTE, ...option }}
       style={{ height, width: "100%" }}
       notMerge lazyUpdate
