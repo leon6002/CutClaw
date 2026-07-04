@@ -37,7 +37,7 @@ export default function RenderView({
   const [outputs, setOutputs] = useState<Output[]>([]);
   const [hasEnding, setHasEnding] = useState(false);
   const [addEnding, setAddEnding] = useState(false);
-  const [transition, setTransition] = useState(false);
+  const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("none");
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
@@ -111,7 +111,8 @@ export default function RenderView({
           video_path: project.effectiveVideo || project.videos[0] || "",
           audio_path: project.audio,
           ratio, add_ending: addEnding, has_dialogue: project.hasDialogue,
-          transition: transition ? 0.4 : 0,
+          transition: transitionMode === "uniform" ? 0.4 : 0,
+          transition_mode: transitionMode === "ai" ? "ai" : "",
         }),
       });
       setJobId(r.job_id);
@@ -173,11 +174,36 @@ export default function RenderView({
                   追加片尾视频
                 </label>
               )}
-              <label className="mb-4 flex cursor-pointer items-center gap-2.5 text-[13px] text-slate-300">
-                <Checkbox checked={transition} onCheckedChange={(v) => setTransition(v === true)} />
-                画面转场（交叉溶解 0.4s）
-                <span className="text-[11px] text-slate-500">快节奏卡点建议关闭（硬切更带感）</span>
-              </label>
+              <div className="mb-4 flex flex-wrap items-center gap-2.5 text-[13px] text-slate-300">
+                <span>画面转场</span>
+                <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                  {([
+                    ["none", "无（硬切）"],
+                    ["uniform", "统一叠化"],
+                    ["ai", "AI 智能转场"],
+                  ] as const).map(([v, label]) => (
+                    <button
+                      key={v}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 text-xs transition-colors",
+                        transitionMode === v
+                          ? "bg-cyan-500/15 font-semibold text-cyan-300"
+                          : "text-slate-400 hover:text-slate-200",
+                      )}
+                      onClick={() => setTransitionMode(v)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-[11px] text-slate-500">
+                  {transitionMode === "ai"
+                    ? "AI 按每个切点的画面内容，从 12 种转场里挑（快切为主，仅在情绪转折处加转场）"
+                    : transitionMode === "uniform"
+                      ? "所有切点统一 0.4s 交叉溶解"
+                      : "快节奏卡点推荐（硬切更带感）"}
+                </span>
+              </div>
 
               <div className="flex flex-wrap gap-2">
                 {RATIOS.map((r) => (

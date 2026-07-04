@@ -500,7 +500,108 @@ def extract_all_clips(
     return all_clips
 
 
-def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, transition_duration):
+def _ai_pick_transitions(clips, shot_plan) -> list:
+    """Ask the agent LLM to choose a transition per cut, based on the outgoing/
+    incoming shot descriptions from the shot_plan. Returns a list of
+    "name:duration" strings (len = n-1) or None on any failure (→ hard cuts)."""
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        import src.config as config
+        import litellm
+
+        # per-shot descriptions keyed by (section_idx, shot_idx)
+        plan_shots = {}
+        for si, sec in enumerate((shot_plan or {}).get("video_structure", []) or []):
+            for hi, sh in enumerate((sec.get("shot_plan") or {}).get("shots", []) or []):
+                plan_shots[(si, hi)] = sh
+        theme = ((shot_plan or {}).get("video_structure") or [{}])[0].get("overall_theme", "")
+
+        main_clips = [c for c in clips if not c.get("is_ending") and not c.get("is_intro")]
+        if len(main_clips) < 2:
+            return None
+        boundaries = []
+        for k in range(1, len(main_clips)):
+            a = plan_shots.get((main_clips[k - 1].get("section_idx", 0), main_clips[k - 1].get("shot_idx", 0)), {})
+            b = plan_shots.get((main_clips[k].get("section_idx", 0), main_clips[k].get("shot_idx", 0)), {})
+            boundaries.append({
+                "cut_index": k,
+                "outgoing": {"content": a.get("content", ""), "emotion": a.get("emotion", ""),
+                             "visual_beat": a.get("visual_beat", "")},
+                "incoming": {"content": b.get("content", ""), "emotion": b.get("emotion", ""),
+                             "visual_beat": b.get("visual_beat", "")},
+            })
+
+        palette_desc = "\n".join(f"- {k}: {v}" for k, v in TRANSITION_PALETTE.items())
+        prompt = (
+            "You are a professional video editor choosing the transition for EACH cut of a music-driven "
+            "short montage.\n\n"
+            f"Overall theme: {theme}\n\n"
+            "Available transitions (name: when to use):\n"
+            f"- cut: instant hard cut — the DEFAULT for beat-synced, high-energy edits\n{palette_desc}\n\n"
+            "Rules:\n"
+            "- Hard cuts should DOMINATE a fast, beat-driven edit; use visible transitions only as accents "
+            "(emotion shifts, location changes, the finale).\n"
+            "- Never use the same non-cut transition twice in a row.\n"
+            "- duration: 0.3-0.6 seconds.\n\n"
+            f"Cuts to decide (between consecutive shots):\n{json.dumps(boundaries, ensure_ascii=False, indent=1)}\n\n"
+            'Reply with ONLY a JSON array, one entry per cut, e.g.: '
+            '["cut", "fadeblack:0.4", "cut", "zoomin:0.35"]'
+        )
+        kwargs = dict(model=config.AGENT_LITELLM_MODEL,
+                      messages=[{"role": "user", "content": prompt}],
+                      # reasoning models spend tokens thinking BEFORE the reply;
+                      # a small cap truncates the actual answer to empty
+                      temperature=0.4, max_tokens=4000, timeout=90)
+        if getattr(config, "AGENT_LITELLM_URL", ""):
+            kwargs["api_base"] = config.AGENT_LITELLM_URL
+        if getattr(config, "AGENT_LITELLM_API_KEY", ""):
+            kwargs["api_key"] = config.AGENT_LITELLM_API_KEY
+        resp = litellm.completion(**kwargs)
+        msg = resp.choices[0].message
+        content = (msg.content or "").strip()
+        if not content:  # some reasoning models leave the array in the thinking text
+            content = str(getattr(msg, "reasoning_content", "") or "").strip()
+        m = re.search(r"\[[^\[\]]*\]", content, re.DOTALL)
+        arr = json.loads(m.group(0) if m else content)
+        if not isinstance(arr, list):
+            return None
+        out = []
+        for item in arr[: len(main_clips) - 1]:
+            s = str(item).strip().lower()
+            name = s.split(":")[0]
+            out.append(s if (name == "cut" or name in TRANSITION_PALETTE) else "cut")
+        while len(out) < len(main_clips) - 1:
+            out.append("cut")
+        print(f"🎞️  [AI transitions] {out}")
+        return out
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ AI transition selection failed ({e}) — falling back to hard cuts")
+        return None
+
+
+# Curated xfade transitions with editorial intent — the AI picker (and any
+# manual caller) may only choose from these. All are built into ffmpeg's xfade
+# filter, no custom build needed.
+TRANSITION_PALETTE = {
+    "fade":       "classic crossfade — gentle, safe default for lyrical moments",
+    "fadeblack":  "dip to black — chapter break, dramatic reset, big scene change",
+    "fadewhite":  "dip to white — dreamy, bright, euphoric peak",
+    "dissolve":   "grainy organic dissolve — nostalgic, textured",
+    "zoomin":     "punch zoom-in — energy spike, beat accent",
+    "radial":     "clock-sweep reveal — stylish, rhythmic",
+    "circleopen": "iris reveal — playful, spotlight on a new subject",
+    "hblur":      "blur-through — dreamy premium feel, time passing",
+    "smoothleft": "smooth directional wipe left — continues leftward motion",
+    "smoothright": "smooth directional wipe right — continues rightward motion",
+    "hlslice":    "sliced wipe — glitchy high-energy accent",
+    "distance":   "stretch morph — abstract premium accent (use sparingly)",
+}
+
+
+def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, transition_duration,
+                          transitions=None):
     """ffmpeg command to join the per-clip files into one video.
 
     Default: hard-cut concat demuxer (stream copy) — unchanged behavior.
@@ -511,19 +612,55 @@ def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, t
     xfade emits video only — the BGM step maps 0:v:0 so that's fine for music-only.
     """
     T = float(transition_duration or 0.0)
-    if T > 0 and len(clip_files) > 1:
+    n = len(clip_files)
+
+    # Normalize per-boundary spec: list of (name, duration), len n-1.
+    # name "cut" → hard cut at that boundary. None → uniform behavior.
+    boundary: list = []
+    if transitions:
+        for k in range(n - 1):
+            item = transitions[k] if k < len(transitions) else "cut"
+            if isinstance(item, dict):
+                name = str(item.get("transition", "cut")).strip() or "cut"
+                dur = float(item.get("duration", 0.4) or 0.4)
+            else:
+                s = str(item).strip()
+                if ":" in s:
+                    name, _, d = s.partition(":")
+                    try:
+                        dur = float(d)
+                    except ValueError:
+                        dur = 0.4
+                else:
+                    name, dur = s, 0.4
+            name = name.strip().lower() or "cut"
+            if name != "cut" and name not in TRANSITION_PALETTE:
+                name = "fade"          # unknown → safe default
+            boundary.append((name, max(0.2, min(dur, 1.0))))
+    elif T > 0:
+        boundary = [("fade", T)] * (n - 1)
+
+    if boundary and n > 1 and any(name != "cut" for name, _ in boundary):
         inputs = []
         for cf in clip_files:
             inputs += ['-i', cf]
-        parts = []
-        prev = '[0:v]'
-        cum = 0.0
-        n = len(clip_files)
+        # settb=AVTB unifies every stream's timebase: the concat filter outputs
+        # 1/1000000 while raw h264 inputs use e.g. 1/12800, and xfade hard-fails
+        # when its two inputs disagree ("timebase do not match").
+        parts = [f"[{i}:v]settb=AVTB[v{i}]" for i in range(n)]
+        prev = '[v0]'
+        S = float(clips[0].get('duration', 0) or 0)   # running duration of the joined stream
         for k in range(1, n):
-            cum += float(clips[k - 1].get('duration', 0) or 0)   # sum of intended durations d0..d(k-1)
-            offset = max(0.05, cum - k * T)                       # xfade start in the accumulated stream
+            name, dur = boundary[k - 1]
+            dk = float(clips[k].get('duration', 0) or 0)
             out = '[vout]' if k == n - 1 else f'[vx{k}]'
-            parts.append(f"{prev}[{k}:v]xfade=transition=fade:duration={T}:offset={offset:.4f}{out}")
+            if name == "cut":
+                parts.append(f"{prev}[v{k}]concat=n=2:v=1:a=0{out}")
+                S += dk
+            else:
+                offset = max(0.05, S - dur)
+                parts.append(f"{prev}[v{k}]xfade=transition={name}:duration={dur}:offset={offset:.4f}{out}")
+                S += dk - dur
             prev = out
         return [
             'ffmpeg', '-y', *inputs,
@@ -567,7 +704,8 @@ def render_video_ffmpeg(
     target_lufs: float = -18.0,
     target_lra: float = 11.0,
     target_tp: float = -1.5,
-    transition_duration: float = 0.0
+    transition_duration: float = 0.0,
+    transitions: list = None,
 ) -> bool:
     """
     Render video clips using ffmpeg concat demuxer.
@@ -1012,7 +1150,7 @@ def render_video_ffmpeg(
         if audio_path and os.path.exists(audio_path):
             # First join video clips (hard cut, or crossfade if transition_duration>0)
             temp_video = os.path.join(temp_dir, 'temp_video.mp4')
-            cmd = _build_video_join_cmd(concat_file, clip_files, clips, temp_video, video_fps, transition_duration)
+            cmd = _build_video_join_cmd(concat_file, clip_files, clips, temp_video, video_fps, transition_duration, transitions)
 
             result = subprocess.run(
                 cmd,
@@ -1207,7 +1345,7 @@ def render_video_ffmpeg(
                 ]
         else:
             # Just join clips without additional audio (hard cut or crossfade)
-            cmd = _build_video_join_cmd(concat_file, clip_files, clips, output_path, video_fps, transition_duration)
+            cmd = _build_video_join_cmd(concat_file, clip_files, clips, output_path, video_fps, transition_duration, transitions)
 
         result = subprocess.run(
             cmd,
@@ -1361,6 +1499,21 @@ def main():
         type=float,
         default=0.0,
         help='Crossfade (dissolve) duration in seconds between clips. 0 = hard cuts (default).'
+    )
+    parser.add_argument(
+        '--transition-mode',
+        type=str,
+        default='',
+        choices=['', 'uniform', 'ai'],
+        help='"ai" = LLM picks a transition per cut from the built-in palette '
+             '(uses shot_plan descriptions); empty/"uniform" = legacy --transition behavior.'
+    )
+    parser.add_argument(
+        '--transitions',
+        type=str,
+        default='',
+        help='Explicit per-cut list, comma-separated, e.g. "cut,fadeblack:0.4,zoomin:0.35". '
+             'Overrides --transition-mode.'
     )
     parser.add_argument(
         '--visualize-detections',
@@ -1673,6 +1826,18 @@ def main():
         print(f"  Ending extension: {ending_duration:.2f}s")
         print(f"  Audio crop start: {audio_start_time:.2f}s")
         print(f"  Audio crop duration: {audio_duration:.2f}s")
+
+    # Per-cut transition plan: explicit list > AI selection > legacy uniform
+    transitions = None
+    if args.transitions.strip():
+        transitions = [t.strip() for t in args.transitions.split(",") if t.strip()]
+        print(f"Using explicit transitions: {transitions}")
+    elif args.transition_mode == "ai":
+        _plan = shot_plan if ('shot_plan' in locals() and isinstance(shot_plan, dict)) else None
+        transitions = _ai_pick_transitions(clips, _plan)
+        if transitions is None:
+            print("AI transition selection unavailable — rendering with hard cuts")
+
     success = render_video_ffmpeg(
         video_path=args.video,
         clips=clips,
@@ -1704,7 +1869,8 @@ def main():
         target_lufs=args.target_lufs,
         target_lra=args.target_lra,
         target_tp=args.target_tp,
-        transition_duration=args.transition
+        transition_duration=args.transition,
+        transitions=transitions,
     )
 
     if success:

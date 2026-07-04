@@ -1413,6 +1413,7 @@ class RenderRequest(BaseModel):
     add_ending: bool = False
     has_dialogue: bool = False
     transition: float = 0.0   # crossfade seconds between clips (0 = hard cuts)
+    transition_mode: str = ""  # "" | "uniform" | "ai" (LLM picks per-cut transitions)
 
 
 @app.post("/api/render")
@@ -1459,7 +1460,9 @@ def render(body: RenderRequest):
     ]
     if body.has_dialogue:
         cmd += ["--render-hook-dialogue"]
-    if body.transition and body.transition > 0:
+    if body.transition_mode == "ai":
+        cmd += ["--transition-mode", "ai"]
+    elif body.transition and body.transition > 0:
         cmd += ["--transition", str(body.transition)]
     if body.add_ending and os.path.exists(ending):
         cmd += ["--ending-video", ending]
