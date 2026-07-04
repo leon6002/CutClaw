@@ -6,11 +6,14 @@ const { Text } = Typography;
 const TASK_LABEL: Record<string, string> = {
   audio_segments: "🎵 音频片段描述",
   editor_shots: "✂️ 镜头选择 Agent",
+  video_clips: "🎬 视频片段理解",
+  video_scenes: "🔍 场景分析",
 };
 
 interface TaskInfo {
   total: number;
   states: Record<string, string>; // idx → "r" | "d" | "f"
+  labels?: Record<string, string>;
   done?: number;
   fail?: number;
   avg?: number;
@@ -45,11 +48,11 @@ function SegGrid({ name, t }: { name: string; t: TaskInfo }) {
         </Text>
       </div>
       <div className="seg-grid">
-        {cells.map((s, i) => (
-          <div key={i} className={`seg seg-${s}`} title={`#${i + 1} ${
-            s === "d" ? "已完成" : s === "r" ? "处理中" : s === "f" ? "失败" : "等待中"
-          }`} />
-        ))}
+        {cells.map((s, i) => {
+          const lab = t.labels?.[String(i)];
+          const st = s === "d" ? "已完成" : s === "r" ? "处理中" : s === "f" ? "失败" : "等待中";
+          return <div key={i} className={`seg seg-${s}`} title={`#${i + 1}${lab ? ` ${lab}` : ""} · ${st}`} />;
+        })}
       </div>
     </div>
   );

@@ -315,7 +315,15 @@ def process_video(
     # ---------------- Async captioning with overlapped frame reading ---------- #
     CONCURRENCY = config.CAPTION_BATCH_SIZE
 
-    async def _caption_one(clip, semaphore, timeout, is_last_attempt=False):
+    try:
+        from src.utils.progress import emit_progress
+    except Exception:
+        def emit_progress(*a, **k):  # type: ignore
+            pass
+    _prog = {"idx": 0}
+    emit_progress("video_clips", 0, -1, "reset")
+
+    async def _caption_one(clip, clip_idx, semaphore, timeout, is_last_attempt=False):
         """Send one acompletion request with timeout, return (clip, meta, content_or_None)."""
         meta = _build_clip_request(clip)
         timestamp, messages_for_clip, frame_range, clip_start_time, clip_end_time = meta
@@ -341,7 +349,7 @@ def process_video(
                 level = "❌" if is_last_attempt else "⚠️ "
                 print(f"  {level} [VideoCaption] [Error] {timestamp}: {type(e).__name__}: {e}")
                 content = None
-        return clip, meta, content
+        return clip, meta, content, clip_idx
 
     async def _run_overlapped(clip_iter, pbar, timeout, is_last_attempt=False):
         """
@@ -363,7 +371,10 @@ def process_video(
                 break
             pbar.total += 1
             pbar.refresh()
-            task = asyncio.create_task(_caption_one(clip, semaphore, timeout, is_last_attempt=is_last_attempt))
+            _idx = _prog["idx"]
+            _prog["idx"] += 1
+            emit_progress("video_clips", _prog["idx"], _idx, "start", label=str(clip[0]))
+            task = asyncio.create_task(_caption_one(clip, _idx, semaphore, timeout, is_last_attempt=is_last_attempt))
             pending_tasks.add(task)
             await asyncio.sleep(0)  # yield to event loop so caption tasks can start
 
@@ -371,23 +382,27 @@ def process_video(
             done = {t for t in pending_tasks if t.done()}
             for t in done:
                 pending_tasks.discard(t)
-                clip_r, meta, content = t.result()
+                clip_r, meta, content, _cidx = t.result()
                 ts, _, fr, cst, cet = meta
                 err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
                 if err is not None:
                     failed_clips.append(clip_r)
+                    emit_progress("video_clips", _prog["idx"], _cidx, "fail")
                 else:
                     pbar.update(1)
+                    emit_progress("video_clips", _prog["idx"], _cidx, "done")
 
         # Wait for remaining tasks
         for t in asyncio.as_completed(pending_tasks):
-            clip_r, meta, content = await t
+            clip_r, meta, content, _cidx = await t
             ts, _, fr, cst, cet = meta
             err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
             if err is not None:
                 failed_clips.append(clip_r)
+                emit_progress("video_clips", _prog["idx"], _cidx, "fail")
             else:
                 pbar.update(1)
+                emit_progress("video_clips", _prog["idx"], _cidx, "done")
 
         return failed_clips
 

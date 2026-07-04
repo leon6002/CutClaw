@@ -748,7 +748,12 @@ def _apply_progress_ev(job: Job, ev: dict):
             t["total"] = total
         idx = ev.get("idx", -1)
         event = ev.get("event", "")
+        if event == "reset":
+            t["states"] = {}
+            t["labels"] = {}
         if isinstance(idx, int) and idx >= 0:
+            if "label" in ev:
+                t.setdefault("labels", {})[str(idx)] = str(ev["label"])[:60]
             if event == "retry":
                 t["states"].pop(str(idx), None)   # back to pending
             elif event in _EVENT_STATE:

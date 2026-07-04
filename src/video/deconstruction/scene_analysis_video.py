@@ -358,19 +358,30 @@ class SceneVideoAnalyzer:
                 except Exception as e:
                     return f"Error: {e}"
 
+        try:
+            from src.utils.progress import emit_progress
+        except Exception:
+            def emit_progress(*a, **k):  # type: ignore
+                pass
+        emit_progress("video_scenes", len(tasks), -1, "reset")
+
         async def _run_all(task_list, pbar):
             semaphore = asyncio.Semaphore(max_workers)
             failed_tasks = []
             pending = set()
+            total = len(task_list)
 
-            for in_path, out_path in task_list:
+            for _idx, (in_path, out_path) in enumerate(task_list):
                 # 同步读 json + 读帧（decord not thread-safe，必须在 event loop 主线程）
                 with open(in_path, 'r', encoding='utf-8') as f:
                     scene_data = json.load(f)
                 frames = self.load_scene_frames(scene_data)
 
+                emit_progress("video_scenes", total, _idx, "start",
+                              label=os.path.basename(in_path))
                 task = asyncio.create_task(_caption_one(in_path, out_path, scene_data, frames, semaphore))
                 task._scene_key = (in_path, out_path)
+                task._scene_idx = _idx
                 pending.add(task)
                 await asyncio.sleep(0)  # yield to event loop so caption tasks can start
 
@@ -381,13 +392,21 @@ class SceneVideoAnalyzer:
                     result = t.result()
                     if result == "Success":
                         pbar.update(1)
+                        emit_progress("video_scenes", total, t._scene_idx, "done")
                     else:
                         failed_tasks.append(t._scene_key)
+                        emit_progress("video_scenes", total, t._scene_idx, "fail")
 
-            for coro in asyncio.as_completed(pending):
-                result = await coro
-                if result == "Success":
-                    pbar.update(1)
+            if pending:
+                done_set, _ = await asyncio.wait(pending)
+                for t in done_set:
+                    result = t.result()
+                    if result == "Success":
+                        pbar.update(1)
+                        emit_progress("video_scenes", total, t._scene_idx, "done")
+                    else:
+                        failed_tasks.append(t._scene_key)
+                        emit_progress("video_scenes", total, t._scene_idx, "fail")
             return failed_tasks
 
         pending_tasks = list(tasks)
