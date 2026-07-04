@@ -1187,6 +1187,39 @@ def caption_audio_with_madmom_segments(
                     boundaries.append(boundaries[-1] + step)
             boundaries.append(t)
 
+        # Step 3: rhythm variation — uniform machine-gun pacing (13× ~1.7s in a
+        # row) feels relentless even when the music is fast. Real editors
+        # alternate: a burst of quick cuts, then a longer "breathing" shot.
+        # Keep bursts, but in every group of 4 consecutive fast segments drop
+        # the WEAKEST interior boundary, merging two segments into one ~2×
+        # hold (capped at _MAX_HOLD).
+        if len(boundaries) >= 6:
+            def _boundary_strength(t: float) -> float:
+                return max((kp.get('normalized_intensity', kp.get('intensity', 0))
+                            for kp in section_all_kps if abs(kp['time'] - t) < 0.02), default=0.0)
+
+            shaped = list(boundaries)
+            i = 1
+            since_hold = 0
+            while i < len(shaped) - 1:
+                seg_dur = shaped[i + 1] - shaped[i]
+                prev_dur = shaped[i] - shaped[i - 1]
+                since_hold += 1
+                # after a burst of fast segments, merge the next pair into a hold
+                if since_hold >= 4 and prev_dur <= sec_target * 1.2 and seg_dur <= sec_target * 1.2 \
+                        and (prev_dur + seg_dur) <= _MAX_HOLD:
+                    # drop the weaker of this boundary vs the next interior one
+                    drop_idx = i if _boundary_strength(shaped[i]) <= _boundary_strength(shaped[i + 1]) \
+                        or i + 1 >= len(shaped) - 1 else i + 1
+                    del shaped[drop_idx]
+                    since_hold = 0
+                    continue   # re-evaluate at same index after deletion
+                i += 1
+            if len(shaped) < len(boundaries):
+                print(f"  🫁 rhythm: merged {len(boundaries) - len(shaped)} boundary(ies) "
+                      f"into breathing holds (burst→hold alternation)")
+            boundaries = shaped
+
         # Build final sub-segment list
         merged_subsegments = []
         for i in range(len(boundaries) - 1):
