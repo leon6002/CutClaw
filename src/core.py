@@ -2350,7 +2350,9 @@ class ParallelShotOrchestrator:
                 for _r in combined_keep_ranges:
                     _r_src, _r_s, _r_e = _norm_range(_r)
                     _k = _r_src or (self.video_path or "")
-                    _taken[_k] = _taken.get(_k, 0.0) + max(0.0, (_r_e or 0.0) - (_r_s or 0.0)) + _gap
+                    # a committed range blocks its own span PLUS the spacing gap on
+                    # BOTH sides — new picks can't land within `gap` of it
+                    _taken[_k] = _taken.get(_k, 0.0) + max(0.0, (_r_e or 0.0) - (_r_s or 0.0)) + 2 * _gap
                 _src_scenes: dict = {}
                 for _sc_idx, _sc_src in self.scene_source_map.items():
                     _src_scenes.setdefault(_sc_src, []).append(_sc_idx)
@@ -2359,6 +2361,7 @@ class ParallelShotOrchestrator:
                     d = sum(float(sh.get('time_duration') or 0.0) for _, sh in items)
                     return d + _gap * max(0, len(items) - 1)
 
+                _moved_keys: set = set()   # never bounce the same shot twice
                 for _ in range(len(pending)):
                     _groups: dict = {}
                     for _key, _shot in pending.items():
@@ -2367,16 +2370,18 @@ class ParallelShotOrchestrator:
                              for s, g in _groups.items()}
                     for s, cap in _caps.items():   # idle sources = spare capacity
                         _free.setdefault(s, cap - _taken.get(s, 0.0))
-                    _worst = min((s for s in _groups), key=lambda s: _free[s])
-                    if _free[_worst] >= 0 or len(_groups[_worst]) <= 1:
-                        break   # nothing over-subscribed (or nothing movable)
+                    _movable = [s for s in _groups
+                                if _free[s] < 0 and any(k not in _moved_keys for k, _ in _groups[s])]
+                    if not _movable:
+                        break   # nothing over-subscribed (or nothing left to move)
+                    _worst = min(_movable, key=lambda s: _free[s])
                     _targets = [s for s in _free if s != _worst and _src_scenes.get(s)]
                     if not _targets:
                         break
                     _best = max(_targets, key=lambda s: _free[s])
-                    # move the smallest slot — easiest to place elsewhere
-                    _key, _shot = min(_groups[_worst],
-                                      key=lambda it: float(it[1].get('time_duration') or 0.0))
+                    # move the smallest not-yet-moved slot — easiest to place elsewhere
+                    _cands = [(k, sh) for k, sh in _groups[_worst] if k not in _moved_keys]
+                    _key, _shot = min(_cands, key=lambda it: float(it[1].get('time_duration') or 0.0))
                     _need = float(_shot.get('time_duration') or 0.0) + _gap
                     if _free[_best] - _need < 0:
                         print(f"⚖️  [Capacity] {os.path.basename(_worst)} over-subscribed by "
@@ -2384,6 +2389,7 @@ class ParallelShotOrchestrator:
                               f"proceeding as planned")
                         break
                     _shot['related_scene'] = sorted(_src_scenes[_best])[0]
+                    _moved_keys.add(_key)
                     print(f"⚖️  [Capacity] Shot{_key[1] + 1} ({_need - _gap:.1f}s) reassigned: "
                           f"{os.path.basename(_worst)} over-subscribed by {-_free[_worst]:.1f}s "
                           f"→ {os.path.basename(_best)} (free {_free[_best]:.1f}s)", flush=True)

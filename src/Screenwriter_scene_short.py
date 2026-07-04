@@ -555,6 +555,7 @@ def generate_shot_plan(
     scene_folder_path: A[str | None, D("Path to scene summaries folder.")] = None,
     user_instruction: A[str, D("User's editing instruction.")] = "",
     main_character: str | None = None,
+    feedback: str | None = None,
 ) -> str | None:
     """Generate a one-to-one shot mapping for each music segment."""
     if isinstance(music_detailed_structure, (dict, list)):
@@ -567,6 +568,11 @@ def generate_shot_plan(
     prompt = prompt.replace("VIDEO_SECTION_INFO_PLACEHOLDER", str(video_section_proposal))
     prompt = prompt.replace("INSTRUCTION_PLACEHOLDER", user_instruction)
     prompt = prompt.replace("MAIN_CHARACTER_PLACEHOLDER", main_character or "the main character")
+    if feedback:
+        prompt += (
+            "\n\n**IMPORTANT — YOUR PREVIOUS ATTEMPT WAS REJECTED:**\n"
+            f"{feedback}\nFix this in your new plan."
+        )
 
     related_video_context = ""
     related_scenes = video_section_proposal.get("related_scenes", []) if isinstance(video_section_proposal, dict) else []
@@ -613,6 +619,66 @@ def _validate_shot_plan_result(shot_plan: dict | None, expect_non_empty: bool = 
     return True, "ok"
 
 
+def _check_scene_load(shot_plan: dict, scene_folder_path: str | None) -> tuple[bool, str]:
+    """Per-scene material budget: total shot seconds assigned to a scene must fit
+    inside that scene's real footage (with headroom for spacing/unusable parts).
+    The Screenwriter tends to pile shots onto its favorite scene — a 19s scene
+    was asked for 16s across 3 shots, structurally starving the last one."""
+    if not scene_folder_path or not os.path.isdir(scene_folder_path):
+        return True, "ok"
+
+    def _ts(v) -> float:
+        try:
+            s = str(v).strip()
+            if ":" in s:
+                parts = [float(x) for x in s.split(":")]
+                return sum(p * m for p, m in zip(reversed(parts), [1, 60, 3600]))
+            return float(s)
+        except (TypeError, ValueError):
+            return 0.0
+
+    scene_dur: dict = {}
+    for f in os.listdir(scene_folder_path):
+        m = re.search(r"scene_(\d+)\.json$", f)
+        if not m:
+            continue
+        try:
+            with open(os.path.join(scene_folder_path, f), "r", encoding="utf-8") as fh:
+                tr = (json.load(fh).get("time_range") or {})
+            d = _ts(tr.get("end_seconds")) - _ts(tr.get("start_seconds"))
+            if d > 0:
+                scene_dur[int(m.group(1))] = d
+        except Exception:
+            continue
+    if not scene_dur:
+        return True, "ok"
+
+    load: dict = {}
+    for shot in shot_plan.get("shots", []):
+        try:
+            sc = int(shot.get("related_scene"))
+            load.setdefault(sc, [0, 0.0])
+            load[sc][0] += 1
+            load[sc][1] += float(shot.get("time_duration") or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    over = []
+    for sc, (n, secs) in load.items():
+        cap = scene_dur.get(sc)
+        if cap and secs > cap * 0.7:
+            over.append(f"scene {sc}: {n} shots totaling {secs:.1f}s but only {cap:.0f}s of footage "
+                        f"exists (budget {cap * 0.7:.0f}s)")
+    if over:
+        spare = sorted(((sc, d) for sc, d in scene_dur.items()
+                        if load.get(sc, [0, 0.0])[1] < d * 0.4), key=lambda x: -x[1])
+        hint = ", ".join(f"scene {sc} ({d:.0f}s free)" for sc, d in spare[:4]) or "none"
+        return False, ("Scene over-subscription: " + "; ".join(over)
+                       + f". Redistribute shots to under-used scenes: {hint}. "
+                       f"Never assign more shot-seconds to a scene than ~70% of its footage.")
+    return True, "ok"
+
+
 def generate_shot_plan_with_retry(
     music_detailed_structure: list | dict | str,
     video_section_proposal: dict,
@@ -628,6 +694,7 @@ def generate_shot_plan_with_retry(
     expected_non_empty = bool(music_detailed_structure) if isinstance(music_detailed_structure, list) else True
     last_error = "unknown_error"
 
+    best_plan = None   # structurally valid but scene-overloaded — usable fallback
     for attempt in range(1, retries + 1):
         raw_shot_plan = generate_shot_plan(
             music_detailed_structure,
@@ -635,6 +702,7 @@ def generate_shot_plan_with_retry(
             scene_folder_path,
             user_instruction,
             main_character=main_character,
+            feedback=(last_error if attempt > 1 else None),
         )
         if not raw_shot_plan:
             last_error = "empty response from shot plan request"
@@ -645,14 +713,26 @@ def generate_shot_plan_with_retry(
                 expect_non_empty=expected_non_empty,
             )
             if is_valid:
-                return parsed_shot_plan
-            last_error = f"invalid shot plan format: {reason}"
+                load_ok, load_reason = _check_scene_load(parsed_shot_plan, scene_folder_path)
+                if load_ok:
+                    return parsed_shot_plan
+                best_plan = parsed_shot_plan
+                last_error = load_reason
+                print(f"⚖️ [Screenwriter] shot plan rejected: {load_reason}")
+            else:
+                last_error = f"invalid shot plan format: {reason}"
 
         if attempt < retries:
             wait_seconds = min(max_backoff, base_backoff * (2 ** (attempt - 1)))
             print(f"🔄 [Screenwriter: Shot Plan] Retrying in {wait_seconds:.1f}s...")
             time.sleep(wait_seconds)
 
+    if best_plan is not None:
+        # scene-overloaded but structurally sound — the orchestrator's capacity
+        # guard will rebalance at dispatch; better than failing the pipeline
+        print("⚖️ [Screenwriter] scene load still unbalanced after retries — "
+              "proceeding; orchestrator capacity guard will rebalance")
+        return best_plan
     return None
 
 
