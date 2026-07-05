@@ -1449,7 +1449,34 @@ def print_clip_summary(clips: List[Dict[str, Any]]):
     print("=" * 60 + "\n")
 
 
+class _SafeStream:
+    """stdout/stderr wrapper that swallows write errors. When the API server
+    (our parent) restarts, our piped stdout closes and the next print() would
+    raise BrokenPipe — killing an otherwise healthy render minutes before it
+    writes the output file. Losing log lines beats losing the render."""
+
+    def __init__(self, s):
+        self._s = s
+
+    def write(self, x):
+        try:
+            return self._s.write(x)
+        except (OSError, ValueError):
+            return len(x)
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
 def main():
+    sys.stdout = _SafeStream(sys.stdout)
+    sys.stderr = _SafeStream(sys.stderr)
     parser = argparse.ArgumentParser(description='Render video from shot_point.json')
     parser.add_argument(
         '--shot-json',
