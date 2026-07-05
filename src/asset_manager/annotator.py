@@ -105,6 +105,42 @@ def _parse_json_strict(content: str | None) -> dict | None:
         return None
 
 
+def _bpm_from_caption_dict(caption_data: dict) -> float | None:
+    try:
+        mt = caption_data.get("measured_tempo") or {}
+        if mt.get("bpm_felt"):
+            return float(mt["bpm_felt"])
+        db = sorted(k["time"] for k in (caption_data.get("_keypoints_detail") or [])
+                    if k.get("type") == "Downbeat")
+        gaps = sorted(b - a for a, b in zip(db, db[1:]) if 0.8 <= b - a <= 8.0)
+        if len(gaps) >= 4:
+            return round(240.0 / gaps[len(gaps) // 2], 1)
+    except Exception:
+        pass
+    return None
+
+
+def _measured_bpm_from_caption(caption_data: dict, content_hash: str = "") -> float | None:
+    """Felt-pulse BPM from the madmom analysis. Never trusts LLM-written text
+    (which routinely answers genre clichés like '128 BPM').
+
+    Order: explicit measured_tempo (new caches) → downbeat gaps in this caption
+    → the PIPELINE's full analysis for the same content hash (the annotator's
+    coarse cache keeps only ~top-30 keypoints, often too few downbeats)."""
+    bpm = _bpm_from_caption_dict(caption_data)
+    if bpm:
+        return bpm
+    if content_hash:
+        full = os.path.join("Output", "analyzed", content_hash, "captions.json")
+        if os.path.exists(full):
+            try:
+                with open(full, "r", encoding="utf-8") as fh:
+                    return _bpm_from_caption_dict(json.load(fh))
+            except Exception:
+                pass
+    return None
+
+
 # ── Video annotator ────────────────────────────────────────────────────────
 
 def _extract_key_frames(video_path: str, num_frames: int = 5) -> list[np.ndarray]:
@@ -449,10 +485,10 @@ def annotate_audio_asset(
                     if parsed and isinstance(parsed, dict):
                         parsed["duration_sec"] = metadata.duration_sec
                         # LLM-guessed bpm is unreliable (anchors on genre clichés);
-                        # override with the madmom-measured felt pulse when present
-                        _mt = caption_data.get("measured_tempo") or {}
-                        if _mt.get("bpm_felt"):
-                            parsed["bpm"] = float(_mt["bpm_felt"])
+                        # override with the madmom-measured felt pulse
+                        _bpm = _measured_bpm_from_caption(caption_data, metadata.content_hash)
+                        if _bpm:
+                            parsed["bpm"] = _bpm
                         return AudioAnnotation(**parsed)
                 except Exception:
                     if attempt == 1:
@@ -465,7 +501,7 @@ def annotate_audio_asset(
                 genre="",
                 emotion="",
                 energy_level="medium",
-                bpm=0.0,
+                bpm=_measured_bpm_from_caption(caption_data, metadata.content_hash) or 0.0,
                 sections_summary=sections_summary,
                 tags=[],
                 quality_score=5.0,
