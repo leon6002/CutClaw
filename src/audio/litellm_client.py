@@ -74,11 +74,15 @@ def _audio_to_base64_mp3(audio_path: str) -> str:
 
 
 def _build_messages(prompt: str, audio_b64: str) -> list:
+    # Standard OpenAI-compatible audio content type. litellm passes it through
+    # for openai/-prefixed models and converts it for native providers (gemini).
+    # The previous data:audio/mp3 URI inside image_url relied on lenient
+    # server-side parsing — a text-only endpoint silently dropped the audio.
     return [{
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{audio_b64}"}},
+            {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "mp3"}},
         ],
     }]
 
