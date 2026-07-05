@@ -414,6 +414,14 @@ TRANSLATE_MODEL = "deepseek/deepseek-v4-flash"
 TRANSLATE_ENDPOINT = "https://api.deepseek.com/v1"
 TRANSLATE_API_KEY = AGENT_LITELLM_API_KEY
 
+STABILITY_CHECK_ENABLED = True
+# Measured footage-quality gate (motion blur / violent camera motion),
+# computed from real frames — not the VLM's still-frame guess.
+
+STABILITY_MIN_SCORE = 3.5
+# Commits with measured quality below this are rejected (except on the final
+# lenient attempt). 0-10; calibrated: drone tilt-correction ≈ 1, smooth ≈ 9-10.
+
 PARALLEL_SHOT_ENABLED = True
 # Whether to enable parallel shot selection (ParallelShotOrchestrator) in film mode.
 

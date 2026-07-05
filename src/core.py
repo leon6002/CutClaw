@@ -509,6 +509,10 @@ def fine_grained_shot_trimming(
         The "internal_scenes" are fine-grained descriptions to help you understand what's  happening INSIDE the analyzed range.
         Use them to decide whether to use the full range, a subset, or refine with another call.
 
+        Scenes may include "measured_quality" (0-10, MEASURED from real frames — motion blur /
+        violent camera motion that still-frame descriptions cannot see). Prefer ranges scoring >=5;
+        NEVER commit a range whose measured_quality is below 4 — such commits are auto-rejected.
+
     
     Args:
         time_range: String in format 'HH:MM:SS to HH:MM:SS' - the range to analyze
@@ -631,8 +635,13 @@ def fine_grained_shot_trimming(
         _requested = end_sec - start_sec
         if _requested > 0 and _covered / _requested >= 0.8:
             internal = []
+            from src.utils.stability import measure_stability, stability_verdict
             for s_abs, e_abs, seg in _hits:
                 cs, ce = max(s_abs, start_sec), min(e_abs, end_sec)
+                # measured blur/violent-motion score — the VLM's still-frame
+                # quality guess cannot see this; the agent needs it to avoid
+                # picking degraded footage in the first place
+                _st = measure_stability(frame_path, cs, ce, samples=3) if frame_path else {"score": -1}
                 parts = []
                 if seg.get("cut_type"):
                     parts.append(f"[{str(seg['cut_type']).upper()}]")
@@ -641,6 +650,10 @@ def fine_grained_shot_trimming(
                 vq = seg.get("visual_quality", {}) or {}
                 em = seg.get("emotion", {}) or {}
                 internal.append({
+                    "measured_quality": {
+                        "score": _st.get("score", -1),
+                        "verdict": stability_verdict(_st.get("score", -1)),
+                    },
                     "scene_time": f"{convert_seconds_to_hhmmss(cs)} to {convert_seconds_to_hhmmss(ce)}",
                     "description": " ".join(parts),
                     "cut_type": seg.get("cut_type", ""),
@@ -1650,6 +1663,7 @@ class EditorCoreAgent:
                     context=self.current_shot_context,
                     used_time_ranges=self.used_time_ranges,
                     lenient=getattr(self, "_grace_commit", False),
+                    video_path=args.get("video_path") or self._current_source_video(),
                 )
 
                 self.current_shot_context["review_result"] = review_result
@@ -2063,6 +2077,7 @@ class ParallelShotOrchestrator:
                                  else (1 if _same_source(w[1], src_pref) else 2), w[0]))
 
         best = None   # (free_len, src, free_start, free_end) — largest gap seen
+        feasible = []  # full-length candidate picks, in preference order
         for _idx, src, w_s, w_e in wins:
             blocks = []
             for fr in forbidden_ranges:
@@ -2082,10 +2097,30 @@ class ParallelShotOrchestrator:
                 free.append((cur, w_e))
             for f_s, f_e in free:
                 ln = f_e - f_s
-                if ln >= need:
-                    return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + need)
+                if ln >= need and len(feasible) < 8:
+                    feasible.append((src, f_s))
                 if best is None or ln > best[0]:
                     best = (ln, src, f_s, f_e)
+
+        if feasible:
+            # among fitting windows, avoid measurably blurry/violent footage —
+            # take the highest-preference candidate that isn't degraded, or the
+            # sharpest one when everything in reach is mediocre
+            try:
+                from src.utils.stability import measure_stability
+                scored = []
+                for src, f_s in feasible:
+                    st = measure_stability(src, f_s, f_s + need)
+                    sc = st.get("score", -1)
+                    if sc < 0 or sc >= 5.0:
+                        return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + need)
+                    scored.append((sc, src, f_s))
+                sc, src, f_s = max(scored)
+                print(f"🛟 [Fallback] all candidate windows are soft — taking the sharpest ({sc}/10)")
+                return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + need)
+            except Exception:  # noqa: BLE001
+                src, f_s = feasible[0]
+                return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + need)
 
         if best and best[0] >= floor:
             ln, src, f_s, f_e = best

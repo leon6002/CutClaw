@@ -146,7 +146,9 @@ export function ClipCaption({ clip, playhead = -1 }: { clip: ClipMapEntry | null
     segTag = `${seg.a}–${seg.b}s`;
   }
   return (
-    <div className="mt-1.5 min-h-[46px] w-full rounded-lg border border-white/[0.06] bg-black/30 px-3 py-1.5">
+    // FIXED height — a min-height container grows/shrinks with 1 vs 2 caption
+    // lines and nudges the whole layout at every cut
+    <div className="mt-1.5 h-[64px] w-full overflow-hidden rounded-lg border border-white/[0.06] bg-black/30 px-3 py-1.5">
       {clip ? (
         <>
           <div className="text-[10px] font-medium tracking-wide text-cyan-300">

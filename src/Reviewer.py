@@ -898,7 +898,7 @@ class ReviewerAgent:
 
 
     def review(self, shot_proposal: dict, context: dict, used_time_ranges: list = None,
-               lenient: bool = False) -> dict:
+               lenient: bool = False, video_path: str = "") -> dict:
         """
         Review whether the shot selection meets requirements.
 
@@ -944,11 +944,32 @@ class ReviewerAgent:
             if "❌" in overlap_review:
                 issues.append(overlap_review)
 
-        # 3. Content match checks (LLM can be used for deeper review)
-        # TODO: Add more checks here, e.g.:
-        # - Whether the selected clip matches target content/emotion
-        # - Visual quality checks
-        # - Narrative coherence
+        # 3. MEASURED footage quality — motion blur betrays violent camera
+        # motion (drone corrections, whip shake) that still-frame VLM scores
+        # miss entirely. Never applied on the lenient/final attempt: a soft
+        # clip beats a hole in the timeline.
+        if (match and video_path and not lenient
+                and getattr(config, 'STABILITY_CHECK_ENABLED', True)):
+            try:
+                from src.utils.stability import measure_stability
+                fps = getattr(config, "VIDEO_FPS", 24) or 24
+                _s = hhmmss_to_seconds(match.group(1), fps=fps)
+                _e = hhmmss_to_seconds(match.group(2), fps=fps)
+                st = measure_stability(video_path, _s, _e)
+                _min = float(getattr(config, 'STABILITY_MIN_SCORE', 3.5))
+                if st.get("score", -1) >= 0 and st["score"] < _min:
+                    issues.append(
+                        f"❌ Measured footage quality too low: {st['score']}/10 "
+                        f"(sharpness is only {st.get('rel_sharp', 0) * 100:.0f}% of this source's own "
+                        f"baseline — violent camera motion / heavy blur, e.g. a drone correcting "
+                        f"course). This is a MEASURED value from the actual frames, not an opinion. "
+                        f"Pick a visually steadier range (nearby seconds in the same scene often work)."
+                    )
+            except Exception as _e:  # noqa: BLE001
+                print(f"⚠️ [Reviewer] stability check skipped: {_e}")
+
+        # More content checks could go here (target content/emotion match,
+        # narrative coherence, ...)
 
         # Lenient mode (used on the forced final commit): the agent has no budget
         # left to adjust, so a duration shortfall alone must not fail the shot —
