@@ -242,6 +242,26 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
 
     scene_files.sort(key=_scene_number)
 
+    # journey chronology: Day-N labels are relative to each TRIP's first day
+    # (capture dates clustered — mixed-trip libraries get Trip 1/Trip 2 prefixes)
+    _cap_label = None
+    try:
+        from datetime import datetime as _dt
+        from src.utils.capture_time import build_trip_labeler
+        _all_dt = []
+        for filename in scene_files:
+            try:
+                with open(os.path.join(scene_folder_path, filename), 'r', encoding='utf-8') as f:
+                    _ct = json.load(f).get("capture_time")
+                if _ct:
+                    _all_dt.append(_dt.fromisoformat(_ct))
+            except Exception:
+                continue
+        if _all_dt:
+            _cap_label = build_trip_labeler(_all_dt)
+    except Exception:
+        _cap_label = None
+
     for filename in scene_files:
         filepath = os.path.join(scene_folder_path, filename)
         try:
@@ -296,9 +316,21 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
             except Exception:
                 pass
 
+            shot_at_line = ""
+            _ct_raw = scene_data.get("capture_time")
+            if _ct_raw and _cap_label:
+                try:
+                    from datetime import datetime as _dt2
+                    _lbl = _cap_label(_dt2.fromisoformat(_ct_raw))
+                    if _lbl:
+                        shot_at_line = f"Shot at: {_lbl}\n"
+                except Exception:
+                    pass
+
             summary_text = (
                 f"[Scene {scene_id}] ({start_time} - {end_time})\n"
                 f"Location: {location}, Time: {time_state}\n"
+                f"{shot_at_line}"
                 f"{capacity_line}"
                 f"Key Event: {key_event}\n"
                 f"Narrative: {narrative}\n"
@@ -318,6 +350,17 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
         "spread shots across different scenes whenever the narrative allows, so the "
         "editor is never starved of usable time ranges.\n\n"
     )
+    if _cap_label is not None:
+        budget_header += (
+            "JOURNEY CHRONOLOGY: scenes carry their REAL capture moment (\"Shot at: "
+            "[Trip N ·] Day N · MM-DD HH:MM\"). For travel/memory edits the film should "
+            "generally move FORWARD through the journey — earlier trips/days/mornings "
+            "first, later ones toward the end — so the montage replays the trip the "
+            "way it was lived. Local back-and-forth within the same day is fine for "
+            "rhythm; only break the overall forward flow when the user instruction "
+            "explicitly demands another narrative order. Scenes without capture data "
+            "may be placed freely.\n\n"
+        )
     return budget_header + "\n".join(scene_summaries), total_scene_files
 
 

@@ -154,6 +154,13 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
   → Reviewer（审查）→ shot_point.json（每 clip 带源视频路径 + 局部起止）
 ```
 
+### 时序叙事（旅程时间脊柱）
+- **动机**：跑马灯式回忆应当按旅程时间推进（Day 1 → Day N、早 → 晚），此前镜头顺序完全由编剧虚构。
+- **拍摄时间提取**（`src/utils/capture_time.py`，零网络）：①文件名模式（DJI_YYYYMMDDHHMMSS / VID_ / PXL_ / 通用 8+6 位）②ffprobe 容器 creation_time（iPhone .MOV）③拿不到 = None（编剧可自由摆放）。文件名时间是当地时间、容器时间常是 UTC——**不做时区换算**，同一旅程内排序一致性才是关键。
+- **场景级时刻** = 文件录制起点 + 场景片内偏移，`merge_scene_summaries` 时写入每个场景的 `capture_time`。
+- **旅行聚类**：拍摄日期间隔 >14 天 = 新旅程（`build_trip_labeler`），混合素材库标 "Trip 2 · Day 1 · 12-13 15:07" 而不是荒谬的 "Day 411"。
+- **进 prompt**：`load_scene_summaries` 给每个场景加 "Shot at:" 行 + JOURNEY CHRONOLOGY 规则（默认时序前进，指令明确要求时可打破）；`generate_shot_plan` 的分段场景描述同样带拍摄时刻。
+
 ### 编排器（`ParallelShotOrchestrator.run_parallel`，src/core.py）
 - **按源分组**：同源镜头串行（前面的选择进后面的禁选区 → 结构上杜绝同源重叠），不同源并行（`PARALLEL_SHOT_MAX_WORKERS`）。
 - **容量守卫**：派发前按"每源需求 vs 供给"重平衡，把超订源上最小的镜头挪到最空的源（解决"最后一个镜头只剩边角料"）。大镜头先选（长窗口优先）。
@@ -270,6 +277,16 @@ shot_point.json（多源 clip 各带 video_path）
 - 全页详情视图（弃用抽屉——用户明确否决抽屉交互）；海报卡片墙（缩略图 `/api/assets/thumb`、状态色条、按哈希路由的实时阶段显示）；命令栏 ⚙ 模型/并发设置;JobDock 全局任务坞。
 - 标注状态按 `content_hash` 键控（`meta.files`: p/r/d/f），**绝不用文件名匹配**（曾致"标注一个全部显示标注中"）。
 
+### 扫描持久化（刷新不重扫）
+**动机**：素材列表原先只存 React 内存 state，一刷新就回到"点击扫描"空状态，必须重扫；而扫描本身很贵——每个文件 SHA-256 读 1MB + `_probe_structured` 为每个视频跑 ~8 次 ffprobe 子进程（Windows 上每次 spawn 50-100ms，单视频 ≈0.5-1s），且文件没变也照跑。刷新即重扫 = 双重浪费。
+
+**三层解法**（缺一不可）：
+1. **磁盘元数据缓存**（`src/asset_manager/scanner.py`）：`scan_asset_directory` 按绝对路径缓存 `{size, mtime, hash, meta}` 到 `Output/asset_index/scan_cache.json`。文件 `(size, mtime)` 未变 → 直接复用缓存对象，**跳过 hash + 全部 ffprobe**；变了/新增才全量 probe。收尾一次性落盘，删掉的文件自动剔除。带 `_CACHE_VERSION`（元数据结构变更时旧缓存作废）；`use_cache=False` 可强制全量重扫。**mtime 存 int 秒**（避免 JSON 浮点精度误判），配合 size 双条件足够稳。Streamlit/CLI 走同函数一并受益。
+2. **后端恢复端点**：`GET /api/assets/scan`——服务内存有上次扫描（`SCANNED`）就秒回；重启后内存空了就对配置根走一次缓存扫描（因①已很快）。与既有 `POST /api/assets/scan`（用户手动扫描）复用 `_assets_with_annotations()` 合并云端+本地注释。
+3. **前端挂载恢复**：`AssetsView` mount 时先 `GET /api/assets/scan` 拉回上次结果直接铺网格，不再回到空状态。
+
+**效果**：刷新→内存秒回；服务重启→磁盘缓存秒级；文件真变→只重 probe 变动的那几个；唯一全量成本是**首次冷扫描**（不可避免，仅一次）。缓存在 `Output/` 下，已被 gitignore 覆盖。
+
 ---
 
 ## 9. 任务系统与进程健壮性
@@ -302,6 +319,7 @@ shot_point.json（多源 clip 各带 video_path）
 | 视频分析（本地轨） | `Output/analyzed/{sha256}@local/` | 本地重标 |
 | 片段 caption 断点 | `Output/analyzed/{hash}/captions/ckpt/*.json` | 随所属分析 |
 | 完成标记 | `Output/analyzed/{hash}/analysis_complete` | — |
+| 扫描元数据缓存 | `Output/asset_index/scan_cache.json` | 文件 (size, mtime) 变化自动重 probe；`_CACHE_VERSION` 升级作废 |
 | 注释索引（云端） | `Output/asset_index/annotations.json` | — |
 | 注释（本地轨） | `Output/asset_index/annotations_local.json` | — |
 | Immich 绑定 | `Output/asset_index/immich_map.json` | — |

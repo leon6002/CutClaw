@@ -618,7 +618,9 @@ def generate_shot_plan(
                         .get('scene_summary', '')
                     )
                     if scene_summary:
-                        scene_descriptions.append(f"Scene {scene_idx}: {scene_summary}")
+                        _ct = scene_data.get('capture_time')
+                        _when = f" (shot at {_ct.replace('T', ' ')})" if _ct else ""
+                        scene_descriptions.append(f"Scene {scene_idx}{_when}: {scene_summary}")
                 except Exception:
                     pass
         related_video_context = "\n".join(scene_descriptions)

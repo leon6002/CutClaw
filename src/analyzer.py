@@ -768,12 +768,18 @@ def merge_scene_summaries(
 
     Returns a flat list of scene dicts sorted by source order.
     """
+    from src.utils.capture_time import get_capture_time, scene_capture_time
+    from src.utils.time_format_convert import hhmmss_to_seconds as _to_sec
+
     all_scenes: list[dict] = []
     for ch in content_hashes:
         cache_dir = get_analysis_path(ch)
         summaries_dir = os.path.join(cache_dir, "captions", "scene_summaries_video")
         if not os.path.isdir(summaries_dir):
             continue
+        md = _load_metadata(cache_dir) or {}
+        # journey chronology: recording start of THIS source (filename/metadata)
+        src_capture = get_capture_time(md.get("absolute_path") or md.get("file_name") or "")
         for fn in sorted(os.listdir(summaries_dir)):
             if not fn.endswith(".json"):
                 continue
@@ -784,6 +790,14 @@ def merge_scene_summaries(
             except Exception:
                 continue
             scene["_source_hash"] = ch
+            if src_capture is not None:
+                try:
+                    _off = _to_sec(str((scene.get("time_range") or {}).get("start_seconds", 0)))
+                except Exception:  # noqa: BLE001
+                    _off = 0.0
+                _ct = scene_capture_time(src_capture, _off)
+                if _ct is not None:
+                    scene["capture_time"] = _ct.strftime("%Y-%m-%dT%H:%M:%S")
             all_scenes.append(scene)
     return all_scenes
 
