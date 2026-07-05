@@ -101,6 +101,18 @@ def _sw_state(event: str):
         pass
 
 
+def _sw_stage(label: str):
+    """Coarse 'which sub-step' label for the screenwriter phase (音乐段→结构→
+    分镜→开场白→保存). Surfaced on the canvas so the phase isn't a black box
+    between LLM calls. Separate 'stage' event — does NOT pollute the LLM call
+    trace / prompt-reply workbench."""
+    try:
+        from src.utils.progress import emit_progress
+        emit_progress("screenwriter_llm", 1, 0, "stage", note=label)
+    except Exception:
+        pass
+
+
 def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
     """Call the agent LLM via litellm. Returns content string or None on failure."""
     import time as _time
@@ -392,9 +404,15 @@ def filter_sub_segments_by_range(
 
 def check_scene_distribution(
     structure_proposal: dict,
-    total_scene_count: int,
+    available_ids: list[int],
 ) -> tuple[bool, str]:
-    """Validate basic structure of the scene proposal (flat format).
+    """Validate the scene proposal against the scenes the model was ACTUALLY
+    shown (`available_ids` — sparse: skipped/low-importance scenes leave gaps).
+
+    The previous version compared against a dense 0..N-1 range derived from the
+    raw file count, so with usable ids like [1, 2] it demanded coverage of
+    "scenes 0/3" the model never saw → unsatisfiable → the Screenwriter burned
+    every retry. Everything here is now keyed to the real available ids.
 
     Returns (passed, feedback_message).
     """
@@ -405,50 +423,54 @@ def check_scene_distribution(
     if not related_scenes:
         return False, "No related_scenes found in proposal."
 
-    min_scenes = min(8, total_scene_count)
-    if len(related_scenes) < min_scenes:
-        return False, (
-            f"Too few scenes selected: {len(related_scenes)}. "
-            f"Need at least {min_scenes} scenes (out of {total_scene_count} available). "
-            f"Please select more diverse scenes."
-        )
+    avail = sorted({int(s) for s in available_ids})
+    avail_set = set(avail)
+    total = len(avail)
+    if total == 0:
+        return False, "No usable scenes available."
 
-    if len(related_scenes) > 15:
-        pass  # allow but don't warn
-
+    # every pick must be a scene the model was actually shown
     for scene_id in related_scenes:
         if not isinstance(scene_id, int):
             return False, f"Invalid scene index (not an integer): {scene_id}"
-        if scene_id < 0:
-            return False, f"Invalid scene index (negative): {scene_id}"
-        if scene_id >= total_scene_count:
-            return False, f"Scene index {scene_id} exceeds total scene count ({total_scene_count})"
+        if scene_id not in avail_set:
+            return False, (f"Scene index {scene_id} is not an available scene. "
+                           f"Select ONLY from these scene ids: {avail}.")
 
-    # Distribution check: all three thirds must have at least one scene
-    third = max(1, total_scene_count // 3)
-    early  = [s for s in related_scenes if s < third]
-    middle = [s for s in related_scenes if third <= s < 2 * third]
-    late   = [s for s in related_scenes if s >= 2 * third]
-    missing = []
-    if not early:
-        missing.append(f"early section (scenes 0–{third - 1})")
-    if not middle:
-        missing.append(f"middle section (scenes {third}–{2 * third - 1})")
-    if not late:
-        missing.append(f"late section (scenes {2 * third}–{total_scene_count - 1})")
-    if missing:
+    min_scenes = min(8, total)
+    if len(related_scenes) < min_scenes:
         return False, (
-            f"Scene distribution is too concentrated. Missing coverage in: {', '.join(missing)}. "
-            f"Current selection: early={len(early)}, middle={len(middle)}, late={len(late)}. "
-            f"Please add scenes from the missing section(s)."
+            f"Too few scenes selected: {len(related_scenes)}. "
+            f"Need at least {min_scenes} picks (available scene ids: {avail}); "
+            f"reuse and spread across them."
         )
 
-    print(
-        f"[Scene Check] {len(related_scenes)} scenes selected "
-        f"(early={len(early)}, middle={len(middle)}, late={len(late)}). "
-        f"Indices: {related_scenes}"
-    )
-    return True, f"Scene selection looks good - {len(related_scenes)} scenes selected."
+    # Timeline spread over the ACTUAL available scenes (ids are chronological).
+    # ≥3 scenes: bucket the available ids into thirds BY POSITION (robust to
+    # sparse ids) and require a pick from each. <3 scenes: just require every
+    # available scene is used — no three-thirds split is possible or meaningful.
+    used = set(related_scenes)
+    if total >= 3:
+        c1, c2 = total // 3, (2 * total) // 3
+        groups = {"early": avail[:c1], "middle": avail[c1:c2], "late": avail[c2:]}
+        missing = [name for name, g in groups.items() if g and not (used & set(g))]
+        if missing:
+            return False, (
+                "Scene distribution is too concentrated. Missing coverage in: "
+                + ", ".join(f"{name} section (scene ids {groups[name]})" for name in missing)
+                + f". Available scene ids: {avail}. Add a pick from each missing section."
+            )
+    else:
+        unused = [s for s in avail if s not in used]
+        if unused:
+            return False, (
+                f"Only {total - len(unused)}/{total} available scenes used — "
+                f"include scene id(s) {unused} too so the montage isn't stuck on one location."
+            )
+
+    print(f"[Scene Check] {len(related_scenes)} picks over {total} available scenes "
+          f"{avail}; used {sorted(used)}.")
+    return True, f"Scene selection looks good - {len(related_scenes)} picks across {total} scenes."
 
 
 def generate_structure_proposal(
@@ -461,8 +483,11 @@ def generate_structure_proposal(
     main_character: A[str | None, D("Name of the main character to focus on.")] = None,
 ) -> str | None:
     """Generate a structure proposal for the video editing based on scene summaries."""
-    video_summary, scene_count = load_scene_summaries(video_scene_path)
-    max_scene_index = scene_count - 1 if scene_count > 0 else 0
+    video_summary, usable_ids = load_scene_summaries(video_scene_path)
+    scene_count = len(usable_ids)
+    # ids are SPARSE (skipped scenes leave gaps) — the model must select from the
+    # exact ids it was shown, not a dense 0..N-1 range.
+    max_scene_index = max(usable_ids) if usable_ids else 0
 
     if isinstance(audio_caption_path, str):
         with open(audio_caption_path, 'r', encoding='utf-8') as f:
@@ -512,6 +537,7 @@ def generate_structure_proposal(
     prompt = GENERATE_STRUCTURE_PROPOSAL_PROMPT
     prompt = prompt.replace("TOTAL_SCENE_COUNT_PLACEHOLDER", str(scene_count))
     prompt = prompt.replace("MAX_SCENE_INDEX_PLACEHOLDER", str(max_scene_index))
+    prompt = prompt.replace("AVAILABLE_SCENE_IDS_PLACEHOLDER", str(usable_ids))
     prompt = prompt.replace("VIDEO_SUMMARY_PLACEHOLDER", video_summary)
     prompt = prompt.replace("AUDIO_SUMMARY_PLACEHOLDER", audio_summary)
     prompt = prompt.replace("AUDIO_STRUCTURE_PLACEHOLDER", audio_structure)
@@ -534,7 +560,7 @@ def generate_structure_proposal_with_retry(
     main_character: str | None = None,
 ) -> str | None:
     """Generate structure proposal with basic validation and retry."""
-    _, scene_count = load_scene_summaries(video_scene_path)
+    _, usable_ids = load_scene_summaries(video_scene_path)
     content = generate_structure_proposal(
         video_scene_path, audio_caption_path, user_instruction,
         selected_start_str, selected_end_str, main_character=main_character,
@@ -553,7 +579,7 @@ def generate_structure_proposal_with_retry(
                 )
                 continue
 
-            passed, last_feedback = check_scene_distribution(parsed, scene_count)
+            passed, last_feedback = check_scene_distribution(parsed, usable_ids)
             if passed:
                 return content
 
@@ -658,16 +684,27 @@ def generate_shot_plan(
                         f"- {m['id']} | scene {m.get('scene', '?')} | "
                         f"{m['start']:.1f}-{m['end']:.1f}s ({m['duration']:.1f}s) | "
                         f"quality {m.get('score', 0) * 10:.1f}/10{_v}{_t} | {m.get('desc', '')[:160]}")
+                _n_voice = sum(1 for m in _cands if m.get("sound"))
+                _voice_rule = (
+                    f"- {_n_voice} moment(s) are marked REAL VOICES (companions talking/laughing in "
+                    "the original audio — the renderer ducks the music and lets them play). These are "
+                    "the emotional core of a memory montage: you MUST anchor at least "
+                    f"{min(2, _n_voice)} shot(s) on REAL VOICES moments.\n" if _n_voice else "")
                 anchors_block = (
                     "\n\n[CURATED REAL MOMENTS — measured from the actual footage]\n"
-                    "Build every shot on ONE of these real moments whenever possible: describe THAT "
-                    "moment's visible imagery in \"content\", set \"related_scene\" to the moment's "
-                    "scene, and ADD a field \"anchor_id\" (the moment's id) to that shot's JSON object. "
-                    "quality is MEASURED (blur/shake + content), REAL VOICES means the original audio "
-                    "there carries voices/laughter — the renderer lets them play through, so strongly "
-                    "prefer such moments. Capture times give the journey order. Never assign the same "
-                    "moment to two shots. Set \"anchor_id\": null ONLY when no listed moment fits the "
-                    "music segment at all.\n" + "\n".join(_lines)
+                    "MANDATORY RULES:\n"
+                    "- EVERY shot MUST carry an \"anchor_id\" field naming one moment from the list "
+                    "below. Anchoring is the DEFAULT, not the exception — these are the best real "
+                    "moments this footage has; your job is to ARRANGE them to fit the music, not to "
+                    "imagine better ones.\n"
+                    "- Describe the CHOSEN moment's visible imagery in \"content\" and set "
+                    "\"related_scene\" to the moment's scene.\n"
+                    "- Never assign the same moment to two shots.\n"
+                    + _voice_rule +
+                    "- \"anchor_id\": null is allowed ONLY when every listed moment is already used "
+                    "or truly none fits the segment — scarcity is the only excuse, not preference.\n"
+                    "quality is MEASURED (blur/shake + content). Capture times give the journey order.\n"
+                    + "\n".join(_lines)
                 )
     prompt = prompt + anchors_block
 
@@ -744,9 +781,27 @@ def _check_scene_load(shot_plan: dict, scene_folder_path: str | None) -> tuple[b
             over.append(f"scene {sc}: {n} shots totaling {secs:.1f}s but only {cap:.0f}s of footage "
                         f"exists (budget {cap * 0.7:.0f}s)")
     if over:
-        spare = sorted(((sc, d) for sc, d in scene_dur.items()
+        # Only scenes the plan actually references are valid redistribution
+        # targets — suggesting an unreferenced (likely skipped/low-importance)
+        # scene just feeds the model a scene it can't use. Budget over those too.
+        usable = {sc: scene_dur[sc] for sc in load if sc in scene_dur}
+        spare = sorted(((sc, d) for sc, d in usable.items()
                         if load.get(sc, [0, 0.0])[1] < d * 0.4), key=lambda x: -x[1])
-        hint = ", ".join(f"scene {sc} ({d:.0f}s free)" for sc, d in spare[:4]) or "none"
+        # Retrying only helps if there's somewhere to move shots TO. When the
+        # total requested shot-seconds already exceed the referenced scenes'
+        # budget (Σ 0.7·footage), or no scene is under-used, no redistribution
+        # can satisfy the per-scene cap — the material is simply too thin for the
+        # target. Retrying then just burns 80s+ reasoning calls and lands on the
+        # same over-subscribed plan anyway. Accept it; the orchestrator capacity
+        # guard + deterministic fallback rebalance what they can at dispatch.
+        total_budget = sum(d * 0.7 for d in usable.values())
+        total_requested = sum(secs for _n, secs in load.values())
+        if total_requested > total_budget or not spare:
+            print(f"⚖️ [Screenwriter] scene over-subscription is material-limited "
+                  f"(requested {total_requested:.0f}s vs budget {total_budget:.0f}s, "
+                  f"spare scenes: {len(spare)}) — accepting instead of retrying")
+            return True, "ok (material-limited)"
+        hint = ", ".join(f"scene {sc} ({d:.0f}s free)" for sc, d in spare[:4])
         return False, ("Scene over-subscription: " + "; ".join(over)
                        + f". Redistribute shots to under-used scenes: {hint}. "
                        f"Never assign more shot-seconds to a scene than ~70% of its footage.")
@@ -1313,6 +1368,7 @@ class Screenwriter:
                         f"⚠️  [Screenwriter] Existing shot plan is missing hook_dialogue. "
                         f"Retrying hook dialogue selection for {self.output_path}..."
                     )
+                    _sw_stage("补全开场对白")
                     existing_output = refresh_hook_dialogue_in_shot_plan(
                         self.output_path,
                         self.subtitle_path,
@@ -1323,9 +1379,11 @@ class Screenwriter:
                     print(f"💾 [Screenwriter] Updated hook dialogue saved to {self.output_path}")
                     return existing_output
                 else:
+                    _sw_stage("复用已有分镜")
                     return existing_output
 
         # Step 1: Select the audio segment first
+        _sw_stage("选择音乐段落")
         selected_start_str, selected_end_str = select_audio_segment(self.audio_db, instruction)
 
         print(
@@ -1334,6 +1392,7 @@ class Screenwriter:
         )
 
         # Step 2: Generate structure proposal scoped to the selected audio segment
+        _sw_stage("生成结构提案")
         structure_proposal = generate_structure_proposal_with_retry(
             self.video_scene_path, self.audio_caption_path, instruction,
             selected_start_str=selected_start_str,
@@ -1379,6 +1438,7 @@ class Screenwriter:
                 segment_name = sec.get('name', segment_name)
                 break
 
+        _sw_stage("生成分镜脚本")
         shot_plan = generate_shot_plan_with_retry(
             selected_sub_segments,
             structure_proposal,
@@ -1404,6 +1464,7 @@ class Screenwriter:
                 "video_structure": [{**structure_proposal, "shot_plan": shot_plan}]
             }
             try:
+                _sw_stage("挑选开场对白")
                 hook_dialogue = select_hook_dialogue(
                     self.subtitle_path,
                     partial_output,
@@ -1440,6 +1501,7 @@ class Screenwriter:
         }
 
         print("\n✅ [Screenwriter] Short video shot plan generated successfully!")
+        _sw_stage("保存分镜脚本")
 
         if self.output_path:
             os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
