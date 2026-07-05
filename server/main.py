@@ -888,6 +888,156 @@ def _materialize_immich_originals(abs_point: str) -> tuple[str, list[str]]:
     return swapped, notes
 
 
+# ── Local VLM / GPU panel ───────────────────────────────────────────────────
+# Manual, observable control over the local model: is the GPU actually in
+# use, is the model resident in VRAM, how long does a real call take.
+
+_OLLAMA = "http://127.0.0.1:11434"
+
+
+def _ollama_req(path: str, method: str = "GET", body: dict | None = None, timeout: int = 600):
+    import urllib.request
+    req = urllib.request.Request(
+        _OLLAMA + path, method=method,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+
+@app.get("/api/local/gpu")
+def local_gpu():
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode != 0:
+            return {"ok": False, "error": r.stderr[:200]}
+        name, util, mu, mt, temp = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+        return {"ok": True, "name": name, "util": int(util),
+                "mem_used_mb": int(mu), "mem_total_mb": int(mt), "temp": int(temp)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.get("/api/local/ollama")
+def local_ollama():
+    try:
+        tags = _ollama_req("/api/tags", timeout=5)
+        ps = _ollama_req("/api/ps", timeout=5)
+        loaded = {m.get("name"): m for m in (ps.get("models") or [])}
+        models = []
+        for m in (tags.get("models") or []):
+            nm = m.get("name", "")
+            ld = loaded.get(nm)
+            models.append({
+                "name": nm,
+                "size_gb": round((m.get("size") or 0) / 1e9, 1),
+                "loaded": bool(ld),
+                "vram_gb": round((ld.get("size_vram") or 0) / 1e9, 1) if ld else None,
+                "until": (ld or {}).get("expires_at", ""),
+            })
+        return {"ok": True, "models": models}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Ollama 未运行? {str(e)[:150]}"}
+
+
+class OllamaModelReq(BaseModel):
+    model: str
+    keep_alive: str = "2h"
+
+
+@app.post("/api/local/ollama/load")
+def local_ollama_load(body: OllamaModelReq):
+    t0 = time.time()
+    try:
+        _ollama_req("/api/generate", "POST",
+                    {"model": body.model, "prompt": "", "keep_alive": body.keep_alive},
+                    timeout=600)
+        return {"ok": True, "seconds": round(time.time() - t0, 1),
+                "message": f"模型已加载并常驻 {body.keep_alive}"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/api/local/ollama/unload")
+def local_ollama_unload(body: OllamaModelReq):
+    try:
+        _ollama_req("/api/generate", "POST",
+                    {"model": body.model, "prompt": "", "keep_alive": 0}, timeout=60)
+        return {"ok": True, "message": "已请求卸载（VRAM 将在数秒内释放）"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/api/local/ollama/test")
+def local_ollama_test(body: OllamaModelReq):
+    """One REAL single-frame vision call with timing + GPU snapshots, so the
+    user can verify the card is doing the work."""
+    import base64
+    import glob as _g
+    # test frame: reuse a cached asset thumbnail; else a generated color frame
+    frame = None
+    for f in _g.glob(os.path.join(PROJECT_ROOT, "Output", "asset_index", "thumbs", "*.jpg")):
+        frame = f
+        break
+    if frame is None:
+        import subprocess
+        frame = os.path.join(PROJECT_ROOT, "Output", "asset_index", "vlm_test.jpg")
+        subprocess.run(["ffmpeg", "-y", "-v", "quiet", "-f", "lavfi",
+                        "-i", "testsrc2=size=426x240:d=1", "-frames:v", "1", frame],
+                       capture_output=True, timeout=30)
+    b64 = base64.b64encode(open(frame, "rb").read()).decode()
+    gpu_before = local_gpu()
+    t0 = time.time()
+    try:
+        r = _ollama_req("/v1/chat/completions", "POST", {
+            "model": body.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe this frame in one sentence for a video editor."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}],
+            "max_tokens": 100, "temperature": 0.0,
+        }, timeout=600)
+        dt = round(time.time() - t0, 2)
+        gpu_after = local_gpu()
+        reply = ((r.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        return {"ok": True, "seconds": dt, "reply": reply[:300],
+                "gpu_before": gpu_before, "gpu_after": gpu_after}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200], "seconds": round(time.time() - t0, 2)}
+
+
+@app.get("/api/local/vlm-stats")
+def local_vlm_stats(model: str = ""):
+    """Recent real VLM call latencies from the LLM call logs."""
+    import glob as _g
+    files = sorted(_g.glob(os.path.join(PROJECT_ROOT, "Output", "logs", "llm_calls_*.jsonl")),
+                   key=os.path.getmtime)[-2:]
+    lat = []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if model and model.split("/")[-1] not in str(d.get("model", "")):
+                        continue
+                    v = d.get("latency_s")
+                    if isinstance(v, (int, float)):
+                        lat.append(float(v))
+        except Exception:
+            continue
+    lat = lat[-50:]
+    return {"count": len(lat),
+            "avg_s": round(sum(lat) / len(lat), 2) if lat else None,
+            "last_s": round(lat[-1], 2) if lat else None}
+
+
 # ── Assets ──────────────────────────────────────────────────────────────────
 
 def _dump(model) -> dict:

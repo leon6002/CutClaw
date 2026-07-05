@@ -24,6 +24,7 @@ import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
+import LocalGpuPanel from "../components/LocalGpuPanel";
 import type { ProjectState } from "../App";
 
 const SELECT_STEPS = [
@@ -1152,6 +1153,8 @@ export default function AssetsView({
               </p>
             </div>
           )}
+
+      <LocalGpuPanel />
 
       {/* ── source tabs: local folder vs Immich library (full-page, no drawer) ── */}
       <div className="mt-4 flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-1" style={{ width: "fit-content" }}>
