@@ -1222,10 +1222,21 @@ def caption_audio_with_madmom_segments(
     _bar_gaps = [b - a for a, b in zip(_db_times, _db_times[1:]) if 0.8 <= b - a <= 8.0]
     _bar = _stats.median(_bar_gaps) if len(_bar_gaps) >= 4 else 0.0
     if _bar > 0:
-        _fast_len = min(max(_bar, _MIN_CUT), _MAX_HOLD)                 # peak: 1 bar
-        _slow_len = min(max(2.0 * _bar, _fast_len + 0.5), _MAX_HOLD)    # calm: 2 bars
-        print(f"\n🎚️  [Pacing] bar ≈ {_bar:.2f}s (≈{240.0 / _bar:.0f} BPM) → "
-              f"shots {_fast_len:.1f}s (peak, 1 bar) … {_slow_len:.1f}s (calm, 2 bars)")
+        # 卡点原则：节拍是切点的 GRID（cuts land ON beats），不是节拍器
+        # （the music must NOT dictate cut FREQUENCY). How many bars a shot
+        # holds depends on the track's overall intensity: a fast, dynamic
+        # track cuts at ~1 bar on peaks, but a mellow ballad's "peak" is
+        # still gentle — hold 2 bars there and up to 4 when calm, or a
+        # travel-memory montage turns into dizzying sub-2s confetti.
+        _felt = 240.0 / _bar
+        _tempo_part = min(1.0, max(0.0, (_felt - 70.0) / 70.0))   # 70bpm→0, 140bpm→1
+        _intensity = 0.6 * _tempo_part + 0.4 * _pace_conf
+        _anchor = 2.0 - _intensity            # frantic → 1 bar, mellow → 2 bars
+        _fast_len = min(max(_anchor * _bar, _MIN_CUT), _MAX_HOLD)
+        _slow_len = min(max(2.0 * _anchor * _bar, _fast_len + 0.5), _MAX_HOLD)
+        print(f"\n🎚️  [Pacing] bar ≈ {_bar:.2f}s (≈{_felt:.0f} BPM felt) · "
+              f"intensity {_intensity:.2f} → anchor {_anchor:.1f} bar(s) → "
+              f"shots {_fast_len:.1f}s (peak) … {_slow_len:.1f}s (calm)")
     else:
         _fast_len, _slow_len = _MIN_CUT, _MAX_HOLD                      # no beat grid → legacy
         print(f"\n🎚️  [Pacing] no reliable beat grid — energy-relative range "

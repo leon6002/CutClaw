@@ -645,16 +645,29 @@ def analyze_audio(
 
     if os.path.exists(caption_path) and not force:
         old_sig = None
+        has_facts = False
+        try:
+            with open(caption_path, "r", encoding="utf-8") as f:
+                has_facts = bool(json.load(f).get("facts"))
+        except Exception:
+            pass
         try:
             with open(os.path.join(cache_dir, "metadata.json"), "r", encoding="utf-8") as f:
                 old_sig = json.load(f).get("caption_params")
         except Exception:
             pass
-        # old_sig is None for legacy caches (params unknown) — grandfather them
-        if old_sig is None or old_sig == params_sig:
+        if not has_facts:
+            # pre-facts-layer cache: sections/energy were LLM guesses with no
+            # measured tempo — pacing built on that produced frantic cuts on
+            # mellow tracks (poisoned format, never reuse)
+            print(f"🔁 [Analyze] Audio cache is pre-facts-layer (no measured tempo) — "
+                  f"re-analyzing {os.path.basename(audio_path)}...")
+        elif old_sig is None or old_sig == params_sig:
+            # old_sig is None for legacy caches (params unknown) — grandfather them
             print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
             return content_hash
-        print(f"🔁 [Analyze] Segment params changed ({old_sig} → {params_sig}), re-analyzing audio captions...")
+        else:
+            print(f"🔁 [Analyze] Segment params changed ({old_sig} → {params_sig}), re-analyzing audio captions...")
 
     os.makedirs(cache_dir, exist_ok=True)
 
