@@ -559,6 +559,33 @@ def annotate_asset(
     )
 
 
+def _annotate_video_in_process(meta, model, endpoint, api_key, q=None):
+    """Child-process entry point: annotate ONE video end-to-end.
+
+    Separate processes (not threads) because decord readers are not
+    thread-safe and the GIL serializes CPU-bound decode anyway. Stage events
+    stream back to the parent through the queue for live per-card UI."""
+    try:
+        if q is not None:
+            try:
+                q.put({"type": "begin", "file": meta.file_name, "hash": meta.content_hash})
+            except Exception:
+                pass
+
+        def _cb(stage, status, detail):
+            if q is not None:
+                try:
+                    q.put({"type": "stage", "file": meta.file_name, "hash": meta.content_hash,
+                           "stage": stage, "status": status, "detail": str(detail or "")[:80]})
+                except Exception:
+                    pass
+        return annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key,
+                              progress_callback=_cb)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
 def batch_annotate(
     new_assets: list,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -602,15 +629,70 @@ def batch_annotate(
             except Exception:
                 pass
 
-    # Videos: sequential
-    for meta in videos:
-        _starting(meta.file_name)
+    # Videos: parallel PROCESSES when configured (decord isn't thread-safe and
+    # the GIL blocks CPU-bound threads — processes give true file-level
+    # parallelism); sequential fallback otherwise.
+    try:
+        from src import config as _cfg
+        _video_workers = max(1, int(getattr(_cfg, "ANNOTATE_VIDEO_WORKERS", 1) or 1))
+    except Exception:
+        _video_workers = 1
+
+    if videos and _video_workers > 1 and len(videos) > 1:
+        import multiprocessing as _mp
+        import threading as _threading
+        from concurrent.futures import ProcessPoolExecutor as _PPE
+
+        _mgr = _mp.Manager()
+        _q = _mgr.Queue()
+        _stop = _threading.Event()
+
+        def _drain():
+            while not (_stop.is_set() and _q.empty()):
+                try:
+                    ev = _q.get(timeout=0.5)
+                except Exception:
+                    continue
+                try:
+                    if ev.get("type") == "begin":
+                        _starting(ev.get("file", ""))
+                    elif ev.get("type") == "stage" and stage_callback:
+                        try:
+                            stage_callback(ev["stage"], ev["status"], ev["detail"],
+                                           filename=ev.get("file"))
+                        except TypeError:
+                            stage_callback(ev["stage"], ev["status"], ev["detail"])
+                except Exception:
+                    pass
+
+        _dt = _threading.Thread(target=_drain, daemon=True)
+        _dt.start()
+        print(f"[AssetAnnotator] Annotating {len(videos)} videos in {min(_video_workers, len(videos))} parallel processes")
         try:
-            result = annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key, progress_callback=stage_callback)
-            results.append(result)
-        except Exception as e:
-            print(f"[AssetAnnotator] Failed to annotate video {meta.file_name}: {e}")
-        _report(meta.file_name)
+            with _PPE(max_workers=min(_video_workers, len(videos))) as _ex:
+                _futs = {_ex.submit(_annotate_video_in_process, m, model, endpoint, api_key, _q): m
+                         for m in videos}
+                for _fut in as_completed(_futs):
+                    _m = _futs[_fut]
+                    try:
+                        _r = _fut.result()
+                        if _r is not None:
+                            results.append(_r)
+                    except Exception as e:
+                        print(f"[AssetAnnotator] video worker failed for {_m.file_name}: {e}")
+                    _report(_m.file_name)
+        finally:
+            _stop.set()
+            _dt.join(timeout=3)
+    else:
+        for meta in videos:
+            _starting(meta.file_name)
+            try:
+                result = annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key, progress_callback=stage_callback)
+                results.append(result)
+            except Exception as e:
+                print(f"[AssetAnnotator] Failed to annotate video {meta.file_name}: {e}")
+            _report(meta.file_name)
 
     # Images: parallel in small batches
     if images:

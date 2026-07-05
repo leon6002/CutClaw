@@ -17,9 +17,9 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615120557_0642_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615165651_0680_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260619162056_0786_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
-AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\马也_Crabbit - 海屿你.mp3"
-INSTRUCTION = "将栈道漫步、营地航拍和花海奔跑串联，以动态镜头语言呈现一段前往旷野的青春旅行记录。"
+VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615165651_0680_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
+AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\Judah Earl - Sand Drawing.mp3"
+INSTRUCTION = "剥离杂音，仅留弦乐与山谷回响，让栈道云海和蜿蜒河流徐徐展开，坠入自然梦境。"
 SRT_PATH = ""
 
 
@@ -187,6 +187,12 @@ VIDEO_ANALYSIS_API_KEY = "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL"
 
 CAPTION_BATCH_SIZE = 64
 # Batch size for parallel clip captioning/analysis.
+
+ANNOTATE_VIDEO_WORKERS = 2
+# Videos annotated in parallel during batch annotation (separate PROCESSES —
+# decord isn't thread-safe and the GIL blocks CPU-bound threads). Each worker
+# owns one video end-to-end. Cap is effectively the VLM provider's rate limit;
+# 2-3 is a good balance on a strong desktop.
 
 SCENE_ANALYSIS_MIN_FRAMES = 6
 # Minimum number of sampled frames per scene.
@@ -361,8 +367,8 @@ AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 55.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 65.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 95.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 105.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3

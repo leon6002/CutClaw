@@ -143,6 +143,54 @@ def _save_sampled_frames_to_disk(
     return saved_paths
 
 
+# Cached availability of CUDA decode — probe once per process, not per video.
+_GPU_PROXY_OK: dict = {"ok": None}
+
+
+def _try_gpu_detect_proxy(video_path: str, frames_dir: str) -> Optional[str]:
+    """Build a small 432p proxy using NVDEC (GPU) decode for shot detection.
+
+    Measured on a 4K HEVC drone clip: NVDEC decode+proxy = 6.2s per 30s of
+    footage vs 34.8s pure CPU (5.6×). Detection then runs on the tiny proxy
+    (identical frame count via -fps_mode passthrough, so frame numbers map
+    1:1 back to the source). Returns None when CUDA decode is unavailable —
+    caller falls back to detecting on the source directly.
+    """
+    if _GPU_PROXY_OK["ok"] is False:
+        return None
+    proxy = os.path.join(frames_dir, "detect_proxy.mp4")
+    if os.path.exists(proxy) and os.path.getsize(proxy) > 0:
+        return proxy
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        return None
+    _ensure_dir(frames_dir)
+    # nvenc first (nearly free when the driver supports it), else CPU x264 —
+    # encoding a 432p stream is cheap; the win is the GPU DECODE of 4K source.
+    for enc in (["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "33"],
+                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28"]):
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-hwaccel", "cuda", "-i", video_path,
+                 "-vf", "scale=-2:432", "-an", "-fps_mode", "passthrough", *enc, proxy],
+                capture_output=True, timeout=900,
+            )
+            if r.returncode == 0 and os.path.exists(proxy) and os.path.getsize(proxy) > 0:
+                _GPU_PROXY_OK["ok"] = True
+                return proxy
+        except Exception:
+            pass
+    _GPU_PROXY_OK["ok"] = False
+    print("[SceneDetect] CUDA decode unavailable — detecting on source directly")
+    try:
+        if os.path.exists(proxy):
+            os.unlink(proxy)
+    except Exception:
+        pass
+    return None
+
+
 def _run_scenedetect(
     video_path: str,
     threshold: float,
@@ -310,9 +358,16 @@ def scenedetect_extract_and_detect(
         scene_list = None  # will load from file below
     else:
         print(f"[SceneDetect] Running PySceneDetect (frame_skip={frame_skip}, num_workers={num_workers})")
+        # GPU-decoded 432p proxy: frame count is identical (fps passthrough),
+        # so detected frame numbers map 1:1 to the source.
+        _detect_src = video_path
+        _proxy = _try_gpu_detect_proxy(video_path, frames_dir)
+        if _proxy:
+            print("[SceneDetect] Detecting on GPU-decoded 432p proxy (NVDEC)")
+            _detect_src = _proxy
         if num_workers > 1:
             scene_list = _run_scenedetect_parallel(
-                video_path,
+                _detect_src,
                 threshold,
                 min_scene_len,
                 end_frame,
@@ -321,7 +376,7 @@ def scenedetect_extract_and_detect(
             )
         else:
             scene_list = _run_scenedetect(
-                video_path,
+                _detect_src,
                 threshold,
                 min_scene_len,
                 end_frame if max_minutes is not None else None,

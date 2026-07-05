@@ -599,6 +599,8 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
   const doneN = order.filter((h) => files[h] === "d").length;
   const stages: Record<string, string> = meta.file_stages ?? {};
   const hasStages = Object.keys(stages).length > 0;
+  const sbh: Record<string, { stage?: string; detail?: string }> = meta.stage_by_hash ?? {};
+  const parallelRows = order.filter((h) => files[h] === "r" && sbh[h]?.stage);
 
   return (
     <div className="mt-3 rounded-xl border border-white/[0.06] bg-black/20 px-3.5 py-3">
@@ -623,8 +625,24 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
         </span>
       </div>
 
-      {/* ② stage stepper for the CURRENT file */}
-      {hasStages && (
+      {/* ②a parallel mode: one stage line per running file */}
+      {parallelRows.length > 0 && (
+        <div className="mt-2.5 space-y-1">
+          {parallelRows.map((h) => (
+            <div key={h} className="flex items-center gap-2 text-[11px]">
+              <Loader2 className="h-3 w-3 shrink-0 animate-spin text-cyan-400" />
+              <span className="min-w-0 flex-1 truncate text-slate-300">{names[h] || h}</span>
+              <span className="shrink-0 text-cyan-300">
+                {STAGE_LABELS[sbh[h]?.stage ?? ""] ?? sbh[h]?.stage}
+                {sbh[h]?.detail && /%$/.test(sbh[h]!.detail!) ? ` ${sbh[h]!.detail}` : ""}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ②b sequential mode: stage stepper for the CURRENT file */}
+      {parallelRows.length === 0 && hasStages && (
         <div className="mt-2.5 flex flex-wrap items-center gap-y-1">
           {ANN_STAGES.map(([k, label], i) => {
             const st = stages[k];
@@ -1020,8 +1038,8 @@ export default function AssetsView({
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
                   annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
                   queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
-                  annStage={annJob.meta.stage}
-                  annStageDetail={annJob.meta.stage_detail}
+                  annStage={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.stage || annJob.meta.stage}
+                  annStageDetail={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.detail || annJob.meta.stage_detail}
                   annBusy={busy}
                   onAnnotate={() => {
                     if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;

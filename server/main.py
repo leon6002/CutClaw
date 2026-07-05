@@ -662,9 +662,21 @@ def annotate(body: AnnotateRequest):
             from src.asset_manager.index_store import upsert_annotations
             from src.analyzer import analyze_video, analyze_audio
 
-            def _stage_cb(stage, status, detail):
+            def _stage_cb(stage, status, detail, filename=None):
                 # per-card stage line ("镜头检测 42% / 片段理解 …") — surfaced live
-                # on the running asset's card + the stage stepper
+                # on the running asset's card + the stage stepper.
+                # filename is set when videos annotate in PARALLEL processes:
+                # stages route per-hash instead of the single global stepper.
+                if filename:
+                    h = _name_to_hash.get(filename)
+                    if h:
+                        _sbh = job.meta.setdefault("stage_by_hash", {})
+                        if status in ("start", "progress"):
+                            _sbh[h] = {"stage": stage, "detail": str(detail or "")[:60]}
+                        else:
+                            _sbh[h] = {"stage": "", "detail": ""}
+                    job.add(f"[stage] {filename} · {stage} {status} {str(detail or '')[:80]}".rstrip())
+                    return
                 _fs = job.meta.setdefault("file_stages", {})
                 if status in ("start", "progress"):
                     _fs[stage] = "running"
@@ -704,6 +716,7 @@ def annotate(body: AnnotateRequest):
                     h = _name_to_hash.get(filename)
                     if h:
                         _files_state[h] = "d"
+                        (job.meta.get("stage_by_hash") or {}).pop(h, None)
                     job.meta.update({"current": current, "total": total})
                     job.add(f"[file] {current}/{total} {filename} done")
                 results = batch_annotate(targets, progress_callback=_file_cb,
