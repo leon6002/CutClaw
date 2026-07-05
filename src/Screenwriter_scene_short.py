@@ -725,6 +725,10 @@ def generate_shot_plan(
                     "- Describe the CHOSEN moment's visible imagery in \"content\" and set "
                     "\"related_scene\" to the moment's scene.\n"
                     "- Never assign the same moment to two shots.\n"
+                    "- VARIETY: CONSECUTIVE shots must not use moments that are near-identical — "
+                    "avoid picking two moments from the same source within ~20s of each other "
+                    "back-to-back (slow aerial glides especially look frozen when cut together). "
+                    "Alternate scenes/sources or jump forward in time between neighboring shots.\n"
                     + _voice_rule +
                     "- \"anchor_id\": null is allowed ONLY when every listed moment is already used "
                     "or truly none fits the segment — scarcity is the only excuse, not preference.\n"
@@ -850,12 +854,25 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         return
     used = set()
     n = 0
+    _prev = None   # (video_path, start) of the previous shot's anchor
     for shot in shot_plan.get("shots", []) or []:
         aid = shot.get("anchor_id")
         m = by_id.get(str(aid)) if aid else None
         if not m or aid in used:      # unknown or duplicated anchor → agent path
             shot.pop("anchor_id", None)
             continue
+        # variety guard: consecutive anchors from the SAME source within 20s
+        # look near-identical on screen (esp. slow aerials) — the film appears
+        # frozen. Strip the later anchor; the agent path + spacing rules will
+        # find something visually different.
+        if (_prev and not m.get("sound")
+                and m.get("video_path") == _prev[0]
+                and abs(float(m.get("start", 0)) - _prev[1]) < 20.0):
+            print(f"🎬 [Curation] anchor {aid} too similar to the previous shot "
+                  f"(same source, {abs(float(m.get('start', 0)) - _prev[1]):.0f}s apart) — agent will re-pick")
+            shot.pop("anchor_id", None)
+            continue
+        _prev = (m.get("video_path"), float(m.get("start", 0)))
         used.add(aid)
         shot["anchor"] = {
             "video_path": m.get("video_path", ""),

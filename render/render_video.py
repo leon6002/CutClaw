@@ -748,12 +748,20 @@ def _compute_duck_windows(clips, transitions, transition_duration) -> list:
         if not hl_cache[src]:
             continue
         s0, e0 = float(c.get("start_sec", 0.0)), float(c.get("end_sec", 0.0))
+        clip_out_s = pos[k]
+        clip_out_e = pos[k] + max(0.0, float(c.get("duration", e0 - s0)))
         for h in hl_cache[src]:
             ov_s = max(s0, float(h.get("start", 0)))
             ov_e = min(e0, float(h.get("end", 0)))
-            if ov_e - ov_s >= 0.5:
-                windows.append([round(pos[k] + (ov_s - s0), 2),
-                                round(pos[k] + (ov_e - s0), 2)])
+            # sub-second voice slivers aren't worth a duck dip — feels like a
+            # glitch, not a moment (user feedback)
+            if ov_e - ov_s < 1.0:
+                continue
+            # breathing room: open the duck slightly before the first word and
+            # close slightly after the last, clamped to this clip's span
+            w_s = max(clip_out_s, pos[k] + (ov_s - s0) - 0.4)
+            w_e = min(clip_out_e, pos[k] + (ov_e - s0) + 0.4)
+            windows.append([round(w_s, 2), round(w_e, 2)])
     windows.sort()
     merged: list = []
     for a, b in windows:
