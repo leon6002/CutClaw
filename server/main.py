@@ -1111,14 +1111,18 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
                 except Exception:
                     pass
     # measured voice/laughter segments in the ORIGINAL audio (may be absent
-    # for annotations that predate the feature — the UI offers on-demand detect)
-    shl = os.path.join(cache_dir, "sound_highlights.json")
-    if os.path.exists(shl):
-        try:
-            with open(shl, "r", encoding="utf-8") as f:
-                result["sound_highlights"] = json.load(f).get("segments", [])
-        except Exception:  # noqa: BLE001
-            result["sound_highlights"] = []
+    # for annotations that predate the feature — the UI offers on-demand
+    # detect). Signal-only, so any track's cache dir is equally valid.
+    for _d in (cache_dir, get_analysis_path(content_hash),
+               get_analysis_path(content_hash, "local")):
+        shl = os.path.join(_d, "sound_highlights.json")
+        if os.path.exists(shl):
+            try:
+                with open(shl, "r", encoding="utf-8") as f:
+                    result["sound_highlights"] = json.load(f).get("segments", [])
+            except Exception:  # noqa: BLE001
+                result["sound_highlights"] = []
+            break
     return result
 
 
@@ -1141,7 +1145,10 @@ def asset_sound_highlights(body: SoundHighlightRequest):
     abs_path = _resolve(body.path)
     if not os.path.isfile(abs_path):
         raise HTTPException(404, f"not found: {body.path}")
+    # highlights are signal-only — either annotation track's cache dir works
     cache_dir = get_analysis_path(body.content_hash)
+    if not os.path.isdir(cache_dir):
+        cache_dir = get_analysis_path(body.content_hash, "local")
     if not os.path.isdir(cache_dir):
         raise HTTPException(400, "该素材还没有分析缓存 — 先标注一次")
     from src.audio.sound_highlights import detect_sound_highlights
