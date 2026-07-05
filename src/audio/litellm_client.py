@@ -119,7 +119,11 @@ def _call_audio_api_sync(
         api_key=AUDIO_API_KEY,
         **({"api_base": AUDIO_BASE_URL} if AUDIO_BASE_URL else {}),
     )
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        # empty body counts as a failed call so tenacity retries it
+        raise ValueError(f"Empty response from audio API for {audio_path}")
+    return content
 
 
 def call_audio_api(
