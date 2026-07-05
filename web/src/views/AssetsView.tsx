@@ -244,7 +244,10 @@ function DetailSheet({
 
   return (
     <Sheet open onOpenChange={(o) => !o && onClose()}>
-      <SheetContent side="right" className="w-full overflow-y-auto border-white/10 bg-slate-950/95 p-5 backdrop-blur-xl sm:max-w-[920px]">
+      {/* NOTE: no backdrop-blur here — Chrome's backdrop-filter breaks hit
+          testing on nested <video> controls (same bug fixed in RenderView) */}
+      <SheetContent side="right" className="w-full overflow-y-auto border-white/10 bg-slate-950 p-5 sm:max-w-[920px]"
+        style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}>
         <SheetHeader className="p-0 pb-3">
           <SheetTitle className="flex flex-wrap items-center gap-2 pr-8 text-sm">
             <span className="truncate">{asset.file_name || asset.file_path}</span>
@@ -412,13 +415,15 @@ const STAGE_LABELS: Record<string, string> = {
   scene_merge: "场景合并", scene_analysis: "场景分析",
 };
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, annStage, annStageDetail, onAnnotate, annBusy }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, annBusy }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
   /** this exact asset is currently being annotated (hash-keyed job state) */
   annotating?: boolean;
   /** waiting in the current annotation batch */
   queued?: boolean;
+  /** queued via the server-side chain (clicked while another batch runs) */
+  queuedLocal?: boolean;
   /** current pipeline stage of THIS asset's annotation */
   annStage?: string;
   /** stage detail, e.g. "42%" during shot detection */
@@ -555,10 +560,10 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
               disabled={annBusy}
               onClick={(e) => { e.stopPropagation(); onAnnotate(); }}
             >
-              {annotating || (annBusy && queued)
+              {annotating || queued || queuedLocal
                 ? <Loader2 className="h-3 w-3 animate-spin" />
                 : a.annotated ? <RefreshCw className="h-3 w-3" /> : <Tags className="h-3 w-3" />}
-              {annotating ? "标注中…" : queued ? "排队中…" : a.annotated ? "重新标注" : "标注"}
+              {annotating ? "标注中…" : (queued || queuedLocal) ? "排队中…" : a.annotated ? "重新标注" : "标注"}
             </Button>
           )}
         </CardContent>
@@ -578,6 +583,37 @@ function Waveform({ seed }: { seed: string }) {
       {bars.map((h, i) => (
         <span key={i} className="w-[3px] rounded-full bg-cyan-500/45" style={{ height: `${h}%` }} />
       ))}
+    </div>
+  );
+}
+
+// ── concurrency setting field (reads/writes config.py via /api/config) ──────
+
+function ConcurrencyField({ k, label, hint }: { k: string; label: string; hint: string }) {
+  const [val, setVal] = useState("");
+  const [saved, setSaved] = useState(false);
+  useEffect(() => {
+    api<Record<string, string>>("/api/config")
+      .then((c) => setVal(String(c[k] ?? ""))).catch(() => {});
+  }, [k]);
+  const save = async (v: string) => {
+    setVal(v);
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 64) return;
+    try {
+      await api("/api/config", { method: "PUT", body: JSON.stringify({ values: { [k]: String(n) } }) });
+      setSaved(true); window.setTimeout(() => setSaved(false), 1500);
+    } catch { /* ignore */ }
+  };
+  return (
+    <div className="mb-1.5 flex items-center gap-2">
+      <span className="w-[110px] shrink-0 text-[11px] text-slate-400">{label}</span>
+      <Input
+        className="h-7 w-16 border-white/10 bg-black/25 text-center text-xs"
+        value={val} onChange={(e) => save(e.target.value)}
+      />
+      {saved ? <span className="text-[10.5px] text-emerald-400">✓ 已保存</span>
+        : <span className="truncate text-[10.5px] text-slate-600">{hint}</span>}
     </div>
   );
 }
@@ -753,6 +789,8 @@ export default function AssetsView({
 
   // reattach to jobs still running server-side after a page refresh
   const [interrupted, setInterrupted] = useState<{ unfinished: number } | null>(null);
+  // cards queued while another batch runs (server chains them automatically)
+  const [localQueued, setLocalQueued] = useState<Set<string>>(new Set());
   useEffect(() => {
     api<any>("/api/jobs/current/annotate")
       .then((r) => {
@@ -784,10 +822,11 @@ export default function AssetsView({
   const annotate = async (hashes: string[] = [], force = false) => {
     setError("");
     try {
-      const r = await api<{ job_id: string | null; message?: string }>("/api/assets/annotate", {
+      const r = await api<{ job_id: string | null; queued?: boolean; message?: string }>("/api/assets/annotate", {
         method: "POST", body: JSON.stringify({ content_hashes: hashes, force }),
       });
       if (r.job_id) setAnnJobId(r.job_id);
+      else if (r.queued) setLocalQueued((s0) => new Set([...s0, ...hashes]));
       else setError(r.message || "没有需要标注的素材。");
     } catch (e: any) { setError(e.message); }
   };
@@ -820,9 +859,16 @@ export default function AssetsView({
   }, [selJob.status]);
 
   useEffect(() => {
-    if (annJob.status === "done" && annJobId) {
+    if ((annJob.status === "done" || annJob.status === "error") && annJobId) {
       setAnnJobId(null);
+      setLocalQueued(new Set());
       scan();
+      // a queued request may have been chained into a fresh batch — attach
+      const t = window.setTimeout(() => {
+        api<any>("/api/jobs/current/annotate")
+          .then((r) => { if (r.job) setAnnJobId(r.job.id); }).catch(() => {});
+      }, 1500);
+      return () => window.clearTimeout(t);
     }
   }, [annJob.status]);
 
@@ -887,6 +933,11 @@ export default function AssetsView({
                     <RoleModelSelect role="agent" disabled={selecting} className="justify-between" />
                   </div>
                   <div className="mt-2 text-[11px] text-slate-600">视觉/音频用于标注 · Agent 用于智能选材</div>
+                  <div className="mt-3 border-t border-white/[0.07] pt-2.5">
+                    <div className="mb-1.5 text-xs font-semibold text-slate-300">并发设置</div>
+                    <ConcurrencyField k="ANNOTATE_VIDEO_WORKERS" label="并行标注文件数" hint="进程级并行，2-4；上限看 API 限流" />
+                    <ConcurrencyField k="CAPTION_BATCH_SIZE" label="VLM 并发调用数" hint="片段/密集/场景分析的并发上限" />
+                  </div>
                 </div>
               )}
               {moreOpen && (
@@ -1062,7 +1113,13 @@ export default function AssetsView({
                   queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
                   annStage={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.stage || annJob.meta.stage}
                   annStageDetail={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.detail || annJob.meta.stage_detail}
-                  annBusy={busy}
+                  annBusy={
+                    // only the card's OWN activity blocks its button — other
+                    // cards stay clickable and join the queue mid-batch
+                    (busy && (annJob.meta.files ?? {})[a.content_hash] !== undefined)
+                    || localQueued.has(a.content_hash)
+                  }
+                  queuedLocal={localQueued.has(a.content_hash)}
                   onAnnotate={() => {
                     if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;
                     annotate([a.content_hash], a.annotated);

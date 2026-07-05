@@ -371,6 +371,8 @@ CONFIG_KEYS = [
     "VIDEO_ANALYSIS_MODEL", "VIDEO_ANALYSIS_ENDPOINT", "VIDEO_ANALYSIS_API_KEY",
     "AUDIO_LITELLM_MODEL", "AUDIO_LITELLM_BASE_URL", "AUDIO_LITELLM_API_KEY",
     "AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY",
+    # concurrency knobs — maximize hardware/API utilization during annotation
+    "ANNOTATE_VIDEO_WORKERS", "CAPTION_BATCH_SIZE", "VIDEO_CAPTION_MAX_FRAMES",
 ]
 
 
@@ -636,12 +638,34 @@ class AnnotateRequest(BaseModel):
     force: bool = False
 
 
+# Requests arriving while a batch is running are QUEUED and chained into a
+# follow-up job automatically — clicking 标注 on other cards mid-batch just
+# adds them to the line instead of being rejected/disabled.
+_ANNOTATE_QUEUE: list = []
+_ANNOTATE_LOCK = threading.Lock()
+
+
+def _annotate_running_job():
+    for j in reversed(list(JOBS.values())):
+        if j.kind == "annotate" and j.status == "running":
+            return j
+    return None
+
+
 @app.post("/api/assets/annotate")
 def annotate(body: AnnotateRequest):
     """Annotate assets in a background thread (in-process, like Streamlit batch)."""
     from src.asset_manager.index_store import find_new_assets
     if not SCANNED["assets"]:
         raise HTTPException(400, "Scan first.")
+    with _ANNOTATE_LOCK:
+        running = _annotate_running_job()
+        if running is not None:
+            _ANNOTATE_QUEUE.append({"content_hashes": list(body.content_hashes or []),
+                                    "force": bool(body.force)})
+            running.add(f"[queue] +1 请求已排队（队列 {len(_ANNOTATE_QUEUE)}）")
+            return {"job_id": None, "queued": True, "position": len(_ANNOTATE_QUEUE),
+                    "message": f"已加入标注队列（第 {len(_ANNOTATE_QUEUE)} 位），当前批次完成后自动开始。"}
     if body.content_hashes:
         targets = [a for a in SCANNED["assets"] if a.content_hash in set(body.content_hashes)]
     else:
@@ -755,6 +779,31 @@ def annotate(body: AnnotateRequest):
         finally:
             _progress.HOOK = None
             job.save(force=True)
+            # chain: start the next queued annotate request (merge all queued
+            # hashes into ONE follow-up batch; a queued "annotate new" request
+            # (empty hashes) makes the follow-up scan for everything new).
+            # Drain under the lock, but CALL annotate() outside it — annotate()
+            # acquires the same non-reentrant lock.
+            _merged: list = []
+            _force_any = False
+            _scan_new = False
+            with _ANNOTATE_LOCK:
+                while _ANNOTATE_QUEUE:
+                    _q = _ANNOTATE_QUEUE.pop(0)
+                    if _q.get("content_hashes"):
+                        _merged.extend(_q["content_hashes"])
+                    else:
+                        _scan_new = True
+                    _force_any = _force_any or bool(_q.get("force"))
+            if _merged or _scan_new:
+                try:
+                    annotate(AnnotateRequest(
+                        content_hashes=[] if _scan_new else list(dict.fromkeys(_merged)),
+                        force=_force_any,
+                    ))
+                    job.add("[queue] 队列中的请求已作为新批次启动")
+                except Exception as _e:  # noqa: BLE001
+                    job.add(f"[queue] 启动排队批次失败: {_e}")
 
     threading.Thread(target=_run, daemon=True).start()
     return {"job_id": job.id}
