@@ -370,8 +370,12 @@ AUDIO_KEYPOINT_MAX_TOKENS = 4096
 
 # ------------------ Agent Runtime ------------------ #
 
-AGENT_MODEL_MAX_TOKEN = 8192
+AGENT_MODEL_MAX_TOKEN = 24576
 # Maximum generated tokens per agent response (not total context size).
+# Reasoning models spend THINKING tokens from this same budget BEFORE the
+# visible answer: the shot plan (14+ shots × verbose fields + anchor
+# reasoning) was truncated mid-JSON at 8192. Billed by actual usage, not
+# by this cap — keep it generous.
 
 AGENT_MAX_ITERATIONS = 2
 # Max tool-use iterations per shot in the editor agent loop. Each iteration is

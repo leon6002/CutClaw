@@ -885,6 +885,10 @@ def generate_shot_plan_with_retry(
                 print(f"⚖️ [Screenwriter] shot plan rejected: {load_reason}")
             else:
                 last_error = f"invalid shot plan format: {reason}"
+                _tail = (raw_shot_plan or "")[-120:].replace("\n", " ")
+                print(f"⚠️ [Screenwriter] shot plan attempt {attempt} invalid: {reason} "
+                      f"(response ends with: …{_tail}) — a mid-JSON cutoff means the reply "
+                      f"hit AGENT_MODEL_MAX_TOKEN", flush=True)
 
         if attempt < retries:
             wait_seconds = min(max_backoff, base_backoff * (2 ** (attempt - 1)))
