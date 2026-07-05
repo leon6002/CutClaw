@@ -1164,15 +1164,18 @@ class EditorCoreAgent:
         tag = f"S{(self.current_section_idx or 0) + 1}·Shot{(self.current_shot_idx or 0) + 1}"
         loop_start = time.time()
 
-        # One extra "grace" iteration beyond the budget: if the agent inspected
-        # footage but spent its last call on review/trim instead of commit (the
-        # dominant failure mode with small budgets), force a commit instead of
-        # failing the shot. tool_choice is locked to `commit` so it cannot wander.
+        # One extra "grace" iteration beyond the budget: whatever the agent
+        # spent its calls on, force a commit instead of failing the shot — a
+        # rough pick beats a hole. tool_choice is locked to `commit` so it
+        # cannot wander (unless the provider rejects forced tool_choice).
         grace_iter = False
         self._grace_commit = False
+        # DeepSeek thinking mode 400s on forced tool_choice; flip this and rely
+        # on the forced-commit prompt alone once we see that rejection.
+        _tc_unsupported = False
         for i in range(max_iterations + 1):
             if i == max_iterations:
-                if section_completed or should_restart or not self.attempted_time_ranges:
+                if section_completed or should_restart:
                     break
                 grace_iter = True
                 # lenient review: duration shortfall alone won't reject the commit
@@ -1208,7 +1211,7 @@ class EditorCoreAgent:
                             tools=self.function_schemas,
                             # grace iteration: the model may ONLY commit
                             tool_choice=({"type": "function", "function": {"name": "commit"}}
-                                         if grace_iter else "auto"),
+                                         if (grace_iter and not _tc_unsupported) else "auto"),
                         )
                         if config.AGENT_LITELLM_URL:
                             kwargs["api_base"] = config.AGENT_LITELLM_URL
@@ -1252,6 +1255,13 @@ class EditorCoreAgent:
                             print(f"🔄 [Retry] Model returned None, retrying ({model_retry + 1}/{max_model_retries})...")
                     except Exception as e:
                         error_msg = str(e).lower()
+                        if grace_iter and not _tc_unsupported and "tool_choice" in error_msg:
+                            # provider rejects forced tool_choice (DeepSeek thinking
+                            # mode) — retrying the identical request can never work;
+                            # drop the constraint, the commit prompt still steers it
+                            _tc_unsupported = True
+                            print(f"⚠️  [{tag}] provider rejects forced tool_choice — retrying without it")
+                            continue
                         if "context length" in error_msg or "too large" in error_msg or "max_tokens" in error_msg:
                             print(f"❌ [Error] Context length exceeded: {e}")
                             context_length_error = True
@@ -2006,6 +2016,104 @@ class ParallelShotOrchestrator:
                 ))
         return ranges
 
+    def _fallback_pick(self, shot, sec_idx, shot_idx, forbidden_ranges):
+        """Deterministic no-LLM rescue. When the agent could not commit a shot
+        (model errors, review rejections, budget exhausted), pick a free window
+        on the shot's assigned footage instead of leaving a hole in the montage.
+        Preference order: the Screenwriter's related scene(s) → other scenes on
+        the same source → any scene anywhere. Returns None only when no free
+        window ≥ the minimum shot duration exists on ANY source — i.e. the
+        material itself is exhausted, not the agent."""
+        import glob as _g
+
+        def _ts(v) -> float:
+            try:
+                s = str(v).strip()
+                if ":" in s:
+                    parts = [float(x) for x in s.split(":")]
+                    return sum(p * m for p, m in zip(reversed(parts), [1, 60, 3600]))
+                return float(s)
+            except (TypeError, ValueError):
+                return 0.0
+
+        gap = float(getattr(config, 'SHOT_MIN_GAP_SEC', 0.0) or 0.0)
+        need = float(shot.get('time_duration') or 0.0) or 2.0
+        floor = float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0))
+
+        wins = []   # (scene_idx, src, window_start, window_end)
+        for f in _g.glob(os.path.join(self.video_scene_path or "", "scene_*.json")):
+            m = re.search(r"scene_(\d+)\.json$", os.path.basename(f))
+            if not m:
+                continue
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    tr = (json.load(fh).get("time_range") or {})
+                w_s, w_e = _ts(tr.get("start_seconds")), _ts(tr.get("end_seconds"))
+            except Exception:
+                continue
+            idx = int(m.group(1))
+            src = self.scene_source_map.get(idx, "") or (self.video_path or "")
+            if w_e > w_s:
+                wins.append((idx, src, w_s, w_e))
+
+        rs = shot.get('related_scene', [])
+        rel = set(rs if isinstance(rs, list) else [rs])
+        src_pref = self._shot_source(shot)
+        wins.sort(key=lambda w: (0 if w[0] in rel
+                                 else (1 if _same_source(w[1], src_pref) else 2), w[0]))
+
+        best = None   # (free_len, src, free_start, free_end) — largest gap seen
+        for _idx, src, w_s, w_e in wins:
+            blocks = []
+            for fr in forbidden_ranges:
+                r_src, r_s, r_e = _norm_range(fr)
+                if not _same_source(r_src or (self.video_path or ""), src):
+                    continue
+                # committed clips block their span plus the spacing gap
+                blocks.append((max(w_s, (r_s or 0.0) - gap), min(w_e, (r_e or 0.0) + gap)))
+            blocks.sort()
+            cur = w_s
+            free = []
+            for b_s, b_e in blocks:
+                if b_s > cur:
+                    free.append((cur, b_s))
+                cur = max(cur, b_e)
+            if w_e > cur:
+                free.append((cur, w_e))
+            for f_s, f_e in free:
+                ln = f_e - f_s
+                if ln >= need:
+                    return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + need)
+                if best is None or ln > best[0]:
+                    best = (ln, src, f_s, f_e)
+
+        if best and best[0] >= floor:
+            ln, src, f_s, f_e = best
+            return self._build_fallback_result(shot, sec_idx, shot_idx, src, f_s, f_s + min(need, ln))
+
+        print(f"🛑 [Fallback] S{sec_idx + 1}-Shot{shot_idx + 1}: no free window ≥{floor:.1f}s left "
+              f"on any source — material exhausted, shot dropped", flush=True)
+        return None
+
+    def _build_fallback_result(self, shot, sec_idx, shot_idx, src, s_sec, e_sec):
+        s_h = convert_seconds_to_hhmmss(round(s_sec, 2))
+        e_h = convert_seconds_to_hhmmss(round(e_sec, 2))
+        dur = round(e_sec - s_sec, 2)
+        print(f"🛟 [Fallback] S{sec_idx + 1}-Shot{shot_idx + 1}: agent failed — deterministic pick "
+              f"{s_h}→{e_h} ({dur:.2f}s) on {os.path.basename(src) or '?'} (hole prevented)", flush=True)
+        return {
+            "status": "success",
+            "section_idx": sec_idx,
+            "shot_idx": shot_idx,
+            "total_duration": dur,
+            "target_duration": float(shot.get('time_duration') or 0.0),
+            "num_clips": 1,
+            "is_stitched": False,
+            "clips": [{"shot": 1, "start": s_h, "end": e_h, "duration": dur, "video_path": src or ""}],
+            "video_path": src or "",
+            "fallback": True,
+        }
+
     def _detect_conflicts(self, results: dict, keep_ranges: list) -> tuple[dict, set]:
         """Return (losers, soft_keys). Losers is keyed by (sec_idx, shot_idx) with
         guidance text. `soft_keys` ⊆ losers are conflicts caused ONLY by same-source
@@ -2219,6 +2327,13 @@ class ParallelShotOrchestrator:
                 except Exception as e:
                     print(f"Worker failed for shot {k}: {e}")
                     res = None
+                if not res:
+                    # 100%-success guarantee: an agent failure must not leave a
+                    # hole — take a free window on the assigned footage instead
+                    res = self._fallback_pick(shot, s_idx, shot_idx,
+                                              base_forbidden + local_ranges)
+                    if res:
+                        self._append_result_to_output(k, res)
                 out[k] = res
                 _emit(k, "done" if res else "fail")
                 if res:
@@ -2472,7 +2587,8 @@ class ParallelShotOrchestrator:
                         # Spacing (soft) conflicts must never drop a shot: if a
                         # crowded/single source couldn't satisfy the min gap after
                         # all reruns, commit the close pick anyway — an adjacent
-                        # clip still beats a missing one. True overlaps still fail.
+                        # clip still beats a missing one. True overlaps get a
+                        # deterministic fallback pick on free footage instead.
                         _res = results.get(_key)
                         if _key in soft_losers and _res:
                             final_results[_key] = _res
@@ -2481,7 +2597,17 @@ class ParallelShotOrchestrator:
                             _accepted_soft = True
                             _emit(_key, "done")
                         else:
-                            _emit(_key, "fail")
+                            _fb = self._fallback_pick(
+                                shots[_key[1]], _key[0], _key[1],
+                                global_keep_ranges + section_keep_ranges)
+                            if _fb:
+                                final_results[_key] = _fb
+                                for _r in self._result_ranges(_fb):
+                                    section_keep_ranges.append(_r)
+                                _accepted_soft = True
+                                _emit(_key, "done")
+                            else:
+                                _emit(_key, "fail")
                     if _accepted_soft:
                         self._save_checkpoint(existing, final_results)
                     break
