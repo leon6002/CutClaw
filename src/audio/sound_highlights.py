@@ -15,18 +15,30 @@ measurable value). Two stages so wind/water noise can't fool it:
                    sound has a stable 70-400 Hz pitch track; wind, rumble
                    and broadband ambience do not.
 
+Primary detector: Silero VAD (tiny local model, deterministic, CPU-ms —
+still "measured, not LLM-guessed"). The pyin heuristic below remains as a
+fallback when silero-vad is unavailable. Ground truth that forced the
+switch: distant outdoor voices/laughter (DJI_0642 7-11s) score only
+0.07-0.13 mean voiced_prob under pyin (excited voices pitch 400-900 Hz,
+reverb breaks the tracker) while Silero nails them, with zero false
+alarms on pink noise, jet engine, and instrumental music.
+
 Output per segment: {"start", "end", "kind": "voice", "strength" 0-1}.
 Cached as sound_highlights.json in the video's analysis dir.
 """
 import json
 import os
 import subprocess
+import sys
 import tempfile
 
 import numpy as np
 
 _SR = 16000
 _HOP = 0.05          # feature frame hop (s)
+_CACHE_VERSION = 2   # v1 = pyin-only detector (missed outdoor voices) — stale
+
+_SILERO = None       # lazy singleton
 
 
 def detect_sound_highlights(media_path: str, cache_path: str | None = None) -> list:
@@ -34,15 +46,26 @@ def detect_sound_highlights(media_path: str, cache_path: str | None = None) -> l
 
     Returns a list of segments; [] when the file has no usable audio.
     When cache_path is given, results are read from / written to it.
+
+    The actual detection ALWAYS runs in a child process: loading torch
+    (Silero) into a host that already holds another OpenMP runtime (numpy/
+    MKL in the API server, decord in renders) can hard-abort the whole
+    process on Windows with no traceback. Callers only ever parse JSON.
     """
     if cache_path and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("segments", [])
+                d = json.load(f)
+            if int(d.get("version", 1)) >= _CACHE_VERSION:
+                return d.get("segments", [])
+            # older detector version → fall through and re-detect
         except Exception:  # noqa: BLE001
             pass
     try:
-        segs = _detect(media_path)
+        if os.environ.get("CUTCLAW_SHL_WORKER"):
+            segs = _detect(media_path)          # we ARE the isolated worker
+        else:
+            segs = _detect_via_subprocess(media_path)
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ [SoundHL] detection failed for {os.path.basename(media_path)}: {str(e)[:150]}")
         return []
@@ -50,10 +73,31 @@ def detect_sound_highlights(media_path: str, cache_path: str | None = None) -> l
         try:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "segments": segs}, f, ensure_ascii=False, indent=1)
+                json.dump({"version": _CACHE_VERSION, "segments": segs}, f,
+                          ensure_ascii=False, indent=1)
         except Exception:  # noqa: BLE001
             pass
     return segs
+
+
+def _detect_via_subprocess(media_path: str) -> list:
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    code = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {root!r})\n"
+        "from src.audio.sound_highlights import _detect\n"
+        f"print('SHL_JSON:' + json.dumps(_detect({media_path!r})))\n"
+    )
+    env = os.environ.copy()
+    env["CUTCLAW_SHL_WORKER"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    r = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True, timeout=900, env=env)
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("SHL_JSON:"):
+            return json.loads(line[len("SHL_JSON:"):])
+    raise RuntimeError(f"worker exited rc={r.returncode}: {(r.stderr or '')[-200:]}")
 
 
 def _has_audio_stream(media_path: str) -> bool:
@@ -95,6 +139,53 @@ def _detect(media_path: str) -> list:
             pass
     if y.size < sr:          # under a second of audio
         return []
+
+    segs = _detect_silero(y, sr)
+    if segs is not None:
+        return segs
+    return _detect_heuristic(y, sr)
+
+
+def _detect_silero(y, sr) -> list | None:
+    """Silero VAD path. Returns None when silero is unavailable (→ fallback)."""
+    global _SILERO
+    try:
+        import torch
+        from silero_vad import load_silero_vad, get_speech_timestamps
+        if _SILERO is None:
+            _SILERO = load_silero_vad()
+        ts = get_speech_timestamps(
+            torch.from_numpy(y.astype(np.float32)), _SILERO, sampling_rate=sr,
+            return_seconds=True, threshold=0.5,
+            # laughter bursts are short — don't gate them out
+            min_speech_duration_ms=300, min_silence_duration_ms=600)
+    except ImportError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [SoundHL] silero failed ({str(e)[:100]}) — using heuristic fallback")
+        return None
+
+    if not ts:
+        return []
+    import librosa
+    hop = int(_HOP * sr)
+    rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+    db = librosa.amplitude_to_db(rms + 1e-10)
+    floor = float(np.percentile(db, 30))
+    segs = []
+    for t in ts:
+        s, e = float(t["start"]), float(t["end"])
+        i0, i1 = max(0, int(s / _HOP)), max(1, int(e / _HOP))
+        loud = float(np.median(db[i0:i1])) - floor
+        strength = float(np.clip(0.55 + loud / 30.0, 0.3, 1.0))
+        segs.append({"start": round(s, 2), "end": round(e, 2),
+                     "kind": "voice", "strength": round(strength, 2)})
+    return segs
+
+
+def _detect_heuristic(y, sr) -> list:
+    """Legacy two-stage signal heuristic (no-model fallback)."""
+    import librosa
 
     hop = int(_HOP * sr)
     n_fft = 1024

@@ -34,6 +34,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.utils.env_keys import env_expr_name, resolve_env_expr, write_env_var
+
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "src", "config.py")
 
 app = FastAPI(title="CutClaw API")
@@ -59,12 +61,22 @@ def _read_config() -> dict:
 
 def cfg(key: str, fallback: str = "") -> str:
     raw = _read_config().get(key, fallback)
+    resolved = resolve_env_expr(raw)
+    if resolved is not None:
+        return resolved
     if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
         return raw[1:-1]
     return raw
 
 
 def save_config(key: str, value: str):
+    # Env-backed secret (KEY = os.getenv(...)): write the value into .env so
+    # the literal key never lands in the git-tracked config.py.
+    env_name = env_expr_name(_read_config().get(key, ""))
+    if env_name:
+        if value != os.getenv(env_name, ""):
+            write_env_var(env_name, value)
+        return
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         content = f.read()
     try:
@@ -1113,16 +1125,21 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
     # measured voice/laughter segments in the ORIGINAL audio (may be absent
     # for annotations that predate the feature — the UI offers on-demand
     # detect). Signal-only, so any track's cache dir is equally valid.
+    from src.audio.sound_highlights import _CACHE_VERSION as _SHL_V
     for _d in (cache_dir, get_analysis_path(content_hash),
                get_analysis_path(content_hash, "local")):
         shl = os.path.join(_d, "sound_highlights.json")
         if os.path.exists(shl):
             try:
                 with open(shl, "r", encoding="utf-8") as f:
-                    result["sound_highlights"] = json.load(f).get("segments", [])
+                    _sd = json.load(f)
+                # stale detector version → pretend absent so the UI offers
+                # re-detection instead of showing outdated results
+                if int(_sd.get("version", 1)) >= _SHL_V:
+                    result["sound_highlights"] = _sd.get("segments", [])
+                    break
             except Exception:  # noqa: BLE001
-                result["sound_highlights"] = []
-            break
+                pass
     return result
 
 
