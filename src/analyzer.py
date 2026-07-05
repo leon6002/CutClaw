@@ -81,11 +81,20 @@ def _save_metadata(cache_dir: str, metadata: dict):
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 
+def _prog_emit(task: str, total: int, idx: int, event: str, **extra):
+    """Fine-grained progress/trace events for the web UI (no-op outside jobs)."""
+    try:
+        from src.utils.progress import emit_progress
+        emit_progress(task, total, idx, event, **extra)
+    except Exception:
+        pass
+
+
 # ── Video analysis ─────────────────────────────────────────────────────────
 
 def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
                          video_reader, video_fps: float, config,
-                         reader_lock=None) -> list[dict] | None:
+                         reader_lock=None, prog_idx: int = -1) -> list[dict] | None:
     """Run dense captioning on a time range: extract frames → VLM → segments.
 
     reader_lock: when clips are processed in parallel threads, decord readers
@@ -147,6 +156,11 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         if config.VIDEO_ANALYSIS_API_KEY:
             kwargs["api_key"] = config.VIDEO_ANALYSIS_API_KEY
 
+        if prog_idx >= 0:
+            _prog_emit("video_dense", 0, prog_idx, "step", phase="action", iter=1, max_iter=1,
+                       tool=f"VLM 密集描述 · {len(b64_frames)} 帧 → {config.VIDEO_ANALYSIS_MODEL}",
+                       args=prompt[:2000])
+        _t0 = time.time()
         raw = litellm.completion(**kwargs)
         content = raw.choices[0].message.content or ""
         # Parse JSON from response
@@ -175,8 +189,11 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
             if result is None:
                 raise
             _fr = getattr(raw.choices[0], "finish_reason", "")
+            _salvage_note = f"截断抢救(finish_reason={_fr}),保留 {len(result.get('segments', []))} 个完整段落"
             print(f"  ♻️ [DenseCaption] truncated reply (finish_reason={_fr}) — "
                   f"salvaged {len(result.get('segments', []))} complete segment(s)")
+        else:
+            _salvage_note = ""
         raw_segments = result.get("segments", []) if isinstance(result, dict) else []
         # Convert relative timestamps to absolute, with a scale-correction. The VLM
         # sometimes writes seconds in MM:SS form ("12 seconds" -> "00:12:00" =
@@ -242,9 +259,18 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
                         sub["_split_part"] = f"{_k + 1}/{_n}"
                     capped.append(sub)
             segments = capped
+        if prog_idx >= 0:
+            _prog_emit("video_dense", 0, prog_idx, "step", phase="result", iter=1, max_iter=1,
+                       elapsed=round(time.time() - _t0, 1),
+                       verdict="warn" if _salvage_note else ("ok" if segments else "fail"),
+                       result=(_salvage_note or f"{len(segments)} 个时间段描述")[:160],
+                       reply=content[:4000])
         return segments
     except Exception as e:
         print(f"[DenseCaption] Failed for {video_path} [{start_sec:.1f}-{end_sec:.1f}]: {e}")
+        if prog_idx >= 0:
+            _prog_emit("video_dense", 0, prog_idx, "step", phase="result", iter=1, max_iter=1,
+                       verdict="fail", result=f"{type(e).__name__}: {e}"[:160])
         return None
 
 
@@ -388,8 +414,9 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
         from concurrent.futures import ThreadPoolExecutor as _TPE
         _rd_lock = _threading.Lock()
         _workers = max(1, min(int(getattr(config, "CAPTION_BATCH_SIZE", 4) or 4), len(_need_dense)))
+        _prog_emit("video_dense", len(_need_dense), -1, "reset")
 
-        def _dense_one(_cf: str):
+        def _dense_one(_di: int, _cf: str):
             _cp = os.path.join(shots_dir, _cf)
             try:
                 with open(_cp, "r", encoding="utf-8") as _f2:
@@ -404,19 +431,21 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
             if _end_sec <= _start_sec:
                 return
             _emit("dense_caption", "progress", f"{_cf}: {_clip_start}-{_clip_end}")
+            _prog_emit("video_dense", len(_need_dense), _di, "start", label=_cf.replace(".json", ""))
             _segments = _dense_caption_clip(abs_path, _start_sec, _end_sec, _reader,
-                                            _video_fps, config, reader_lock=_rd_lock)
+                                            _video_fps, config, reader_lock=_rd_lock, prog_idx=_di)
             if _segments:
                 _cd["dense_segments"] = _segments
                 with open(_cp, "w", encoding="utf-8") as _f2:
                     json.dump(_cd, _f2, ensure_ascii=False, indent=2)
+            _prog_emit("video_dense", len(_need_dense), _di, "done" if _segments else "fail")
 
         if _workers > 1:
             with _TPE(max_workers=_workers) as _ex:
-                list(_ex.map(_dense_one, _need_dense))
+                list(_ex.map(_dense_one, range(len(_need_dense)), _need_dense))
         else:
-            for _cf in _need_dense:
-                _dense_one(_cf)
+            for _di, _cf in enumerate(_need_dense):
+                _dense_one(_di, _cf)
         _emit("dense_caption", "done", f"{len(_need_dense)} clips · {time.time() - _dense_t0:.1f}s")
 
         # Completeness check: clips whose dense caption still failed must keep

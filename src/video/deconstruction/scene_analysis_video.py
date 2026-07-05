@@ -6,7 +6,9 @@ import os
 import sys
 import json
 import re
+import time
 import asyncio
+import contextvars
 from typing import List, Dict, Optional
 
 import litellm
@@ -25,6 +27,23 @@ from src.utils.media_utils import (
     hhmmss_to_seconds,
     pil_to_base64,
 )
+
+
+# which video_scenes unit the current asyncio task belongs to — create_task
+# snapshots the context, so each scene's coroutine sees its own index and the
+# nested generate_caption call can report prompt/reply traces to the workbench
+_SCENE_PROG_IDX = contextvars.ContextVar("_scene_prog_idx", default=-1)
+
+
+def _emit_scene_step(**ev):
+    idx = _SCENE_PROG_IDX.get()
+    if idx < 0:
+        return
+    try:
+        from src.utils.progress import emit_progress
+    except Exception:
+        return
+    emit_progress("video_scenes", 0, idx, "step", **ev)
 
 
 def _is_valid_scene_analysis_output(output_path: str) -> bool:
@@ -176,6 +195,10 @@ class SceneVideoAnalyzer:
         timeouts = [90, 120, 150]
         for attempt in range(max_retries):
             timeout = timeouts[min(attempt, len(timeouts) - 1)]
+            _emit_scene_step(phase="action", iter=attempt + 1, max_iter=max_retries,
+                             tool=f"VLM 场景分析 · {len(frames)} 帧 → {config.VIDEO_ANALYSIS_MODEL}",
+                             args=prompt[:2000])
+            _t0 = time.time()
             result = await self._call_vlm(prompt, content, max_tokens=4096, timeout=timeout)
             parsed = parse_json_safely(result) if result else None
 
@@ -212,8 +235,16 @@ class SceneVideoAnalyzer:
                 if classification.get('importance_score', 0) == 0:
                     classification['is_usable'] = False
 
+                _sum = f"{classification.get('scene_type', '?')} · 重要度 {classification.get('importance_score', '?')}"
+                _emit_scene_step(phase="result", iter=attempt + 1, max_iter=max_retries,
+                                 elapsed=round(time.time() - _t0, 1), verdict="ok",
+                                 result=_sum[:160], reply=(result or "")[:4000])
                 return parsed
 
+            _emit_scene_step(phase="result", iter=attempt + 1, max_iter=max_retries,
+                             elapsed=round(time.time() - _t0, 1), verdict="fail",
+                             result="VLM 无响应/超时" if not result else "输出缺少必需字段(scene_classification)",
+                             reply=(result or "")[:4000])
             if attempt < max_retries - 1:
                 print(f"⚠️  [SceneAnalysis] Output missing required fields, retrying ({attempt + 1}/{max_retries})...")
 
@@ -381,6 +412,7 @@ class SceneVideoAnalyzer:
 
                 emit_progress("video_scenes", total, _idx, "start",
                               label=os.path.basename(in_path))
+                _SCENE_PROG_IDX.set(_idx)  # snapshotted by create_task's context copy
                 task = asyncio.create_task(_caption_one(in_path, out_path, scene_data, frames, semaphore))
                 task._scene_key = (in_path, out_path)
                 task._scene_idx = _idx

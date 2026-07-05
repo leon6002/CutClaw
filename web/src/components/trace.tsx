@@ -1,15 +1,26 @@
 /** Shared trace data layer: types, polling hook, grouping, reasoning splitter. */
 import { useEffect, useState, type ReactNode } from "react";
-import { AudioWaveform, Film, Layers, PenLine, Scissors } from "lucide-react";
+import { AudioWaveform, FileVideo, Film, Layers, PenLine, ScanText, Scissors } from "lucide-react";
 import { api } from "../api";
 
 export const TASK_LABEL: Record<string, ReactNode> = {
+  video_analysis: <><FileVideo className="mr-1.5 inline h-3.5 w-3.5 text-slate-400" />逐文件分析调度</>,
+  audio_analysis_asset: <><AudioWaveform className="mr-1.5 inline h-3.5 w-3.5 text-violet-400" />音频分析（素材）</>,
   audio_segments: <><AudioWaveform className="mr-1.5 inline h-3.5 w-3.5 text-violet-400" />音频片段描述</>,
   editor_shots: <><Scissors className="mr-1.5 inline h-3.5 w-3.5 text-cyan-400" />镜头选择 Agent</>,
   video_clips: <><Film className="mr-1.5 inline h-3.5 w-3.5 text-sky-400" />视频片段理解</>,
+  video_dense: <><ScanText className="mr-1.5 inline h-3.5 w-3.5 text-fuchsia-400" />密集片段描述</>,
   video_scenes: <><Layers className="mr-1.5 inline h-3.5 w-3.5 text-emerald-400" />场景分析</>,
   screenwriter_llm: <><PenLine className="mr-1.5 inline h-3.5 w-3.5 text-amber-400" />AI 编剧（提示词 / 回复）</>,
 };
+
+/** File-level scheduler grids track states only — LLM call traces live in the
+ *  inner per-clip/per-scene grids. Explain that instead of the checkpoint blurb. */
+export function emptyTraceMsg(task: string): string {
+  if (task === "video_analysis" || task === "audio_analysis_asset")
+    return "这一层是文件级调度单元，只记录 开始/完成 状态，不承载模型调用轨迹——视频理解的调用细节（提示词 / 模型回复）在下方「视频片段理解 / 密集片段描述 / 场景分析」网格里，点开对应单元查看。";
+  return "本轮没有执行该单元（尚未开始，或先前运行已完成、走检查点跳过），历史任务中也没有找到它的轨迹。";
+}
 
 /** "3/12" when a max exists, "#3" for unbounded call counters. */
 export function fmtIter(iter?: number, maxIter?: number): string {
@@ -39,6 +50,8 @@ export interface TraceStep {
   verdict?: "ok" | "warn" | "fail" | "info" | string;
   result?: string;
   note?: string;
+  /** screenwriter sub-step this call belongs to (选择音乐段落 / 生成分镜脚本 / …) */
+  stage?: string;
 }
 
 export const VERDICT_META: Record<string, {
@@ -93,6 +106,8 @@ export interface IterEntry {
   results: TraceStep[];
   /** round divider marker (new conversation: initial run / conflict rerun) */
   round?: { note?: string; n: number };
+  /** screenwriter sub-step this iteration belongs to */
+  stage?: string;
 }
 
 export function groupSteps(steps: TraceStep[]): IterEntry[] {
@@ -106,12 +121,12 @@ export function groupSteps(steps: TraceStep[]): IterEntry[] {
     }
     if (s.phase === "calling") {
       if (i === steps.length - 1) {
-        out.push({ iter: s.iter, max_iter: s.max_iter, elapsed: s.elapsed, calling: true, results: [] });
+        out.push({ iter: s.iter, max_iter: s.max_iter, elapsed: s.elapsed, calling: true, results: [], stage: s.stage });
       }
       return;
     }
     if (s.phase === "action") {
-      out.push({ iter: s.iter, max_iter: s.max_iter, elapsed: s.elapsed, action: s, results: [] });
+      out.push({ iter: s.iter, max_iter: s.max_iter, elapsed: s.elapsed, action: s, results: [], stage: s.stage });
       return;
     }
     if (s.phase === "result") {

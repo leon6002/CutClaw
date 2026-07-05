@@ -19,7 +19,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   TASK_LABEL, STATE_DOT, STATE_TXT, VERDICT_META,
-  entryWorstVerdict, fmtIter, groupSteps, splitReasoning, tryPretty, useTrace,
+  emptyTraceMsg, entryWorstVerdict, fmtIter, groupSteps, splitReasoning, tryPretty, useTrace,
   type IterEntry, type TaskInfo,
 } from "./trace";
 
@@ -273,6 +273,11 @@ function NodeCard({ e, onCollapse }: { e: IterEntry; onCollapse: () => void }) {
         <Badge variant="outline" className="border-white/15 bg-white/[0.06] font-mono text-[11px] text-slate-300">
           Iter {fmtIter(e.iter, e.max_iter)}
         </Badge>
+        {e.stage && (
+          <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-[11px] text-amber-300">
+            {e.stage}
+          </Badge>
+        )}
         {a?.tool ? (
           <span className="flex items-center gap-1.5 font-mono text-[13px] font-semibold text-cyan-300">
             <Wrench className="h-3.5 w-3.5" />{a.tool}
@@ -463,9 +468,7 @@ export default function AgentWorkbench({
             {steps === null ? (
               <div className="p-4 text-sm text-slate-500">加载轨迹…</div>
             ) : entries.length === 0 ? (
-              <div className="p-4 text-sm leading-relaxed text-slate-500">
-                本轮没有执行该单元（先前运行已完成、走检查点跳过），历史任务中也没有找到它的轨迹。
-              </div>
+              <div className="p-4 text-sm leading-relaxed text-slate-500">{emptyTraceMsg(name)}</div>
             ) : (
               <AnimatePresence initial={false}>
                 {entries.map((e, i) => {
@@ -525,6 +528,11 @@ export default function AgentWorkbench({
                           className="group flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition-colors hover:bg-white/[0.03]"
                         >
                           <span className="font-mono text-[11px] text-slate-600">Iter {e.iter}</span>
+                          {e.stage && (
+                            <span className="shrink-0 rounded border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300/90">
+                              {e.stage}
+                            </span>
+                          )}
                           <span className={cn("truncate font-mono text-xs", worst === "fail" ? "text-red-400/80" : worst === "warn" ? "text-amber-300/70" : "text-slate-500 group-hover:text-slate-300")}>
                             {e.action?.tool || "（无工具）"}
                           </span>

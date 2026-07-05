@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import {
   TASK_LABEL, STATE_DOT, STATE_TXT, VERDICT_META,
-  entryWorstVerdict, fmtIter, groupSteps, useTrace, type TaskInfo,
+  emptyTraceMsg, entryWorstVerdict, fmtIter, groupSteps, useTrace, type TaskInfo,
 } from "./trace";
 
 // ── compact inline glance (click a cell) ────────────────────────────────────
@@ -45,9 +45,7 @@ function InlineTrace({
           {steps === null ? (
             <div className="py-2 text-xs text-slate-500">加载轨迹…</div>
           ) : entries.length === 0 ? (
-            <div className="py-2 text-xs text-slate-500">
-              本轮没有执行该单元（尚未开始，或先前运行已完成、走检查点跳过），历史任务中也没有找到它的轨迹。
-            </div>
+            <div className="py-2 text-xs text-slate-500">{emptyTraceMsg(task)}</div>
           ) : (
             entries.map((e, i) => {
               if (e.round) {

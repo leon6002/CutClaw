@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import time as _time
 import litellm
 from typing import List, Dict, Optional, Tuple
 from src import config
@@ -368,6 +369,16 @@ def process_video(
         """Send one acompletion request with timeout, return (clip, meta, content_or_None)."""
         meta = _build_clip_request(clip)
         timestamp, messages_for_clip, frame_range, clip_start_time, clip_end_time = meta
+        # workbench trace: surface the actual prompt/reply per clip (frames as count)
+        _ptext, _n_imgs = "", 0
+        for _m in messages_for_clip:
+            _c = _m.get("content")
+            if isinstance(_c, list):
+                for _p in _c:
+                    if _p.get("type") == "text":
+                        _ptext += _p.get("text") or ""
+                    elif _p.get("type") == "image_url":
+                        _n_imgs += 1
         kwargs = dict(
             model=config.VIDEO_ANALYSIS_MODEL,
             messages=messages_for_clip,
@@ -381,15 +392,27 @@ def process_video(
             kwargs["api_key"] = config.VIDEO_ANALYSIS_API_KEY
 
         async with semaphore:
+            emit_progress("video_clips", 0, clip_idx, "step", phase="action", iter=1, max_iter=1,
+                          tool=f"VLM 片段描述 · {_n_imgs} 帧 → {config.VIDEO_ANALYSIS_MODEL}",
+                          args=_ptext[:2000])
+            _t0 = _time.time()
+            _err = ""
             try:
                 resp = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout)
                 content = resp.choices[0].message.content
                 if content is None:
+                    _err = f"空响应 finish_reason={resp.choices[0].finish_reason}"
                     print(f"  ⚠️  [VideoCaption] [Null content] {timestamp}: finish_reason={resp.choices[0].finish_reason}")
             except Exception as e:
                 level = "❌" if is_last_attempt else "⚠️ "
+                _err = f"{type(e).__name__}: {e}"
                 print(f"  {level} [VideoCaption] [Error] {timestamp}: {type(e).__name__}: {e}")
                 content = None
+            emit_progress("video_clips", 0, clip_idx, "step", phase="result", iter=1, max_iter=1,
+                          elapsed=round(_time.time() - _t0, 1),
+                          verdict="ok" if content else "fail",
+                          result=(_err or (content or "").strip().split("\n")[0])[:160],
+                          reply=(content or "")[:4000])
         return clip, meta, content, clip_idx
 
     async def _run_overlapped(clip_iter, pbar, timeout, is_last_attempt=False):
@@ -428,6 +451,9 @@ def process_video(
                 err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
                 if err is not None:
                     failed_clips.append(clip_r)
+                    if content:  # network was fine — surface the parse failure in the trace
+                        emit_progress("video_clips", 0, _cidx, "step", phase="result",
+                                      iter=1, max_iter=1, verdict="fail", result=str(err)[:160])
                     emit_progress("video_clips", _prog["idx"], _cidx, "fail")
                 else:
                     pbar.update(1)
@@ -440,6 +466,9 @@ def process_video(
             err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
             if err is not None:
                 failed_clips.append(clip_r)
+                if content:
+                    emit_progress("video_clips", 0, _cidx, "step", phase="result",
+                                  iter=1, max_iter=1, verdict="fail", result=str(err)[:160])
                 emit_progress("video_clips", _prog["idx"], _cidx, "fail")
             else:
                 pbar.update(1)
