@@ -279,7 +279,14 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
             if isinstance(vr, dict):
                 _sampled = vr.get("num_frames") or len(vr.get("frame_indices") or [])
             if not _sampled:
-                _sampled = int(metadata.get("duration_sec", 0) * config.VIDEO_FPS)
+                # NOTE: `metadata` belongs to the OUTER function — referencing it
+                # here was a latent NameError. Derive duration from the reader.
+                try:
+                    _rd = vr.get("video_reader") if isinstance(vr, dict) else None
+                    if _rd is not None and len(_rd) > 0 and float(_rd.get_avg_fps() or 0) > 0:
+                        _sampled = int(len(_rd) / float(_rd.get_avg_fps()) * config.VIDEO_FPS)
+                except Exception:
+                    _sampled = 0
             if _sampled > 0:
                 with open(shot_scenes_file, "w") as _sf:
                     _sf.write(f"0 {_sampled - 1}\n")
@@ -456,9 +463,25 @@ def analyze_video(
     }
 
     existing = _load_metadata(cache_dir)
+    # "Already analyzed" must mean COMPLETED, not merely started: metadata.json
+    # is written before the pipeline runs, so checking bare existence turned a
+    # crashed/killed run into a permanently "done" cache (the per-step resume
+    # inside the pipeline never got a chance to fire). Require the completion
+    # marker; legacy caches (pre-marker) count as complete only when their end
+    # artifacts actually exist.
+    def _looks_complete(md: dict) -> bool:
+        if md.get("analysis_complete"):
+            return True
+        _sums = os.path.join(cache_dir, "captions", "scene_summaries_video")
+        _caps = os.path.join(cache_dir, "captions", "captions.json")
+        return (os.path.exists(_caps) and os.path.isdir(_sums)
+                and any(f.endswith(".json") for f in os.listdir(_sums)))
+
     if existing and not force:
-        print(f"♻️  [Analyze] Video already analyzed: {os.path.basename(video_path)} (hash={content_hash[:12]})")
-        return content_hash
+        if _looks_complete(existing):
+            print(f"♻️  [Analyze] Video already analyzed: {os.path.basename(video_path)} (hash={content_hash[:12]})")
+            return content_hash
+        print(f"🔁 [Analyze] Previous run incomplete — resuming: {os.path.basename(video_path)} (hash={content_hash[:12]})")
 
     _save_metadata(cache_dir, metadata)
     # If forcing, clear ALL cached analysis artifacts so every step re-runs.
@@ -519,8 +542,10 @@ def analyze_video(
             json.dump(fallback, f, ensure_ascii=False, indent=2)
         print(f"🔧 [Analyze] No scenes detected — created fallback scene_0.json")
 
-    # Update metadata with completion marker
+    # Update metadata with completion marker — only NOW does the cache count
+    # as "already analyzed" (see the resume check above)
     metadata["analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    metadata["analysis_complete"] = True
     _save_metadata(cache_dir, metadata)
 
     print(f"💾 [Analyze] Results cached: {cache_dir}")

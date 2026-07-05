@@ -652,6 +652,15 @@ def annotate(body: AnnotateRequest):
             from src.asset_manager.index_store import upsert_annotations
             from src.analyzer import analyze_video, analyze_audio
 
+            def _stage_cb(stage, status, detail):
+                # per-card stage line ("镜头检测/片段理解/…") — surfaced live on
+                # the running asset's card in the grid
+                if status in ("start", "progress"):
+                    job.meta.update({"stage": stage})
+                elif status in ("done", "skip"):
+                    job.meta.update({"stage": ""})
+                job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
+
             if body.force:
                 results = []
                 for i, meta in enumerate(targets, 1):
@@ -661,16 +670,14 @@ def annotate(body: AnnotateRequest):
                     job.add(f"[file] {i}/{len(targets)} {getattr(meta, 'file_name', '')}")
                     ap = getattr(meta, "absolute_path", "")
                     if getattr(meta, "asset_type", "video") == "video":
-                        analyze_video(ap, force=True)
+                        analyze_video(ap, force=True, progress_callback=_stage_cb)
                     elif getattr(meta, "asset_type", "") == "audio":
                         analyze_audio(ap, force=True)
                     results.append(annotate_asset(meta))
                     _files_state[meta.content_hash] = "d"
-                    job.meta.update({"current": i})
+                    job.meta.update({"current": i, "stage": ""})
                 upsert_annotations(results)
             else:
-                def _stage_cb(stage, status, detail):
-                    job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
                 def _start_cb(filename):
                     h = _name_to_hash.get(filename)
                     if h:

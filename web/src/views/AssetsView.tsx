@@ -407,13 +407,24 @@ function DetailSheet({
 
 // ── asset card ──────────────────────────────────────────────────────────────
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued }: {
+const STAGE_LABELS: Record<string, string> = {
+  shot_detection: "镜头检测", captioning: "片段理解", dense_caption: "密集描述",
+  scene_merge: "场景合并", scene_analysis: "场景分析",
+};
+
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, annStage, onAnnotate, annBusy }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
   /** this exact asset is currently being annotated (hash-keyed job state) */
   annotating?: boolean;
   /** waiting in the current annotation batch */
   queued?: boolean;
+  /** current pipeline stage of THIS asset's annotation */
+  annStage?: string;
+  /** start (re-)annotation of this asset */
+  onAnnotate?: () => void;
+  /** any annotation job is running (disables the button) */
+  annBusy?: boolean;
 }) {
   const ann = a.annotation ?? {};
   const src = mediaUrl(a.absolute_path || a.file_path);
@@ -499,6 +510,15 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued 
               排队中
             </span>
           )}
+          {/* live stage strip on the running card: 镜头检测 → 片段理解 → … */}
+          {annotating && (
+            <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 bg-gradient-to-t from-black/85 to-transparent px-2.5 pt-5 pb-1.5">
+              <Loader2 className="h-3 w-3 shrink-0 animate-spin text-cyan-400" />
+              <span className="truncate text-[10.5px] text-cyan-200">
+                {STAGE_LABELS[annStage ?? ""] ?? annStage ?? "分析中"}…
+              </span>
+            </div>
+          )}
         </div>
 
         <CardContent className="p-3">
@@ -519,6 +539,24 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued 
           </div>
           {ann.summary && (
             <p className="mt-1.5 line-clamp-2 text-xs text-slate-400">{ann.summary}</p>
+          )}
+          {onAnnotate && (
+            <Button
+              variant="outline" size="sm"
+              className={cn(
+                "mt-2.5 h-7 w-full gap-1.5 text-xs",
+                a.annotated
+                  ? "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-200"
+                  : "border-cyan-500/30 bg-cyan-500/[0.08] text-cyan-300 hover:bg-cyan-500/15",
+              )}
+              disabled={annBusy}
+              onClick={(e) => { e.stopPropagation(); onAnnotate(); }}
+            >
+              {annotating || (annBusy && queued)
+                ? <Loader2 className="h-3 w-3 animate-spin" />
+                : a.annotated ? <RefreshCw className="h-3 w-3" /> : <Tags className="h-3 w-3" />}
+              {annotating ? "标注中…" : queued ? "排队中…" : a.annotated ? "重新标注" : "标注"}
+            </Button>
           )}
         </CardContent>
       </Card>
@@ -922,6 +960,12 @@ export default function AssetsView({
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
                   annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
                   queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
+                  annStage={annJob.meta.stage}
+                  annBusy={busy}
+                  onAnnotate={() => {
+                    if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;
+                    annotate([a.content_hash], a.annotated);
+                  }}
                 />
               ))}
             </div>
