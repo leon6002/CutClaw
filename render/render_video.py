@@ -211,7 +211,11 @@ def get_video_dimensions(video_path: str) -> tuple:
 
 
 def get_audio_samplerate(video_path: str) -> int:
-    """Get audio sample rate using ffprobe."""
+    """Get audio sample rate using ffprobe.
+
+    Sources without an audio stream (drone footage) make ffprobe exit 0 with
+    EMPTY stdout — that is a normal condition, not an error: return the 48 kHz
+    default quietly (silent clips get an anullsrc track at 48 kHz anyway)."""
     try:
         cmd = [
             'ffprobe',
@@ -222,8 +226,11 @@ def get_audio_samplerate(video_path: str) -> int:
             video_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
+        raw = (result.stdout or "").strip()
+        if result.returncode == 0 and raw:
+            return int(raw)
         if result.returncode == 0:
-            return int(result.stdout.strip())
+            print("Source has no audio stream — using 48000 Hz for the mix (normal for drone footage)")
     except Exception as e:
         print(f"Warning: Could not get audio sample rate: {e}")
     return 48000  # Default fallback
@@ -508,6 +515,7 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
         _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _root not in sys.path:
             sys.path.insert(0, _root)
+        import src.utils.litellm_local  # noqa: F401  — local cost map, before litellm
         import src.config as config
         import litellm
 
@@ -1331,10 +1339,14 @@ def render_video_ffmpeg(
                 # silent source (drone footage) — give the clip a REAL silent
                 # track so the audio concat/xfade chains stay homogeneous
                 j = cmd.index(source_video) + 1
+                # 0:v:0 (not 0:v): DJI/GoPro MP4s embed an MJPEG cover thumbnail
+                # as a SECOND video stream. "0:v" maps both, and ffmpeg then fails
+                # trying to re-encode the attached-picture stream through libx264.
+                # Map only the first (real) video stream.
                 cmd = (cmd[:j]
                        + ['-f', 'lavfi', '-t', str(duration), '-i',
                           f'anullsrc=channel_layout=stereo:sample_rate={audio_ar}']
-                       + cmd[j:-1] + ['-map', '0:v', '-map', '1:a'] + [clip_file])
+                       + cmd[j:-1] + ['-map', '0:v:0', '-map', '1:a'] + [clip_file])
 
             if verbose:
                 label_info = f" [S{section_idx + 1}-Shot{shot_idx + 1}]" if show_labels_for_clip else ""
