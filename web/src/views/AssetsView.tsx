@@ -960,6 +960,17 @@ export default function AssetsView({
                     <RefreshCw className="h-3.5 w-3.5 text-slate-500" />
                     强制重新标注全部…
                   </button>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"
+                    onClick={async () => {
+                      setMoreOpen(false); setError("");
+                      try {
+                        const r = await api<any>("/api/immich/writeback", { method: "POST", body: JSON.stringify({}) });
+                        setError(`Immich 回写完成：同步 ${r.synced} 个` + (r.errors?.length ? ` · 失败 ${r.errors.length}` : ""));
+                      } catch (e: any) { setError(`Immich 回写失败：${e.message}`); }
+                    }}>
+                    🖼 同步标注到 Immich 描述
+                  </button>
                 </div>
               )}
             </div>

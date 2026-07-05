@@ -709,6 +709,105 @@ def immich_import(body: ImmichImport):
             "dest": dest_dir}
 
 
+# ── Immich annotation write-back ────────────────────────────────────────────
+# Push CutClaw's VLM annotation into the Immich asset description, making the
+# analysis searchable inside Immich itself. Our block is delimited so repeated
+# syncs REPLACE it while any human-written description above is preserved.
+
+_CUTCLAW_MARK = "─── CutClaw AI 标注 ───"
+
+
+def _load_immich_map() -> dict:
+    p = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_map.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _compose_cutclaw_block(ann: dict) -> str:
+    lines = [_CUTCLAW_MARK]
+    q = ann.get("quality_score")
+    emo = ann.get("emotion") or ann.get("mood") or ""
+    head = []
+    if q not in (None, ""):
+        head.append(f"质量分 {q}")
+    if emo:
+        head.append(f"情绪 {emo}")
+    if ann.get("camera_movement"):
+        head.append(f"运镜 {ann['camera_movement']}")
+    if head:
+        lines.append(" · ".join(str(x) for x in head))
+    if ann.get("summary"):
+        lines.append(str(ann["summary"]))
+    tags = [str(t) for t in (ann.get("tags") or []) + (ann.get("visual_tags") or [])]
+    if tags:
+        lines.append("标签: " + ", ".join(dict.fromkeys(tags)))
+    if ann.get("suggested_use"):
+        lines.append("建议用途: " + str(ann["suggested_use"]))
+    lines.append(f"(CutClaw 同步于 {time.strftime('%Y-%m-%d %H:%M')})")
+    return "\n".join(lines)
+
+
+def _immich_writeback_one(immich_id: str, ann: dict) -> None:
+    info = _immich_req(f"/assets/{immich_id}")
+    cur = ((info.get("exifInfo") or {}).get("description")
+           or info.get("description") or "")
+    # strip any previous CutClaw block (keep the human part above it)
+    if _CUTCLAW_MARK in cur:
+        cur = cur.split(_CUTCLAW_MARK)[0].rstrip()
+    block = _compose_cutclaw_block(ann)
+    new_desc = (cur + "\n\n" + block).strip() if cur else block
+    _immich_req(f"/assets/{immich_id}", "PUT", {"description": new_desc[:4000]})
+
+
+def _writeback_annotations(file_names: list | None = None) -> dict:
+    """Sync annotations of Immich-bound assets back to Immich descriptions.
+
+    file_names: restrict to these local proxy filenames; None = all bound.
+    Returns {synced, skipped, errors}.
+    """
+    imap = _load_immich_map()
+    if not imap:
+        return {"synced": 0, "skipped": 0, "errors": []}
+    ann_path = os.path.join(PROJECT_ROOT, "Output", "asset_index", "annotations.json")
+    try:
+        with open(ann_path, "r", encoding="utf-8") as f:
+            store = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"synced": 0, "skipped": 0, "errors": ["annotations.json 不可读"]}
+    wanted = set(file_names) if file_names else None
+    synced, skipped, errors = 0, 0, []
+    for entry in store.values():
+        meta = entry.get("metadata") or {}
+        fname = meta.get("file_name", "")
+        bind = imap.get(fname)
+        if not bind:
+            continue
+        if wanted is not None and fname not in wanted:
+            continue
+        ann = entry.get("annotation") or {}
+        if not ann.get("summary") and not ann.get("tags"):
+            skipped += 1
+            continue
+        try:
+            _immich_writeback_one(bind["id"], ann)
+            synced += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{fname}: {str(e)[:80]}")
+    return {"synced": synced, "skipped": skipped, "errors": errors}
+
+
+class WritebackRequest(BaseModel):
+    file_names: list[str] = []
+
+
+@app.post("/api/immich/writeback")
+def immich_writeback(body: WritebackRequest):
+    return _writeback_annotations(body.file_names or None)
+
+
 # ── Assets ──────────────────────────────────────────────────────────────────
 
 def _dump(model) -> dict:
@@ -921,6 +1020,18 @@ def annotate(body: AnnotateRequest):
                 results = batch_annotate(targets, progress_callback=_file_cb,
                                          stage_callback=_stage_cb, start_callback=_start_cb)
                 upsert_annotations(results)
+            # auto write-back: freshly annotated Immich-bound assets get their
+            # description updated in Immich (searchable there too)
+            try:
+                _wb = _writeback_annotations(
+                    [getattr(r.metadata, "file_name", "") for r in results if r is not None])
+                if _wb.get("synced"):
+                    job.add(f"[immich] 标注已回写 {_wb['synced']} 个资产描述")
+                for _e2 in _wb.get("errors", [])[:3]:
+                    job.add(f"[immich] 回写失败: {_e2}")
+            except Exception as _e:  # noqa: BLE001
+                job.add(f"[immich] 回写跳过: {_e}")
+
             job.add(f"DONE — {len(results)} assets annotated")
             job.status = "done"
         except Exception as e:
