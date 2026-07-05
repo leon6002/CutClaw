@@ -654,26 +654,57 @@ def immich_import(body: ImmichImport):
     root = str(cfg("ASSET_ROOT_DIR", "resource/imports") or "resource/imports")
     dest_dir = os.path.join(_resolve(root), "immich")
     os.makedirs(dest_dir, exist_ok=True)
+
+    # Persistent binding: proxy filename → Immich identity. `id` is the API
+    # handle; `checksum` (SHA-1 of the ORIGINAL's content) is the stable
+    # content identity — it survives re-uploads AND proxy re-transcodes, so
+    # our VLM analysis stays attached to the right video forever.
+    map_path = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_map.json")
+    try:
+        with open(map_path, "r", encoding="utf-8") as f:
+            imap = json.load(f)
+    except Exception:  # noqa: BLE001
+        imap = {}
+    known_checksums = {v.get("checksum"): k for k, v in imap.items() if v.get("checksum")}
+
     imported, skipped, errors = [], [], []
     for aid in body.ids[:50]:
         safe = "".join(c for c in aid if c.isalnum() or c == "-")
         try:
             info = _immich_req(f"/assets/{safe}")
+            checksum = info.get("checksum", "")
+            # content-level dedup: same original already imported under any name
+            if checksum and checksum in known_checksums:
+                skipped.append(known_checksums[checksum])
+                continue
             stem = os.path.splitext(str(info.get("originalFileName") or safe))[0]
             stem = "".join(c for c in stem if c not in '\\/:*?"<>|')
             fname = f"{stem}__im-{safe[:8]}.mp4"
             fp = os.path.join(dest_dir, fname)
-            if os.path.exists(fp) and os.path.getsize(fp) > 0:
+            if not (os.path.exists(fp) and os.path.getsize(fp) > 0):
+                data = _immich_req(f"/assets/{safe}/video/playback", raw=True, timeout=300)
+                with open(fp, "wb") as f:
+                    f.write(data)
+                imported.append(fname)
+            else:
                 skipped.append(fname)
-                continue
-            data = _immich_req(f"/assets/{safe}/video/playback", raw=True, timeout=300)
-            with open(fp, "wb") as f:
-                f.write(data)
-            imported.append(fname)
+            imap[fname] = {
+                "id": info.get("id", safe),
+                "checksum": checksum,
+                "original_name": info.get("originalFileName", ""),
+                "original_path": info.get("originalPath", ""),
+                "duration": info.get("duration", ""),
+            }
+            if checksum:
+                known_checksums[checksum] = fname
         except HTTPException as e:
             errors.append(f"{aid[:8]}: {e.detail}")
         except Exception as e:  # noqa: BLE001
             errors.append(f"{aid[:8]}: {e}")
+
+    os.makedirs(os.path.dirname(map_path), exist_ok=True)
+    with open(map_path, "w", encoding="utf-8") as f:
+        json.dump(imap, f, ensure_ascii=False, indent=2)
     return {"imported": imported, "skipped": skipped, "errors": errors,
             "dest": dest_dir}
 
