@@ -219,23 +219,42 @@ def _iter_clip_frames(
         if not valid_indices:
             continue
 
-        # Cap frames per VLM call: sending the full 2fps sample (60 frames for
-        # a 30s clip) cost ~57k input tokens PER CALL (~1.1k tok/frame
-        # measured). 16 evenly-spaced frames describe a ≤30s clip just as
-        # well at ~30% of the cost.
-        _max_f = 16
-        try:
-            from src import config as _cfg
-            _max_f = max(4, int(getattr(_cfg, "VIDEO_CAPTION_MAX_FRAMES", 16) or 16))
-        except Exception:
-            pass
-        if len(valid_indices) > _max_f:
-            _step = len(valid_indices) / _max_f
-            valid_indices = [valid_indices[int(i * _step)] for i in range(_max_f)]
-
         orig_indices = [frame_indices[idx] for idx in valid_indices]
         chunk_frames = video_reader.get_batch(orig_indices).asnumpy()
-        arrays = list(chunk_frames)
+
+        # Motion-aware frame selection. The full 2fps sample (60 frames / 30s
+        # clip) measured ~57k input tokens per call; but UNIFORM subsampling
+        # is lossy — sub-2s action peaks (a jump apex, a splash) can vanish
+        # between anchors. Instead: decode everything (cheap at 240p), score
+        # inter-frame motion, and keep uniform anchors + the highest-motion
+        # frames. Every visual event above noise survives; only redundant
+        # near-duplicate frames are dropped (which also sharpens VLM focus —
+        # walls of identical frames dilute attention).
+        # VIDEO_CAPTION_MAX_FRAMES=0 disables the cap entirely.
+        _max_f = 24
+        try:
+            from src import config as _cfg
+            _max_f = int(getattr(_cfg, "VIDEO_CAPTION_MAX_FRAMES", 24) or 0)
+        except Exception:
+            pass
+        if _max_f and len(chunk_frames) > _max_f:
+            import numpy as _np
+            _diffs = _np.abs(
+                chunk_frames[1:].astype(_np.int16) - chunk_frames[:-1].astype(_np.int16)
+            ).mean(axis=(1, 2, 3))  # motion score for frames 1..N-1
+            _n = len(chunk_frames)
+            _keep = {0, _n - 1}
+            _n_anchor = max(6, _max_f // 3)          # uniform coverage floor
+            for _i in range(_n_anchor):
+                _keep.add(int(_i * (_n - 1) / max(1, _n_anchor - 1)))
+            for _di in _np.argsort(_diffs)[::-1]:    # then motion peaks
+                if len(_keep) >= _max_f:
+                    break
+                _keep.add(int(_di) + 1)
+            _sel = sorted(_keep)[:_max_f]
+            arrays = [chunk_frames[_i] for _i in _sel]
+        else:
+            arrays = list(chunk_frames)
 
         clip_data = {
             "arrays": arrays,

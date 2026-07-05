@@ -188,10 +188,12 @@ VIDEO_ANALYSIS_API_KEY = "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL"
 CAPTION_BATCH_SIZE = 64
 # Batch size for parallel clip captioning/analysis.
 
-VIDEO_CAPTION_MAX_FRAMES = 16
-# Max frames sent to the VLM per clip-captioning call. The full 2fps sample
-# (60 frames / 30s clip) measured ~57k input tokens PER CALL; 16 frames keep
-# description quality while cutting vision cost ~3x.
+VIDEO_CAPTION_MAX_FRAMES = 24
+# Max frames per clip-captioning VLM call, selected MOTION-AWARE (uniform
+# anchors + highest inter-frame-change peaks), so sub-2s action moments are
+# preserved — only redundant near-duplicate frames get dropped. The full 2fps
+# sample measured ~57k input tokens per call (~1.1k/frame); 24 smart frames
+# ≈ 27k with near-lossless content coverage. Set 0 to disable the cap.
 
 ANNOTATE_VIDEO_WORKERS = 2
 # Videos annotated in parallel during batch annotation (separate PROCESSES —
