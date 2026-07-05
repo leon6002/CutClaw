@@ -1022,6 +1022,11 @@ def render_video_ffmpeg(
                     '-vf', video_filter,
                     '-r', str(video_fps),
                     '-c:v', 'libx264',  # Re-encode for consistent format
+                    # 8-bit is REQUIRED: 10-bit sources (e.g. DJI D-Log) would
+                    # otherwise make x264 emit High10, and a concat-copy stream
+                    # that switches profile mid-file kills every hardware
+                    # decoder (browser/NVDEC) exactly at that clip boundary.
+                    '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac',
                     '-ar', str(audio_ar),
                     '-ac', '2',
@@ -1089,6 +1094,7 @@ def render_video_ffmpeg(
                         # inflates. Every extraction branch must emit the same -r.
                         '-r', str(video_fps),
                         '-c:v', 'libx264',  # Re-encode for consistent format
+                        '-pix_fmt', 'yuv420p',  # force 8-bit (10-bit source → High10 breaks hw decoders)
                         '-c:a', 'aac',
                         '-ar', str(audio_ar),
                         '-ac', '2',
@@ -1106,6 +1112,7 @@ def render_video_ffmpeg(
                         '-t', str(duration),
                         '-r', str(video_fps),
                         '-c:v', 'libx264',  # Re-encode for consistent format
+                        '-pix_fmt', 'yuv420p',  # force 8-bit (10-bit source → High10 breaks hw decoders)
                         '-c:a', 'aac',
                         '-ar', str(audio_ar),
                         '-ac', '2',
@@ -1289,7 +1296,7 @@ def render_video_ffmpeg(
 
                 # Use re-encode when ending clip is present so -t can cut precisely
                 # (copy mode can only cut at keyframe boundaries, truncating the ending).
-                video_codec = ['libx264', '-preset', 'fast', '-crf', '18'] if outro_duration > 0 else ['copy']
+                video_codec = ['libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
                 cmd = [
                     'ffmpeg',
                     '-y',
@@ -1335,7 +1342,7 @@ def render_video_ffmpeg(
                 )
                 filter_complex = ";".join(filter_parts)
 
-                video_codec = ['libx264', '-preset', 'fast', '-crf', '18'] if outro_duration > 0 else ['copy']
+                video_codec = ['libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
                 cmd = [
                     'ffmpeg',
                     '-y',
