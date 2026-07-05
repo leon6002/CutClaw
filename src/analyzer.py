@@ -646,9 +646,13 @@ def analyze_audio(
     if os.path.exists(caption_path) and not force:
         old_sig = None
         has_facts = False
+        poisoned = []
         try:
+            from src.audio.caption_quality import find_poisoned_subsegments
             with open(caption_path, "r", encoding="utf-8") as f:
-                has_facts = bool(json.load(f).get("facts"))
+                caption_data = json.load(f)
+            has_facts = bool(caption_data.get("facts"))
+            poisoned = find_poisoned_subsegments(caption_data)
         except Exception:
             pass
         try:
@@ -662,6 +666,11 @@ def analyze_audio(
             # mellow tracks (poisoned format, never reuse)
             print(f"🔁 [Analyze] Audio cache is pre-facts-layer (no measured tempo) — "
                   f"re-analyzing {os.path.basename(audio_path)}...")
+        elif poisoned:
+            # baked-in failure placeholders (empty / "no audio" refusals) came
+            # from runs before captioning failures raised — never reuse them
+            print(f"🔁 [Analyze] Audio cache has {len(poisoned)} placeholder sub-segment caption(s) "
+                  f"(e.g. {poisoned[0]}) — re-analyzing {os.path.basename(audio_path)}...")
         elif old_sig is None or old_sig == params_sig:
             # old_sig is None for legacy caches (params unknown) — grandfather them
             print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")

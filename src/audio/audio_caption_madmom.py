@@ -37,7 +37,8 @@ from typing import Dict, List, Optional
 import soundfile as sf
 import numpy as np
 
-from src.audio.litellm_client import call_audio_api, call_audio_api_batch
+from src.audio.litellm_client import call_audio_api, call_audio_api_batch, AUDIO_MODEL
+from src.audio.caption_quality import caption_reports_missing_audio
 from .. import config
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +135,34 @@ Output ONLY valid JSON:
 }}
 Do NOT output timestamps, BPM or any numeric values — those are already measured."""
 
+
+
+# --------------------------------------------------------------------------- #
+#                           Failure Helpers                                   #
+# --------------------------------------------------------------------------- #
+def _no_audio_error(context: str) -> RuntimeError:
+    """Error for responses that prove the model never received the audio."""
+    return RuntimeError(
+        f"{context}: the model responded that it received NO AUDIO. "
+        f"The configured audio model ({AUDIO_MODEL}) most likely cannot accept "
+        "audio input (e.g. a text-only model). Set AUDIO_LITELLM_MODEL to an "
+        "audio-capable (omni) model in src/config.py or the model settings UI. "
+        "Refusing to bake placeholder captions into the analysis cache."
+    )
+
+
+def _validate_subsegment_caption(caption_text) -> tuple:
+    """Check one sub-segment caption. Returns (parsed_dict_or_None, reason)."""
+    if caption_text is None or not str(caption_text).strip():
+        return None, "empty response"
+    if caption_reports_missing_audio(caption_text):
+        return None, "model reports it received no audio"
+    parsed = extract_json_from_text(caption_text)
+    if not isinstance(parsed, dict):
+        return None, "JSON parsing failed"
+    if not str(parsed.get("summary", "")).strip():
+        return None, "empty summary"
+    return parsed, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -858,8 +887,16 @@ def caption_audio_with_madmom_segments(
             climax=audio_facts.get("climax_sec", "?"),
         )
         _names: dict = {}
+        _resp = None
         try:
             _resp = call_audio_api(audio_path, _naming_prompt, temperature, top_p, max_tokens)
+        except Exception as _e:  # noqa: BLE001
+            print(f"  ⚠ naming call failed ({_e}) — using generic section names")
+        if _resp and caption_reports_missing_audio(_resp):
+            # fail fast: if the naming call got no audio, every sub-segment
+            # caption below would fail (or hallucinate) the same way
+            raise _no_audio_error("Section naming (STAGE 2)")
+        if _resp:
             _pj = extract_json_from_text(_resp) or {}
             overall_summary = str(_pj.get("summary", "") or "")
             for _it in _pj.get("sections", []) or []:
@@ -870,8 +907,6 @@ def caption_audio_with_madmom_segments(
                     )
                 except (TypeError, ValueError):
                     continue
-        except Exception as _e:  # noqa: BLE001
-            print(f"  ⚠ naming call failed ({_e}) — using generic section names")
         for _i in range(len(_fact_bounds) - 1):
             _nm, _ds = _names.get(_i, ("", ""))
             stage1_sections.append({
@@ -895,6 +930,9 @@ def caption_audio_with_madmom_segments(
             max_tokens=max_tokens,
             audio_duration=audio_duration,
         )
+
+        if caption_reports_missing_audio(overall_analysis_text):
+            raise _no_audio_error("Overall analysis (STAGE 2)")
 
         # Try to parse JSON from overall analysis
         overall_json = extract_json_from_text(overall_analysis_text)
@@ -1433,8 +1471,12 @@ def caption_audio_with_madmom_segments(
             subsegment_info_list.append((section_idx, subseg_idx, subseg, segment_path))
 
         except Exception as e:
-            print(f"✗ Section {section_idx + 1}, Sub-segment {subseg_idx + 1}: Error extracting - {e}")
-            subsegment_info_list.append((section_idx, subseg_idx, subseg, None))
+            # A failed slice means a local bug or a broken source file — baking
+            # an empty sub-segment into the cache would hide it forever
+            raise RuntimeError(
+                f"Failed to extract audio for Section {section_idx + 1}, "
+                f"Sub-segment {subseg_idx + 1} ({start_time:.2f}s - {end_time:.2f}s): {e}"
+            ) from e
 
     # Step 2: Process sub-segments in batches
     print(f"\n{'-'*80}")
@@ -1487,6 +1529,69 @@ def caption_audio_with_madmom_segments(
     for path, caption_text in zip(valid_segment_paths, caption_texts):
         subsegment_captions[path] = caption_text
 
+    # Validate every caption (audio actually heard + parseable JSON) and retry
+    # only the failed ones. Failures that survive the retries must raise —
+    # placeholder text baked into the cache is never retried again.
+    CAPTION_RETRY_ROUNDS = 2
+    parsed_captions = {}  # Maps segment_path to parsed caption dict
+    failed_reasons = {}
+
+    for round_no in range(CAPTION_RETRY_ROUNDS + 1):
+        failed_paths = []
+        failed_reasons = {}
+        for path in valid_segment_paths:
+            if path in parsed_captions:
+                continue
+            parsed, reason = _validate_subsegment_caption(subsegment_captions.get(path))
+            if parsed is not None:
+                parsed_captions[path] = parsed
+            else:
+                failed_paths.append(path)
+                failed_reasons[path] = reason
+
+        if not failed_paths:
+            break
+        if round_no == CAPTION_RETRY_ROUNDS:
+            break
+
+        print(f"\n⚠ {len(failed_paths)} sub-segment caption(s) invalid — "
+              f"retry round {round_no + 1}/{CAPTION_RETRY_ROUNDS}...")
+        for path in failed_paths:
+            _si, _bi, _ = path_to_info[path]
+            print(f"    - Section {_si + 1}, Sub {_bi + 1}: {failed_reasons[path]}")
+        retry_texts = generate_audio_captions_batch(
+            audio_paths=failed_paths,
+            prompt=AUDIO_SEG_KEYPOINT_PROMPT.replace("MEASURED_TEMPO_LINE", _tempo_line),
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_workers=max_workers,
+        )
+        for path, text in zip(failed_paths, retry_texts):
+            subsegment_captions[path] = text
+
+    if failed_reasons:
+        details = []
+        for path, reason in failed_reasons.items():
+            _si, _bi, _ss = path_to_info[path]
+            details.append(
+                f"  - Section {_si + 1}, Sub {_bi + 1} "
+                f"({_ss['start_time']:.1f}s - {_ss['end_time']:.1f}s): {reason}"
+            )
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"Sub-segment captioning failed for {len(failed_reasons)}/{len(valid_segment_paths)} "
+            f"segments after {CAPTION_RETRY_ROUNDS} retry rounds:\n" + "\n".join(details) +
+            f"\nIf the model reports missing audio, AUDIO_LITELLM_MODEL ({AUDIO_MODEL}) "
+            "likely cannot accept audio input — configure an audio-capable (omni) model. "
+            "Refusing to bake placeholder captions into the analysis cache."
+        )
+
     print(f"✓ All sub-segments processed")
 
     # Step 3: Build the two-level structure
@@ -1503,42 +1608,25 @@ def caption_audio_with_madmom_segments(
             "End_Time": seconds_to_mmss(subseg['relative_end'])
         }
 
-        if segment_path is None:
-            print(f"  Section {section_idx + 1}, Sub {subseg_idx + 1}: No audio (skipped)")
-            final_sections[section_idx]["detailed_analysis"]["sections"].append(sub_section)
-            continue
+        # Every path was validated above — parsed dict with a non-empty summary
+        segment_json = parsed_captions[segment_path]
 
-        # Get caption for this sub-segment
-        caption_text = subsegment_captions.get(segment_path)
+        # Merge the analysis fields into sub_section
+        if "summary" in segment_json:
+            sub_section["description"] = segment_json["summary"]
+        if "emotion" in segment_json:
+            sub_section["Emotional_Tone"] = segment_json["emotion"]
+        if "energy" in segment_json:
+            sub_section["energy"] = segment_json["energy"]
+        if "rhythm" in segment_json:
+            sub_section["rhythm"] = segment_json["rhythm"]
 
-        if caption_text is None:
-            print(f"  Section {section_idx + 1}, Sub {subseg_idx + 1}: Caption generation failed")
-            final_sections[section_idx]["detailed_analysis"]["sections"].append(sub_section)
-            continue
+        # Also store the raw detailed analysis if there are extra fields
+        for key, value in segment_json.items():
+            if key not in ["summary", "emotion", "energy", "rhythm"]:
+                sub_section[key] = value
 
-        # Try to parse JSON from caption
-        segment_json = extract_json_from_text(caption_text)
-
-        if segment_json and isinstance(segment_json, dict):
-            # Merge the analysis fields into sub_section
-            if "summary" in segment_json:
-                sub_section["description"] = segment_json["summary"]
-            if "emotion" in segment_json:
-                sub_section["Emotional_Tone"] = segment_json["emotion"]
-            if "energy" in segment_json:
-                sub_section["energy"] = segment_json["energy"]
-            if "rhythm" in segment_json:
-                sub_section["rhythm"] = segment_json["rhythm"]
-
-            # Also store the raw detailed analysis if there are extra fields
-            for key, value in segment_json.items():
-                if key not in ["summary", "emotion", "energy", "rhythm"]:
-                    sub_section[key] = value
-
-            print(f"✓ Section {section_idx + 1}, Sub {subseg_idx + 1}: Detailed analysis added")
-        else:
-            sub_section["description"] = caption_text
-            print(f"⚠ Section {section_idx + 1}, Sub {subseg_idx + 1}: Raw text added (JSON parsing failed)")
+        print(f"✓ Section {section_idx + 1}, Sub {subseg_idx + 1}: Detailed analysis added")
 
         final_sections[section_idx]["detailed_analysis"]["sections"].append(sub_section)
 
