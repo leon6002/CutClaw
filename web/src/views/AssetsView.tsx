@@ -225,11 +225,25 @@ function DetailView({
   busy: boolean; annMeta?: Record<string, any>;
   onPrev?: () => void; onNext?: () => void; pos?: string;
 }) {
-  const [details, setDetails] = useState<{ clips: any[]; scenes: any[] } | null>(null);
+  const [details, setDetails] = useState<{ clips: any[]; scenes: any[]; sound_highlights?: any[] } | null>(null);
   const [loading, setLoading] = useState(false);
   // annotation track: cloud (API) vs local VLM — two parallel, persisted results
   const [track, setTrack] = useState<"cloud" | "local">("cloud");
+  const [shlBusy, setShlBusy] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  const detectHighlights = async () => {
+    if (!asset) return;
+    setShlBusy(true);
+    try {
+      const r = await api<{ segments: any[] }>("/api/assets/sound_highlights", {
+        method: "POST",
+        body: JSON.stringify({ content_hash: asset.content_hash, path: asset.absolute_path || asset.file_path }),
+      });
+      setDetails((d) => ({ ...(d ?? { clips: [], scenes: [] }), sound_highlights: r.segments }));
+    } catch { /* surfaced by the empty state */ }
+    setShlBusy(false);
+  };
 
   useEffect(() => { setTrack("cloud"); }, [asset?.content_hash]);
 
@@ -336,6 +350,38 @@ function DetailView({
             {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
             {asset.absolute_path || asset.file_path}
           </div>
+
+          {/* measured voice/laughter segments — click to LISTEN at that spot */}
+          {asset.asset_type === "video" && (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-violet-300">🎙 声音高光</span>
+              {details?.sound_highlights === undefined ? (
+                <Button
+                  variant="outline" size="sm"
+                  className="h-6 gap-1 border-violet-500/30 bg-violet-500/[0.06] px-2 text-[11px] text-violet-300"
+                  disabled={shlBusy} onClick={detectHighlights}
+                  title="信号分析检测原声里的人声/笑声段（一次检测永久缓存）"
+                >
+                  {shlBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                  {shlBusy ? "检测中…" : "检测"}
+                </Button>
+              ) : (details.sound_highlights.length === 0 ? (
+                <span className="text-[11px] text-slate-600">未检测到人声/笑声（无人机素材通常没有音轨）</span>
+              ) : (
+                details.sound_highlights.map((h: any, i: number) => (
+                  <button
+                    key={i}
+                    className="rounded-full border border-violet-400/40 bg-violet-500/10 px-2 py-0.5 text-[11px] text-violet-200 hover:bg-violet-500/25"
+                    title={`点击跳到 ${h.start}s 试听 · 强度 ${Math.round((h.strength ?? 0) * 100)}%`}
+                    onClick={() => seek(h.start)}
+                  >
+                    {h.start.toFixed(1)}–{h.end.toFixed(1)}s
+                  </button>
+                ))
+              ))}
+              <span className="text-[10px] text-slate-600">— 渲染时这些片段会压低 BGM 放出原声</span>
+            </div>
+          )}
         </div>
         <div className="min-w-[320px] flex-[2] basis-[360px] rounded-xl border border-white/[0.07] bg-white/[0.02] p-3.5">
           <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-300">

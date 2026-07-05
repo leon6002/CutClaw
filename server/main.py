@@ -1110,12 +1110,44 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
                         result["scenes"].append(json.load(f))
                 except Exception:
                     pass
+    # measured voice/laughter segments in the ORIGINAL audio (may be absent
+    # for annotations that predate the feature — the UI offers on-demand detect)
+    shl = os.path.join(cache_dir, "sound_highlights.json")
+    if os.path.exists(shl):
+        try:
+            with open(shl, "r", encoding="utf-8") as f:
+                result["sound_highlights"] = json.load(f).get("segments", [])
+        except Exception:  # noqa: BLE001
+            result["sound_highlights"] = []
     return result
 
 
 @app.get("/api/assets/{content_hash}/details")
 def asset_details(content_hash: str, variant: str = ""):
     return _analysis_details(content_hash, variant)
+
+
+class SoundHighlightRequest(BaseModel):
+    content_hash: str
+    path: str          # media path the player already uses
+
+
+@app.post("/api/assets/sound_highlights")
+def asset_sound_highlights(body: SoundHighlightRequest):
+    """Detect voice/laughter segments for one asset on demand (backfill for
+    annotations made before the feature). Cached in the analysis dir, so this
+    runs the signal analysis at most once per asset."""
+    from src.analyzer import get_analysis_path
+    abs_path = _resolve(body.path)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(404, f"not found: {body.path}")
+    cache_dir = get_analysis_path(body.content_hash)
+    if not os.path.isdir(cache_dir):
+        raise HTTPException(400, "该素材还没有分析缓存 — 先标注一次")
+    from src.audio.sound_highlights import detect_sound_highlights
+    segs = detect_sound_highlights(
+        abs_path, cache_path=os.path.join(cache_dir, "sound_highlights.json"))
+    return {"segments": segs}
 
 
 class AnnotateRequest(BaseModel):
