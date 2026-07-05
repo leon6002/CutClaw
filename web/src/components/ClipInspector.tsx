@@ -170,45 +170,52 @@ export function ActiveClipCard({ clip, index }: { clip: ClipMapEntry | null; ind
   const [zh] = useZhFlag();
   const zhMap = useZh([clip?.content, clip?.analysis], zh);
   const disp = (t?: string) => (zh && t && zhMap[t]) || t;
-  if (!clip) {
-    return (
-      <div className="flex h-[120px] items-center justify-center rounded-xl border border-dashed border-white/10 text-xs text-slate-600">
-        播放视频 — 当前镜头的剧本会固定显示在这里
-      </div>
-    );
-  }
+  // FIXED height: content changes with every shot — if the card grew/shrank
+  // with its text, everything below would jump on each cut.
   return (
-    <div className="rounded-xl border border-cyan-400/50 bg-cyan-400/[0.06] px-3.5 py-3 shadow-[0_0_16px_rgba(34,211,238,0.10)]">
-      <div className="flex items-center gap-2 text-[11.5px]">
-        <span className="font-bold text-cyan-300">▶ 当前镜头 #{index + 1}</span>
-        <span className="tabular-nums text-slate-400">成片 {clip.out_start.toFixed(1)}–{clip.out_end.toFixed(1)}s</span>
-        <span className="truncate tabular-nums text-slate-500">
-          ← {clip.video} [{clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s]
-        </span>
-      </div>
-      <div className="mt-2 rounded-lg bg-black/25 px-2.5 py-1.5">
-        <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
-        <div className="text-[11.5px] leading-snug text-slate-200">{disp(clip.content) || "—"}</div>
-      </div>
-      <div className="mt-1.5 rounded-lg bg-black/25 px-2.5 py-1.5">
-        <div className="text-[9px] uppercase tracking-wider text-emerald-400/70">VLM 实际看到</div>
-        <div className="max-h-[130px] overflow-y-auto text-[11.5px] leading-snug text-slate-200">
-          {disp(clip.analysis) || <span className="text-slate-500">（该源时间段无缓存描述）</span>}
+    <div className="flex h-[320px] flex-col rounded-xl border border-cyan-400/50 bg-cyan-400/[0.06] px-3.5 py-3 shadow-[0_0_16px_rgba(34,211,238,0.10)]">
+      {!clip ? (
+        <div className="flex flex-1 items-center justify-center text-xs text-slate-600">
+          播放视频 — 当前镜头的剧本会固定显示在这里
         </div>
-      </div>
+      ) : (
+        <>
+          <div className="flex shrink-0 items-center gap-2 text-[11.5px]">
+            <span className="font-bold text-cyan-300">▶ 当前镜头 #{index + 1}</span>
+            <span className="tabular-nums text-slate-400">成片 {clip.out_start.toFixed(1)}–{clip.out_end.toFixed(1)}s</span>
+            <span className="truncate tabular-nums text-slate-500">
+              ← {clip.video} [{clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s]
+            </span>
+          </div>
+          <div className="mt-2 shrink-0 rounded-lg bg-black/25 px-2.5 py-1.5">
+            <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
+            <div className="max-h-[88px] overflow-y-auto text-[11.5px] leading-snug text-slate-200">
+              {disp(clip.content) || "—"}
+            </div>
+          </div>
+          <div className="mt-1.5 flex min-h-0 flex-1 flex-col rounded-lg bg-black/25 px-2.5 py-1.5">
+            <div className="shrink-0 text-[9px] uppercase tracking-wider text-emerald-400/70">VLM 实际看到</div>
+            <div className="min-h-0 flex-1 overflow-y-auto text-[11.5px] leading-snug text-slate-200">
+              {disp(clip.analysis) || <span className="text-slate-500">（该源时间段无缓存描述）</span>}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
 /** Full inspector list synced to playhead. */
 export function ClipInspector({
-  clips, currentTime, error, onRetry, onSeek, maxHeight = "440px",
+  clips, currentTime, error, onRetry, onSeek, maxHeight = "440px", compact = false,
 }: {
   clips: ClipMapEntry[] | null; currentTime: number;
   error?: string; onRetry?: () => void;
   onSeek?: (t: number) => void;
   /** CSS max-height of the scrolling list (e.g. "calc(100vh - 260px)") */
   maxHeight?: string;
+  /** slim one-line index rows — details live in the ActiveClipCard instead */
+  compact?: boolean;
 }) {
   const activeIdx = useMemo(() => activeClipAt(clips, currentTime), [clips, currentTime]);
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -275,6 +282,32 @@ export function ClipInspector({
         const intent = [c.content, c.visuals, c.visual_beat, c.emotion].filter(Boolean).join(" ");
         const score = matchScore(intent, c.analysis);
         const mismatch = score >= 0 && score < 0.06 && !!c.analysis;
+        if (compact) {
+          return (
+            <div
+              key={i}
+              ref={(el) => { rowRefs.current[i] = el; }}
+              onClick={() => onSeek?.(c.out_start + 0.05)}
+              title="点击跳转到该镜头（详情在上方「当前镜头」卡片）"
+              className={
+                "flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-[11px] transition-colors " +
+                (onSeek ? "cursor-pointer " : "") +
+                (active
+                  ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
+                  : "border-white/[0.05] bg-white/[0.02] text-slate-400 hover:border-white/[0.14]")
+              }
+            >
+              <span className={"w-7 shrink-0 " + (active ? "font-bold text-cyan-300" : "text-slate-500")}>
+                #{i + 1}
+              </span>
+              <span className="shrink-0 tabular-nums">{c.out_start.toFixed(1)}–{c.out_end.toFixed(1)}s</span>
+              <span className="min-w-0 flex-1 truncate tabular-nums text-slate-500">
+                ← {c.video} [{c.src_start?.toFixed(1)}–{c.src_end?.toFixed(1)}s]
+              </span>
+              {mismatch && <span className="shrink-0 text-[10px] text-amber-400" title="剧本与画面词汇几乎零重叠 — 建议人工确认">⚠</span>}
+            </div>
+          );
+        }
         return (
           <div
             key={i}

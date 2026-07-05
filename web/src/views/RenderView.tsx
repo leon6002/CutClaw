@@ -356,7 +356,7 @@ export default function RenderView({
                   <ClipInspector
                     clips={clipMap} currentTime={playhead} error={clipMapError}
                     onRetry={reloadClipMap} onSeek={seekTo}
-                    maxHeight="400px"
+                    maxHeight="360px" compact
                   />
                 </div>
               </div>
