@@ -164,6 +164,42 @@ export function ClipCaption({ clip, playhead = -1 }: { clip: ClipMapEntry | null
   );
 }
 
+/** Focus card pinned beside the player: the CURRENT shot's full script,
+ * always in the same spot — no hunting inside the scrolling list. */
+export function ActiveClipCard({ clip, index }: { clip: ClipMapEntry | null; index: number }) {
+  const [zh] = useZhFlag();
+  const zhMap = useZh([clip?.content, clip?.analysis], zh);
+  const disp = (t?: string) => (zh && t && zhMap[t]) || t;
+  if (!clip) {
+    return (
+      <div className="flex h-[120px] items-center justify-center rounded-xl border border-dashed border-white/10 text-xs text-slate-600">
+        播放视频 — 当前镜头的剧本会固定显示在这里
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl border border-cyan-400/50 bg-cyan-400/[0.06] px-3.5 py-3 shadow-[0_0_16px_rgba(34,211,238,0.10)]">
+      <div className="flex items-center gap-2 text-[11.5px]">
+        <span className="font-bold text-cyan-300">▶ 当前镜头 #{index + 1}</span>
+        <span className="tabular-nums text-slate-400">成片 {clip.out_start.toFixed(1)}–{clip.out_end.toFixed(1)}s</span>
+        <span className="truncate tabular-nums text-slate-500">
+          ← {clip.video} [{clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s]
+        </span>
+      </div>
+      <div className="mt-2 rounded-lg bg-black/25 px-2.5 py-1.5">
+        <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
+        <div className="text-[11.5px] leading-snug text-slate-200">{disp(clip.content) || "—"}</div>
+      </div>
+      <div className="mt-1.5 rounded-lg bg-black/25 px-2.5 py-1.5">
+        <div className="text-[9px] uppercase tracking-wider text-emerald-400/70">VLM 实际看到</div>
+        <div className="max-h-[130px] overflow-y-auto text-[11.5px] leading-snug text-slate-200">
+          {disp(clip.analysis) || <span className="text-slate-500">（该源时间段无缓存描述）</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Full inspector list synced to playhead. */
 export function ClipInspector({
   clips, currentTime, error, onRetry, onSeek, maxHeight = "440px",

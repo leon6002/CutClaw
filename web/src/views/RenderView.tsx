@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
 import { ShotTimeline } from "../components/Charts";
-import { ClipCaption, ClipInspector, activeClipAt, useClipMap } from "../components/ClipInspector";
+import { ActiveClipCard, ClipCaption, ClipInspector, activeClipAt, useClipMap } from "../components/ClipInspector";
 import type { PipelineStatus, ProjectState } from "../App";
 
 interface RecentProject {
@@ -347,13 +347,18 @@ export default function RenderView({
                 </div>
               </div>
 
-              {/* right: script list, own scroll, follows the playhead */}
+              {/* right: pinned focus card (current shot) + compact full list.
+                  List height is capped so both columns end together — no
+                  page-long scroll, no blank space under the player. */}
               <div className="min-w-[360px] flex-[2] basis-[400px]">
-                <ClipInspector
-                  clips={clipMap} currentTime={playhead} error={clipMapError}
-                  onRetry={reloadClipMap} onSeek={seekTo}
-                  maxHeight="calc(100vh - 240px)"
-                />
+                <ActiveClipCard clip={activeClip} index={activeIdx} />
+                <div className="mt-3">
+                  <ClipInspector
+                    clips={clipMap} currentTime={playhead} error={clipMapError}
+                    onRetry={reloadClipMap} onSeek={seekTo}
+                    maxHeight="400px"
+                  />
+                </div>
               </div>
             </div>
           </CardContent>
