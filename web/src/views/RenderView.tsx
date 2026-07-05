@@ -38,6 +38,7 @@ export default function RenderView({
   const [hasEnding, setHasEnding] = useState(false);
   const [addEnding, setAddEnding] = useState(false);
   const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("none");
+  const [sourceQuality, setSourceQuality] = useState<"proxy" | "original">("proxy");
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
@@ -113,6 +114,7 @@ export default function RenderView({
           ratio, add_ending: addEnding, has_dialogue: project.hasDialogue,
           transition: transitionMode === "uniform" ? 0.4 : 0,
           transition_mode: transitionMode === "ai" ? "ai" : "",
+          source_quality: sourceQuality,
         }),
       });
       setJobId(r.job_id);
@@ -202,6 +204,34 @@ export default function RenderView({
                     : transitionMode === "uniform"
                       ? "所有切点统一 0.4s 交叉溶解"
                       : "快节奏卡点推荐（硬切更带感）"}
+                </span>
+              </div>
+
+              <div className="mb-4 flex flex-wrap items-center gap-2.5 text-[13px] text-slate-300">
+                <span>渲染源</span>
+                <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                  {([
+                    ["proxy", "1080p 代理（快）"],
+                    ["original", "4K 原片"],
+                  ] as const).map(([v, label]) => (
+                    <button
+                      key={v}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 text-xs transition-colors",
+                        sourceQuality === v
+                          ? "bg-cyan-500/15 font-semibold text-cyan-300"
+                          : "text-slate-400 hover:text-slate-200",
+                      )}
+                      onClick={() => setSourceQuality(v)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-[11px] text-slate-500">
+                  {sourceQuality === "original"
+                    ? "Immich 素材将拉取/直读 4K 原片渲染（首次较慢，之后缓存）"
+                    : "发抖音等平台 1080p 足够 — 本地 4K 素材不受此选项影响"}
                 </span>
               </div>
 

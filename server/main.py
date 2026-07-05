@@ -808,6 +808,86 @@ def immich_writeback(body: WritebackRequest):
     return _writeback_annotations(body.file_names or None)
 
 
+def _immich_stream_original(immich_id: str, dst: str):
+    """Stream an original (can be hundreds of MB) to disk without buffering."""
+    import shutil as _sh
+    import urllib.request
+    base = str(cfg("IMMICH_URL", "http://127.0.0.1:2284")).rstrip("/")
+    req = urllib.request.Request(
+        f"{base}/api/assets/{immich_id}/original",
+        headers={"x-api-key": str(cfg("IMMICH_API_KEY", ""))})
+    tmp = dst + ".part"
+    with urllib.request.urlopen(req, timeout=1800) as resp, open(tmp, "wb") as f:
+        _sh.copyfileobj(resp, f, length=1 << 20)
+    os.replace(tmp, dst)
+
+
+def _materialize_immich_originals(abs_point: str) -> tuple[str, list[str]]:
+    """4K source swap for original-quality renders: rewrite Immich PROXY paths
+    in shot_point.json to the ORIGINALS. Resolution order per clip:
+    IMMICH_PATH_MAP (zero-copy read from the mounted volume) → cached
+    download → keep proxy (with a note). Times are seconds — they map 1:1
+    between proxy and original. Returns (shot_json_to_use, notes)."""
+    imap = _load_immich_map()
+    notes: list[str] = []
+    if not imap:
+        return abs_point, notes
+    with open(abs_point, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    entries = data if isinstance(data, list) else []
+
+    pm = str(cfg("IMMICH_PATH_MAP", "") or "").strip()
+    cpfx, hpfx = (pm.split("::", 1) if "::" in pm else ("", ""))
+    dl_dir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_originals")
+
+    resolved: dict = {}
+
+    def _orig_for(fname: str):
+        if fname in resolved:
+            return resolved[fname]
+        bind = imap.get(fname)
+        out = None
+        if bind:
+            # zero-copy via host-mounted Immich volume
+            op = str(bind.get("original_path") or "")
+            if cpfx and op.startswith(cpfx):
+                hp = hpfx + op[len(cpfx):]
+                if os.path.exists(hp):
+                    out = hp
+                    notes.append(f"零拷贝: {fname} → {hp}")
+            if out is None:
+                os.makedirs(dl_dir, exist_ok=True)
+                ext = os.path.splitext(str(bind.get("original_name") or ""))[1] or ".mp4"
+                dst = os.path.join(dl_dir, f"{bind['id']}{ext}")
+                if not (os.path.exists(dst) and os.path.getsize(dst) > 0):
+                    notes.append(f"拉取原片: {bind.get('original_name', fname)}")
+                    _immich_stream_original(bind["id"], dst)
+                else:
+                    notes.append(f"原片缓存命中: {fname}")
+                out = dst
+        resolved[fname] = out
+        return out
+
+    changed = False
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        for holder in ([e] + list(e.get("clips") or [])):
+            vp = str(holder.get("video_path") or "")
+            if not vp:
+                continue
+            op = _orig_for(os.path.basename(vp))
+            if op:
+                holder["video_path"] = op
+                changed = True
+    if not changed:
+        return abs_point, notes
+    swapped = abs_point[:-5] + ".orig.json" if abs_point.endswith(".json") else abs_point + ".orig"
+    with open(swapped, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return swapped, notes
+
+
 # ── Assets ──────────────────────────────────────────────────────────────────
 
 def _dump(model) -> dict:
@@ -1868,6 +1948,7 @@ class RenderRequest(BaseModel):
     has_dialogue: bool = False
     transition: float = 0.0   # crossfade seconds between clips (0 = hard cuts)
     transition_mode: str = ""  # "" | "uniform" | "ai" (LLM picks per-cut transitions)
+    source_quality: str = "proxy"  # "proxy" (1080p 代理, 快) | "original" (拉取/直读 4K 原片)
 
 
 @app.post("/api/render")
@@ -1906,9 +1987,19 @@ def render(body: RenderRequest):
     if not vid or not os.path.exists(vid):
         raise HTTPException(400, "找不到任何存在的源视频（项目视频与 shot_point 中的 clip 路径均无效）")
 
+    # 4K option: swap Immich proxy paths for originals in a sibling json.
+    # Output filename/tag stays keyed to the ORIGINAL shot_point name.
+    shot_json_for_render = abs_point
+    _orig_notes: list = []
+    if body.source_quality == "original":
+        try:
+            shot_json_for_render, _orig_notes = _materialize_immich_originals(abs_point)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"原片替换失败: {e}")
+
     cmd = [
         sys.executable, "render/render_video.py",
-        "--shot-plan", abs_plan, "--shot-json", abs_point,
+        "--shot-plan", abs_plan, "--shot-json", shot_json_for_render,
         "--video", vid, "--audio", _resolve(body.audio_path),
         "--output", out, "--crop-ratio", body.ratio, "--no-labels",
     ]
@@ -1923,7 +2014,10 @@ def render(body: RenderRequest):
     if os.path.exists(font):
         cmd += ["--dialogue-font", font]
     job = Job("render")
-    job.meta.update({"output": out, "ratio": body.ratio})
+    job.meta.update({"output": out, "ratio": body.ratio,
+                     "source_quality": body.source_quality})
+    for _n in _orig_notes:
+        job.add(f"[原片] {_n}")
     try:
         _spawn(job, cmd)
     except Exception as e:
