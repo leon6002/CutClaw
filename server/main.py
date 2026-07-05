@@ -2307,6 +2307,9 @@ class RenderRequest(BaseModel):
     transition: float = 0.0   # crossfade seconds between clips (0 = hard cuts)
     transition_mode: str = ""  # "" | "uniform" | "ai" (LLM picks per-cut transitions)
     source_quality: str = "proxy"  # "proxy" (1080p 代理, 快) | "original" (拉取/直读 4K 原片)
+    color_grade: str = ""      # "" | "teal_orange" | "film" | "warm"
+    letterbox: bool = False    # 2.35:1 cinematic bars inside the 16:9 frame
+    fades: bool = True         # fade in from black + fade out to black w/ music
 
 
 @app.post("/api/render")
@@ -2367,6 +2370,12 @@ def render(body: RenderRequest):
         cmd += ["--transition-mode", "ai"]
     elif body.transition and body.transition > 0:
         cmd += ["--transition", str(body.transition)]
+    if body.color_grade in ("teal_orange", "film", "warm"):
+        cmd += ["--color-grade", body.color_grade]
+    if body.letterbox and body.ratio == "16:9":
+        cmd += ["--letterbox"]
+    if body.fades:
+        cmd += ["--fades"]
     if body.add_ending and os.path.exists(ending):
         cmd += ["--ending-video", ending]
     if os.path.exists(font):

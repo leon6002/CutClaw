@@ -248,6 +248,13 @@ shot_point.json（多源 clip 各带 video_path）
 - 统一叠化：全切点 `fade:0.4`。
 - xfade 会吞掉每切点 ~duration 时长（重叠淡化），切点相对节拍轻微漂移，已知取舍。
 
+### 电影感层（画面风格 / 黑边 / 淡入淡出）
+- **实现原则：全部在切片提取阶段追加滤镜**——切片本来就要重编码，调色/黑边/淡入淡出零额外遍数。三个提取分支在 subprocess.run 前有统一注入点（有 `-vf` 则拼接，无则插入）。
+- **调色 `COLOR_GRADES`**：纯 ffmpeg 滤镜链、不依赖外部 LUT 文件——teal_orange（青橙：阴影偏青高光偏橙）/ film（胶片：提黑压高光降饱和）/ warm（暖阳：色温 5400K）。片尾/片头卡不调色。
+- **2.35:1 黑边 `LETTERBOX_FILTER`**：crop 到 2.35:1 再 pad 回 16:9（容器仍是平台友好的 16:9）；仅 16:9 比例开放。
+- **淡入淡出**：首个主镜头 fade-in 0.5s、最后一个主镜头 fade-out 1.2s（都在切片级，不触发成片级重编码）；BGM 在混音阶段 afade 收尾 1.5s。默认开。
+- 渲染请求字段 `color_grade` / `letterbox` / `fades`，sidecar 记录。像素级验证：黑边区亮度 0.0、首帧 0.0、末帧 5.1。
+
 ### sidecar 元数据（UI 可视化数据源）
 `{output}.render.json`：`transition_mode` / `transitions[]`（每切点实际用的）/ `audio {path,start,duration}` / `clips`。
 `GET /api/render/outputs` 附带为 `render_meta`（并 ffprobe 补 `audio.total`，有 mtime 缓存）。

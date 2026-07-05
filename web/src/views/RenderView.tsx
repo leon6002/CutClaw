@@ -47,6 +47,9 @@ export default function RenderView({
   const [addEnding, setAddEnding] = useState(false);
   const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("uniform");
   const [sourceQuality, setSourceQuality] = useState<"proxy" | "original">("proxy");
+  const [colorGrade, setColorGrade] = useState<"" | "teal_orange" | "film" | "warm">("");
+  const [letterbox, setLetterbox] = useState(false);
+  const [fades, setFades] = useState(true);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
@@ -123,6 +126,9 @@ export default function RenderView({
           transition: transitionMode === "uniform" ? 0.4 : 0,
           transition_mode: transitionMode === "ai" ? "ai" : "",
           source_quality: sourceQuality,
+          color_grade: colorGrade,
+          letterbox: letterbox && ratio === "16:9",
+          fades,
         }),
       });
       setJobId(r.job_id);
@@ -241,6 +247,39 @@ export default function RenderView({
                     ? "Immich 素材将拉取/直读 4K 原片渲染（首次较慢，之后缓存）"
                     : "发抖音等平台 1080p 足够 — 本地 4K 素材不受此选项影响"}
                 </span>
+              </div>
+
+              <div className="mb-4 flex flex-wrap items-center gap-2.5 text-[13px] text-slate-300">
+                <span>画面风格</span>
+                <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                  {([
+                    ["", "原色"],
+                    ["teal_orange", "青橙电影感"],
+                    ["film", "胶片柔和"],
+                    ["warm", "暖阳回忆"],
+                  ] as const).map(([v, label]) => (
+                    <button
+                      key={v}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 text-xs transition-colors",
+                        colorGrade === v
+                          ? "bg-cyan-500/15 font-semibold text-cyan-300"
+                          : "text-slate-400 hover:text-slate-200",
+                      )}
+                      onClick={() => setColorGrade(v)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400">
+                  <Checkbox checked={letterbox} onCheckedChange={(v) => setLetterbox(v === true)} />
+                  2.35:1 电影黑边<span className="text-[10px] text-slate-600">(仅 16:9)</span>
+                </label>
+                <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400">
+                  <Checkbox checked={fades} onCheckedChange={(v) => setFades(v === true)} />
+                  淡入淡出收尾
+                </label>
               </div>
 
               <div className="flex flex-wrap gap-2">

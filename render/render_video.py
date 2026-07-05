@@ -625,6 +625,22 @@ TRANSITION_PALETTE = {
 }
 
 
+# ── Cinematic looks — pure ffmpeg filter chains, no external LUT files ──────
+COLOR_GRADES = {
+    # 青橙电影感: shadows toward teal, highlights toward orange, gentle punch
+    "teal_orange": ("colorbalance=rm=0.05:bm=-0.04:rs=-0.06:bs=0.08,"
+                    "eq=saturation=1.06:contrast=1.05:brightness=0.01"),
+    # 胶片柔和: lifted blacks, rolled-off highlights, muted saturation
+    "film": ("curves=master='0/0.03 0.5/0.52 1/0.96',"
+             "eq=saturation=0.9:contrast=1.06"),
+    # 暖阳回忆: warmer temperature, light glow
+    "warm": "colortemperature=temperature=5400,eq=saturation=1.03:contrast=1.03",
+}
+
+# 2.35:1 cinematic letterbox INSIDE a 16:9 frame (platform-friendly container)
+LETTERBOX_FILTER = ("crop=iw:floor(iw/2.35/2)*2,"
+                    "pad=iw:floor(iw*9/16/2)*2:0:(oh-ih)/2:black")
+
 _HAS_AUDIO_CACHE: dict = {}
 
 
@@ -865,6 +881,9 @@ def render_video_ffmpeg(
     transition_duration: float = 0.0,
     transitions: list = None,
     duck_windows: list = None,
+    color_grade: str = "",
+    letterbox: bool = False,
+    fades: bool = False,
 ) -> bool:
     """
     Render video clips using ffmpeg concat demuxer.
@@ -957,6 +976,10 @@ def render_video_ffmpeg(
 
         # Extract each clip to a temporary file
         print(f"Extracting {len(clips)} clips...")
+        # last MAIN clip gets the fade-to-black ending (never the outro card)
+        _last_main_idx = max(
+            (idx for idx, c in enumerate(clips)
+             if not c.get('is_ending') and not c.get('is_intro')), default=-1)
         for i, clip in enumerate(clips):
             clip_file = os.path.join(temp_dir, f"clip_{i:04d}.mp4")
             clip_files.append(clip_file)
@@ -1281,6 +1304,29 @@ def render_video_ffmpeg(
                         clip_file
                     ]
 
+            # cinematic layer — applied per clip (clips are re-encoded anyway,
+            # so grade/letterbox/fades cost zero extra passes)
+            _extra_vf = []
+            _is_extra = clip.get('is_ending') or clip.get('is_intro')
+            if color_grade and not _is_extra:
+                _g = COLOR_GRADES.get(color_grade)
+                if _g:
+                    _extra_vf.append(_g)
+            if letterbox and not _is_extra:
+                _extra_vf.append(LETTERBOX_FILTER)
+            if fades:
+                if i == 0:
+                    _extra_vf.append("fade=t=in:st=0:d=0.5")
+                if i == _last_main_idx and duration > 1.5:
+                    _extra_vf.append(f"fade=t=out:st={duration - 1.2:.2f}:d=1.2")
+            if _extra_vf:
+                if '-vf' in cmd:
+                    _vi = cmd.index('-vf') + 1
+                    cmd[_vi] = cmd[_vi] + "," + ",".join(_extra_vf)
+                else:
+                    _ti = cmd.index('-t') + 2
+                    cmd = cmd[:_ti] + ['-vf', ",".join(_extra_vf)] + cmd[_ti:]
+
             if duck_windows and not _source_has_audio(source_video):
                 # silent source (drone footage) — give the clip a REAL silent
                 # track so the audio concat/xfade chains stay homogeneous
@@ -1483,8 +1529,10 @@ def render_video_ffmpeg(
                 # Normalize=0 prevents amix from dynamically changing BGM volume when original audio ends.
                 # Padding inputs ensures they don't unexpectedly drop out early.
                 filter_parts.append("[a0p][a1p]amix=inputs=2:duration=longest:normalize=0[amix]")
+                _afade = (f",afade=t=out:st={max(0.0, total_duration - 1.5):.2f}:d=1.5"
+                          if fades else "")
                 filter_parts.append(
-                    f"[amix]atrim=duration={total_duration},asetpts=PTS-STARTPTS[aout]"
+                    f"[amix]atrim=duration={total_duration},asetpts=PTS-STARTPTS{_afade}[aout]"
                 )
                 filter_complex = ";".join(filter_parts)
                 print(f"DEBUG filter_complex: {filter_complex}")
@@ -1530,10 +1578,12 @@ def render_video_ffmpeg(
                     )
                     bgm_stage_label = "a1n"
 
+                _afade = (f",afade=t=out:st={max(0.0, total_duration - 1.5):.2f}:d=1.5"
+                          if fades else "")
                 filter_parts.append(
                     f"[{bgm_stage_label}]volume={escape_ffmpeg_expr(bgm_volume_expr)}:eval=frame,"
                     f"apad=whole_dur={total_duration + 1.0},"
-                    f"atrim=duration={total_duration},asetpts=PTS-STARTPTS[aout]"
+                    f"atrim=duration={total_duration},asetpts=PTS-STARTPTS{_afade}[aout]"
                 )
                 filter_complex = ";".join(filter_parts)
 
@@ -1751,6 +1801,23 @@ def main():
         default='',
         help='Explicit per-cut list, comma-separated, e.g. "cut,fadeblack:0.4,zoomin:0.35". '
              'Overrides --transition-mode.'
+    )
+    parser.add_argument(
+        '--color-grade',
+        type=str,
+        default='',
+        choices=['', 'teal_orange', 'film', 'warm'],
+        help='Cinematic color grade applied per clip (pure ffmpeg filters).'
+    )
+    parser.add_argument(
+        '--letterbox',
+        action='store_true',
+        help='2.35:1 cinematic letterbox inside the 16:9 frame.'
+    )
+    parser.add_argument(
+        '--fades',
+        action='store_true',
+        help='Fade in from black (0.5s), fade out to black + music fade at the end.'
     )
     parser.add_argument(
         '--visualize-detections',
@@ -2119,6 +2186,9 @@ def main():
         transition_duration=args.transition,
         transitions=transitions,
         duck_windows=duck_windows,
+        color_grade=args.color_grade,
+        letterbox=args.letterbox,
+        fades=args.fades,
     )
 
     if success:
@@ -2139,6 +2209,9 @@ def main():
                     "duration": round(float(audio_duration or 0.0), 2),
                 },
                 "duck_windows": [[round(a, 2), round(b, 2)] for a, b in (duck_windows or [])],
+                "color_grade": args.color_grade,
+                "letterbox": bool(args.letterbox),
+                "fades": bool(args.fades),
                 "clips": len(clips),
             }
             with open(os.path.splitext(args.output)[0] + ".render.json", "w", encoding="utf-8") as _mf:
