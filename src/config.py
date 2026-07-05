@@ -196,7 +196,7 @@ VIDEO_ANALYSIS_ENDPOINT = ""
 VIDEO_ANALYSIS_API_KEY = os.getenv("VIDEO_ANALYSIS_API_KEY", "")
 # API key for the video analysis model. Value lives in .env — never inline here.
 
-CAPTION_BATCH_SIZE = 64
+CAPTION_BATCH_SIZE = 24
 # Batch size for parallel clip captioning/analysis.
 
 # ── Immich integration ──────────────────────────────────────────────────────
@@ -314,11 +314,11 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # hold long). These two values are only the PERCEPTUAL EXTREMES the algorithm is
 # allowed to reach — editing-craft constants, like frame rate, not knobs a novice
 # user should set. The self-calibrating pacing lives in audio_caption_madmom.py.
-AUDIO_MIN_SEGMENT_DURATION = 1.2
+AUDIO_MIN_SEGMENT_DURATION = 3
 # Fastest cut (seconds) — reached at the track's most energetic moments.
 # Below ~1s a shot is too brief to read.
 
-AUDIO_MAX_SEGMENT_DURATION = 7.0
+AUDIO_MAX_SEGMENT_DURATION = 10
 # Longest hold (seconds) — reached at the track's calmest moments.
 # Above ~8s a montage shot starts to drag.
 
@@ -373,7 +373,7 @@ AUDIO_KEYPOINT_MAX_TOKENS = 4096
 AGENT_MODEL_MAX_TOKEN = 8192
 # Maximum generated tokens per agent response (not total context size).
 
-AGENT_MAX_ITERATIONS = 3
+AGENT_MAX_ITERATIONS = 2
 # Max tool-use iterations per shot in the editor agent loop. Each iteration is
 # one LLM round-trip carrying the full (growing) message history, so this is the
 # single biggest lever on token cost. Minimal decisive path is: retrieve →
@@ -394,8 +394,8 @@ AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 95.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 105.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 70.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 80.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3
@@ -424,6 +424,12 @@ TRANSLATE_MODEL = "deepseek/deepseek-v4-flash"
 
 TRANSLATE_ENDPOINT = "https://api.deepseek.com/v1"
 TRANSLATE_API_KEY = AGENT_LITELLM_API_KEY
+
+AGENT_LLM_TIMEOUT_SEC = 600
+# Per-attempt timeout for Screenwriter LLM calls. Shot-plan generation is the
+# largest call in the pipeline (all music segments + scenes + curated moments
+# in, dozens of shots out) — reasoning models routinely need 3-8 minutes; a
+# tight timeout kills almost-finished responses and pays the whole wait again.
 
 CURATION_FIRST = True
 # Curation-first flow: build a measured highlight pool from the real footage,
@@ -487,11 +493,11 @@ VLM_MIN_BOX_SIZE = 100
 # ------------------ Shot Selection Constraints ------------------ #
 # These parameters define fallback behavior when perfect matches are unavailable.
 
-MIN_ACCEPTABLE_SHOT_DURATION = 2.0
+MIN_ACCEPTABLE_SHOT_DURATION = 3
 # Minimum acceptable final shot duration (seconds).
 # Smaller values increase match rate but may produce more fragmented edits.
 
-ALLOW_DURATION_TOLERANCE = 1.0
+ALLOW_DURATION_TOLERANCE = 3
 # Allow duration deviation of ±N seconds from target.
 
 ALLOW_CONTENT_MISMATCH = True

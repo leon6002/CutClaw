@@ -541,6 +541,8 @@ if __name__ == "__main__":
         print_llm_summary()
         sys.exit(130)
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # the import/DLL chain matters — never hide it
         print(f"\n❌ Pipeline stopped due to an error: {e}")
         print("💾 Progress is saved incrementally: shot detection, video/audio captions, scene "
               "summaries, the shot plan, and each already-selected shot are all cached on disk.")

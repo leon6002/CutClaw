@@ -4,13 +4,18 @@ from tqdm import tqdm
 import json
 import re
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from src import config
 from src.utils.media_utils import natural_sort_key, hhmmss_to_seconds
 
 class OptimizedSceneSegmenter:
     def __init__(self, model_name='all-MiniLM-L6-v2'):
+        # LAZY torch import — sentence_transformers pulls in torch, and loading
+        # torch's fbgemm.dll AFTER madmom/librosa have filled the process with
+        # their math DLLs hard-fails (WinError 127). This module's import must
+        # stay torch-free: the editor imports video_caption (→ this module)
+        # only for utility functions and never instantiates the segmenter.
+        from sentence_transformers import SentenceTransformer
         print(f"🚀 [SceneMerge] Loading model ({model_name})...")
         self.encoder = SentenceTransformer(model_name)
         
