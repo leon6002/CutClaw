@@ -2489,6 +2489,20 @@ class ParallelShotOrchestrator:
         existing = []
         completed_shots = set()
 
+        # permanent bans (user taste memory): ranges the user explicitly said
+        # never to use again are forbidden for EVERY pick path — agent commits,
+        # anchored trims and deterministic fallbacks alike
+        try:
+            from src.curation import load_rejections
+            _bans = [r for r in load_rejections() if r.get("ban")]
+            for _r in _bans:
+                global_keep_ranges.append((_r.get("video_path", ""),
+                                           float(_r.get("start", 0)), float(_r.get("end", 0))))
+            if _bans:
+                print(f"🚫 [Parallel] {len(_bans)} permanently banned range(s) loaded as forbidden")
+        except Exception:  # noqa: BLE001
+            pass
+
         if self.output_path and os.path.exists(self.output_path):
             try:
                 with open(self.output_path, 'r', encoding='utf-8') as f:

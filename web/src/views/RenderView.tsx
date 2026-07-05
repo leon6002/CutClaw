@@ -69,7 +69,7 @@ export default function RenderView({
 
   const replaceShot = async (c: { section_idx: number; shot_idx: number }) => {
     const reason = window.prompt(
-      "为什么不满意这个镜头?(可留空;写「晃」会要求替代镜头更稳,写「重复」会避开相似画面)", "") ?? null;
+      "为什么不满意?(可留空)\n· 写「晃/歪/晕」→ 替代镜头要求更稳\n· 写「重复/一样」→ 避开相似画面\n· 写「不再使用」或以 ! 开头 → 永久拉黑该片段(所有项目不再选它)\n其余原因会作为负分计入该片段的综合评分", "") ?? null;
     if (reason === null) return;   // 取消
     try {
       const r = await api<{ ok: boolean; new_clip: any; moment: any }>("/api/shots/replace", {

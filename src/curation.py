@@ -22,6 +22,17 @@ import os
 
 _POOL_VERSION = 5   # v5: camera-roll (tilt) penalty in the measured score
 
+# GLOBAL taste memory — user rejections apply across every project.
+REJECTIONS_PATH = os.path.join("Output", "asset_index", "rejections.json")
+
+
+def load_rejections() -> list:
+    try:
+        with open(REJECTIONS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return []
+
 
 def _source_pool(content_hash: str) -> list:
     """Build (or load) the scored moment list for ONE analyzed source."""
@@ -214,6 +225,41 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
             mm = dict(m)
             mm["scene"] = best
             pool.append(mm)
+
+    # user taste memory: rejected ranges depress the score (stacking, capped);
+    # permanently banned ranges (明确说"不再使用") are excluded outright.
+    # Applied at PROJECT-pool time (not the per-source cache) so a fresh
+    # rejection takes effect immediately without a pool rebuild.
+    rejections = load_rejections()
+    if rejections:
+        def _normp(p):
+            return os.path.normcase(os.path.normpath(p or ""))
+        kept = []
+        banned_n = 0
+        for m in pool:
+            pen, reasons, banned = 0.0, [], False
+            for r in rejections:
+                if _normp(r.get("video_path")) != _normp(m.get("video_path")):
+                    continue
+                ov = min(m["end"], float(r.get("end", 0))) - max(m["start"], float(r.get("start", 0)))
+                if ov <= 0.3:
+                    continue
+                if r.get("ban"):
+                    banned = True
+                    break
+                pen += 0.15
+                if r.get("reason"):
+                    reasons.append(str(r["reason"])[:40])
+            if banned:
+                banned_n += 1
+                continue
+            if pen > 0:
+                m["score"] = round(max(0.0, m["score"] - min(pen, 0.45)), 3)
+                m["rejected_overlap"] = reasons[:3]
+            kept.append(m)
+        pool = kept
+        if banned_n:
+            print(f"🚫 [Curation] {banned_n} moment(s) excluded by permanent bans (rejections.json)")
 
     pool.sort(key=lambda m: -m["score"])
     for i, m in enumerate(pool):

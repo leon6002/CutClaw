@@ -564,9 +564,16 @@ def media(path: str):
 
 
 @app.get("/api/assets/thumb")
-def asset_thumb(hash: str, path: str = ""):
+def asset_thumb(hash: str = "", path: str = ""):
     """Poster thumbnail for a video asset — extracted once with ffmpeg and
-    cached on disk, so the grid never embeds heavyweight <video> elements."""
+    cached on disk, so the grid never embeds heavyweight <video> elements.
+
+    `hash` names the on-disk cache; when it's absent (e.g. an un-annotated
+    project asset), derive it from the file content so any video path works."""
+    if not hash or any(c in hash for c in "\\/.:"):
+        from src.asset_manager.scanner import compute_content_hash
+        _src = _resolve(path)
+        hash = compute_content_hash(_src) if (_src and os.path.isfile(_src)) else ""
     if not hash or any(c in hash for c in "\\/.:"):
         raise HTTPException(400, "bad hash")
     tdir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "thumbs")
@@ -2772,14 +2779,16 @@ def replace_shot(body: ShotReplaceRequest):
 
     old = tgt["clips"][0]
     old_src, old_s, old_e = old.get("video_path", ""), _ts(old["start"]), _ts(old["end"])
-    rej_path = os.path.join(proj, "rejections.json")
-    try:
-        with open(rej_path, "r", encoding="utf-8") as f:
-            rejections = json.load(f)
-    except Exception:  # noqa: BLE001
-        rejections = []
+    # GLOBAL taste memory — rejections apply across all projects; the pool
+    # builder turns them into score penalties, "不再使用" wording = permanent ban
+    from src.curation import REJECTIONS_PATH, load_rejections
+    rej_path = os.path.join(PROJECT_ROOT, REJECTIONS_PATH)
+    rejections = load_rejections()
+    _rtxt = body.reason or ""
+    _ban = _rtxt.startswith("!") or any(k in _rtxt for k in ("不再", "别再", "拉黑", "永久", "never"))
     rejections.append({"video_path": old_src, "start": old_s, "end": old_e,
-                       "reason": body.reason, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                       "reason": body.reason, "ban": _ban,
+                       "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
     gap = float(getattr(_cfg, "SHOT_MIN_GAP_SEC", 2.0) or 2.0)
     need = float(tgt.get("target_duration") or (old_e - old_s) or 3.0)
 
@@ -2834,7 +2843,7 @@ def replace_shot(body: ShotReplaceRequest):
         json.dump(shots, f, ensure_ascii=False, indent=2)
     with open(rej_path, "w", encoding="utf-8") as f:
         json.dump(rejections, f, ensure_ascii=False, indent=2)
-    return {"ok": True, "new_clip": tgt["clips"][0],
+    return {"ok": True, "new_clip": tgt["clips"][0], "banned": _ban,
             "moment": {"id": m.get("id"), "score": m.get("score"), "desc": m.get("desc", "")[:120]}}
 
 
