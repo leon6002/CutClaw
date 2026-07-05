@@ -670,11 +670,18 @@ def annotate(body: AnnotateRequest):
                 if filename:
                     h = _name_to_hash.get(filename)
                     if h:
-                        _sbh = job.meta.setdefault("stage_by_hash", {})
-                        if status in ("start", "progress"):
-                            _sbh[h] = {"stage": stage, "detail": str(detail or "")[:60]}
+                        if stage == "annotate" and status == "fail":
+                            # analysis failed but is RESUMABLE — mark the file
+                            # red; the asset stays 未标注 so the next batch run
+                            # picks it up and resumes from the checkpoints
+                            _files_state[h] = "f"
+                            (job.meta.get("stage_by_hash") or {}).pop(h, None)
                         else:
-                            _sbh[h] = {"stage": "", "detail": ""}
+                            _sbh = job.meta.setdefault("stage_by_hash", {})
+                            if status in ("start", "progress"):
+                                _sbh[h] = {"stage": stage, "detail": str(detail or "")[:60]}
+                            else:
+                                _sbh[h] = {"stage": "", "detail": ""}
                     job.add(f"[stage] {filename} · {stage} {status} {str(detail or '')[:80]}".rstrip())
                     return
                 _fs = job.meta.setdefault("file_stages", {})

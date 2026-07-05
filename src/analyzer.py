@@ -391,6 +391,23 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
                 _dense_one(_cf)
         _emit("dense_caption", "done", f"{len(_need_dense)} clips · {time.time() - _dense_t0:.1f}s")
 
+        # Completeness check: clips whose dense caption still failed must keep
+        # the analysis in "incomplete" state so the next run retries them —
+        # instead of permanently completing with holes (e.g. API outage).
+        _still_missing = []
+        for _cf in _need_dense:
+            try:
+                with open(os.path.join(shots_dir, _cf), "r", encoding="utf-8") as _f2:
+                    if not json.load(_f2).get("dense_segments"):
+                        _still_missing.append(_cf)
+            except Exception:
+                _still_missing.append(_cf)
+        if _still_missing:
+            raise RuntimeError(
+                f"dense captioning incomplete: {len(_still_missing)}/{len(_need_dense)} clip(s) "
+                f"failed — analysis left resumable; re-run to retry only these clips"
+            )
+
     # Step 3: Scene merge
     if os.path.exists(shots_dir) and not os.path.exists(scenes_output):
         _emit("scene_merge", "start", "Loading shots, computing embeddings (all-MiniLM-L6-v2)...")
@@ -428,6 +445,14 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
             result = sa.analyze_scenes_dir(scenes_dir=scenes_dir, output_dir=scene_summaries_dir,
                                            max_workers=config.CAPTION_BATCH_SIZE, overwrite=False)
             _emit("scene_analysis", "done", f"{result.get('success', 0)} scenes · {time.time() - t0:.1f}s")
+            # Completeness check — same resumability contract as captioning/dense
+            _sum_now = len([f for f in os.listdir(scene_summaries_dir) if f.endswith(".json")]) \
+                if os.path.isdir(scene_summaries_dir) else 0
+            if _sum_now < len(scene_files):
+                raise RuntimeError(
+                    f"scene analysis incomplete: {_sum_now}/{len(scene_files)} scenes — "
+                    f"analysis left resumable; re-run to retry only the missing scenes"
+                )
         else:
             _emit("scene_analysis", "skip", f"all {existing} cached")
     else:
@@ -497,9 +522,14 @@ def analyze_video(
     def _looks_complete(md: dict) -> bool:
         if md.get("analysis_complete"):
             return True
+        # Legacy caches (pre-marker): consider complete when the end artifacts
+        # exist — per-clip ckpt captions AND at least one scene summary.
+        # (NOTE: captions/captions.json is a phantom — nothing ever wrote it;
+        # requiring it would flag every legacy cache incomplete.)
         _sums = os.path.join(cache_dir, "captions", "scene_summaries_video")
-        _caps = os.path.join(cache_dir, "captions", "captions.json")
-        return (os.path.exists(_caps) and os.path.isdir(_sums)
+        _ckpt = os.path.join(cache_dir, "captions", "ckpt")
+        return (os.path.isdir(_ckpt) and any(f.endswith(".json") for f in os.listdir(_ckpt))
+                and os.path.isdir(_sums)
                 and any(f.endswith(".json") for f in os.listdir(_sums)))
 
     if existing and not force:

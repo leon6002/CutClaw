@@ -614,7 +614,8 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
                 "h-2.5 w-2.5 rounded-full transition-colors",
                 files[h] === "d" ? "bg-emerald-400"
                   : files[h] === "r" ? "animate-pulse bg-cyan-400 ring-2 ring-cyan-400/40"
-                    : "bg-slate-700",
+                    : files[h] === "f" ? "bg-red-400"
+                      : "bg-slate-700",
               )}
             />
           ))}

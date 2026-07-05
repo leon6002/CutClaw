@@ -440,10 +440,18 @@ def process_video(
     finally:
         loop.close()
 
-    if failed:
-        print(f"  ⚠️  [VideoCaption] Warning: {len(failed)} clips still failed after retries")
-
     pbar.close()
+
+    if failed:
+        # HARD STOP before scene merge. Proceeding with a partial clip set used
+        # to bake incomplete scenes and mark the whole analysis "complete" —
+        # the failed clips were then never retried (e.g. API outage mid-run).
+        # Raising keeps the analysis in "incomplete" state; the per-clip ckpt
+        # files mean the next run retries ONLY the missing clips.
+        raise RuntimeError(
+            f"{len(failed)} clip(s) failed captioning after retries — "
+            f"analysis left resumable; re-run to retry only the missing clips"
+        )
 
 
     # ============ Step 2: Scene Merge ============

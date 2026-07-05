@@ -196,17 +196,12 @@ def annotate_video_asset(
     """
     from src.analyzer import analyze_video, get_analysis_path
 
-    try:
-        content_hash = analyze_video(metadata.absolute_path, progress_callback=progress_callback)
-    except Exception as e:
-        print(f"[AssetAnnotator] Full analysis failed for {metadata.file_name}: {e}")
-        return VideoAnnotation(
-            summary=f"Video: {metadata.file_name} ({metadata.duration_sec:.0f}s, {metadata.width}x{metadata.height})",
-            tags=["analysis_failed"],
-            emotion="",
-            quality_score=3.0,
-            suggested_use="",
-        )
+    # Deliberately NOT caught: swallowing an analysis failure into a fake
+    # "analysis_failed" annotation marked the asset as annotated, so the next
+    # batch run would SKIP it forever — the per-step resume never got a
+    # chance. Let it propagate; the asset stays 未标注 and the next run
+    # resumes from the per-clip checkpoints.
+    content_hash = analyze_video(metadata.absolute_path, progress_callback=progress_callback)
 
     # Distill scene summaries into compact annotation
     try:
@@ -674,12 +669,21 @@ def batch_annotate(
                          for m in videos}
                 for _fut in as_completed(_futs):
                     _m = _futs[_fut]
+                    _failed_video = False
                     try:
                         _r = _fut.result()
                         if _r is not None:
                             results.append(_r)
+                        else:
+                            _failed_video = True
                     except Exception as e:
                         print(f"[AssetAnnotator] video worker failed for {_m.file_name}: {e}")
+                        _failed_video = True
+                    if _failed_video and stage_callback:
+                        try:
+                            stage_callback("annotate", "fail", "analysis failed — resumable", filename=_m.file_name)
+                        except TypeError:
+                            pass
                     _report(_m.file_name)
         finally:
             _stop.set()
@@ -692,6 +696,11 @@ def batch_annotate(
                 results.append(result)
             except Exception as e:
                 print(f"[AssetAnnotator] Failed to annotate video {meta.file_name}: {e}")
+                if stage_callback:
+                    try:
+                        stage_callback("annotate", "fail", str(e)[:120], filename=meta.file_name)
+                    except TypeError:
+                        stage_callback("annotate", "fail", str(e)[:120])
             _report(meta.file_name)
 
     # Images: parallel in small batches
