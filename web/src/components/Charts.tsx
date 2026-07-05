@@ -209,7 +209,23 @@ function extractClips(data: any): TimelineClip[] {
     .filter((c) => isFinite(c.start) && isFinite(c.end) && c.end > c.start);
 }
 
-export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; playhead?: number }) {
+const TRANSITION_ZH: Record<string, string> = {
+  fade: "叠化", fadeblack: "闪黑", fadewhite: "闪白", dissolve: "溶解",
+  zoomin: "推近", radial: "旋转扫描", circleopen: "圆形开幕", hblur: "模糊过渡",
+  smoothleft: "左滑", smoothright: "右滑", hlslice: "切片滑动", distance: "拉伸变形",
+};
+
+export interface RenderAudioMeta {
+  path: string; start: number; duration: number; total?: number; name?: string;
+}
+
+export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, audio = null }: {
+  shotPoint: string; playhead?: number;
+  /** per-cut transition list from the render sidecar, e.g. ["cut","fade:0.4",...] */
+  transitions?: (string | null)[] | null;
+  /** music window used by the render (start/duration within the full track) */
+  audio?: RenderAudioMeta | null;
+}) {
   const [clips, setClips] = useState<TimelineClip[] | null>(null);
 
   useEffect(() => {
@@ -241,6 +257,23 @@ export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; 
     ? items.findIndex((it) => playhead >= (it.value[0] as number) && playhead < (it.value[1] as number))
     : -1;
 
+  // visible-transition markers at cut boundaries (diamonds on the timeline)
+  const trMarkers = useMemo(() => {
+    if (!transitions || items.length < 2) return [];
+    const out: { x: number; y: number; name: string; zh: string; dur: string }[] = [];
+    for (let k = 1; k < items.length; k++) {
+      const raw = String(transitions[k - 1] ?? "cut").trim();
+      const [name, dur] = raw.split(":");
+      if (!name || name === "cut") continue;
+      out.push({
+        x: items[k].value[0] as number,
+        y: items[k].value[2] as number,
+        name, zh: TRANSITION_ZH[name] ?? name, dur: dur || "0.4",
+      });
+    }
+    return out;
+  }, [transitions, items]);
+
   if (!shotPoint) return null;
   if (clips === null) return <Hint>加载成片时间轴…</Hint>;
   if (clips.length === 0) return <Hint>无法解析 shot_point 数据</Hint>;
@@ -249,6 +282,7 @@ export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; 
     <div>
       <Label>
         成片时间轴 — {clips.length} 个镜头 · 总时长 {total.toFixed(1)}s · 颜色 = 来源视频
+        {trMarkers.length > 0 && <span className="text-amber-400/80"> · ◆ = 转场 ({trMarkers.length} 处)</span>}
       </Label>
       <Chart
         height={Math.max(140, sources.length * 44 + 70)}
@@ -256,6 +290,9 @@ export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; 
           tooltip: {
             ...TOOLTIP,
             formatter: (p: any) => {
+              if (p.data?.zh) {   // transition diamond
+                return `<b>转场：${p.data.zh}</b> (${p.data.name}) · ${p.data.dur}s`;
+              }
               const c: TimelineClip = p.data.clip;
               return `<b>镜头 ${p.data.idx + 1}</b> · ${p.value[3].toFixed(1)}s<br/>`
                 + `${basename(c.src)} [${c.start.toFixed(1)}s → ${c.end.toFixed(1)}s]`
@@ -301,9 +338,48 @@ export function ShotTimeline({ shotPoint, playhead = -1 }: { shotPoint: string; 
               },
               data: [{ xAxis: Math.min(playhead, total) }],
             } : undefined,
-          }],
+          },
+          // visible transitions as amber diamonds at their cut positions
+          ...(trMarkers.length > 0 ? [{
+            type: "scatter" as const,
+            symbol: "diamond",
+            symbolSize: 11,
+            z: 10,
+            itemStyle: { color: "#fbbf24", borderColor: "#0f172a", borderWidth: 1 },
+            data: trMarkers.map((m) => ({ value: [m.x, m.y], ...m })),
+            animation: false,
+          }] : []),
+          ],
         }}
       />
+
+      {/* music window: which part of the track the render actually used */}
+      {audio && (audio.total ?? 0) > 0 && (
+        <div className="mt-1 px-1">
+          <div className="flex items-center justify-between text-[10px] text-slate-500">
+            <span>🎵 {audio.name || "背景音乐"}</span>
+            <span>
+              使用 {audio.start.toFixed(1)}–{(audio.start + audio.duration).toFixed(1)}s
+              · 全长 {(audio.total as number).toFixed(0)}s
+            </span>
+          </div>
+          <div className="relative mt-1 h-3 w-full overflow-hidden rounded bg-white/[0.05]">
+            <div
+              className="absolute inset-y-0 rounded border border-violet-400/50 bg-violet-500/35"
+              style={{
+                left: `${(audio.start / (audio.total as number)) * 100}%`,
+                width: `${Math.min(100, (audio.duration / (audio.total as number)) * 100)}%`,
+              }}
+            />
+            {playhead >= 0 && playhead <= audio.duration && (
+              <div
+                className="absolute inset-y-0 w-px bg-cyan-300"
+                style={{ left: `${((audio.start + playhead) / (audio.total as number)) * 100}%` }}
+              />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

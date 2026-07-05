@@ -19,7 +19,15 @@ interface RecentProject {
   instruction_id: string;
   mtime: number;
 }
-interface Output { ratio: string; path: string; size_mb: number; mtime: number }
+interface Output {
+  ratio: string; path: string; size_mb: number; mtime: number;
+  render_meta?: {
+    transition_mode: string;
+    transitions: (string | null)[];
+    audio: { path: string; start: number; duration: number; total?: number; name?: string };
+    clips?: number;
+  };
+}
 
 const RATIOS = ["9:16", "16:9", "1:1"];
 // max preview width per ratio (height capped at 480 so player + chart fit side by side)
@@ -37,7 +45,7 @@ export default function RenderView({
   const [outputs, setOutputs] = useState<Output[]>([]);
   const [hasEnding, setHasEnding] = useState(false);
   const [addEnding, setAddEnding] = useState(false);
-  const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("none");
+  const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("uniform");
   const [sourceQuality, setSourceQuality] = useState<"proxy" | "original">("proxy");
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
@@ -332,7 +340,11 @@ export default function RenderView({
 
             {/* below: timeline chart (progress bar) + per-shot inspector, synced to playhead */}
             <div className="mt-4">
-              <ShotTimeline shotPoint={shotPoint} playhead={playhead} />
+              <ShotTimeline
+                shotPoint={shotPoint} playhead={playhead}
+                transitions={activeOutput?.render_meta?.transitions ?? null}
+                audio={activeOutput?.render_meta?.audio ?? null}
+              />
             </div>
             <div className="mt-3">
               <ClipInspector clips={clipMap} currentTime={playhead} error={clipMapError} onRetry={reloadClipMap} onSeek={seekTo} />

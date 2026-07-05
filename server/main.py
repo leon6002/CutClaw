@@ -2484,6 +2484,28 @@ def render_clip_map(shot_point: str):
     return {"clips": out, "total": round(cursor, 2)}
 
 
+_DUR_CACHE: dict = {}
+
+
+def _media_duration(path: str) -> float:
+    """Container duration in seconds (ffprobe), cached by (path, mtime)."""
+    try:
+        key = (path, os.path.getmtime(path))
+        if key in _DUR_CACHE:
+            return _DUR_CACHE[key]
+        fp = os.path.join(PROJECT_ROOT, "tools", "ffmpeg", "ffprobe.exe")
+        if not os.path.exists(fp):
+            fp = "ffprobe"
+        r = subprocess.run([fp, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path],
+                           capture_output=True, text=True, timeout=20)
+        dur = round(float(r.stdout.strip()), 2)
+        _DUR_CACHE[key] = dur
+        return dur
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 @app.get("/api/render/outputs")
 def render_outputs(shot_point: str):
     abs_point = _resolve(shot_point)
@@ -2493,8 +2515,22 @@ def render_outputs(shot_point: str):
     for ratio in ("9:16", "16:9", "1:1"):
         p = os.path.join(d, f"output_{ratio.replace(':', 'x')}_{_sp_tag}.mp4")
         if os.path.exists(p):
-            out.append({"ratio": ratio, "path": p, "size_mb": round(os.path.getsize(p) / 1e6, 1),
-                        "mtime": os.path.getmtime(p)})
+            entry = {"ratio": ratio, "path": p, "size_mb": round(os.path.getsize(p) / 1e6, 1),
+                     "mtime": os.path.getmtime(p)}
+            # sidecar from the renderer: per-cut transitions + music window
+            mp = os.path.splitext(p)[0] + ".render.json"
+            if os.path.exists(mp):
+                try:
+                    with open(mp, "r", encoding="utf-8") as f:
+                        rm = json.load(f)
+                    ap = (rm.get("audio") or {}).get("path") or ""
+                    if ap and os.path.exists(ap):
+                        rm["audio"]["total"] = _media_duration(ap)
+                        rm["audio"]["name"] = os.path.basename(ap)
+                    entry["render_meta"] = rm
+                except Exception:  # noqa: BLE001
+                    pass
+            out.append(entry)
     return {"outputs": out, "shot_point_exists": os.path.exists(abs_point),
             "has_ending_video": os.path.exists(os.path.join(PROJECT_ROOT, "resource", "ending", "ending.mp4"))}
 

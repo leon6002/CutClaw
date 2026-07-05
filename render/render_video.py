@@ -549,23 +549,48 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
             'Reply with ONLY a JSON array, one entry per cut, e.g.: '
             '["cut", "fadeblack:0.4", "cut", "zoomin:0.35"]'
         )
-        kwargs = dict(model=config.AGENT_LITELLM_MODEL,
-                      messages=[{"role": "user", "content": prompt}],
-                      # reasoning models spend tokens thinking BEFORE the reply;
-                      # a small cap truncates the actual answer to empty
-                      temperature=0.4, max_tokens=4000, timeout=90)
-        if getattr(config, "AGENT_LITELLM_URL", ""):
-            kwargs["api_base"] = config.AGENT_LITELLM_URL
-        if getattr(config, "AGENT_LITELLM_API_KEY", ""):
-            kwargs["api_key"] = config.AGENT_LITELLM_API_KEY
-        resp = litellm.completion(**kwargs)
-        msg = resp.choices[0].message
-        content = (msg.content or "").strip()
-        if not content:  # some reasoning models leave the array in the thinking text
-            content = str(getattr(msg, "reasoning_content", "") or "").strip()
-        m = re.search(r"\[[^\[\]]*\]", content, re.DOTALL)
-        arr = json.loads(m.group(0) if m else content)
-        if not isinstance(arr, list):
+        def _ask(model, api_base, api_key):
+            kwargs = dict(model=model,
+                          messages=[{"role": "user", "content": prompt}],
+                          # reasoning models spend tokens thinking BEFORE the
+                          # reply; a small cap truncates the answer to empty
+                          temperature=0.4, max_tokens=8000, timeout=90)
+            if api_base:
+                kwargs["api_base"] = api_base
+            if api_key:
+                kwargs["api_key"] = api_key
+            resp = litellm.completion(**kwargs)
+            msg = resp.choices[0].message
+            content = (msg.content or "").strip()
+            if not content:  # some reasoning models leave the array in the thinking text
+                content = str(getattr(msg, "reasoning_content", "") or "").strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", content)
+            m = re.search(r"\[[^\[\]]*\]", content, re.DOTALL)
+            parsed = json.loads(m.group(0) if m else content)
+            return parsed if isinstance(parsed, list) else None
+
+        # primary: the agent model; fallback: the cheap flash model (empty
+        # replies happen when a reasoning model burns its budget thinking)
+        candidates = [
+            (config.AGENT_LITELLM_MODEL,
+             getattr(config, "AGENT_LITELLM_URL", ""),
+             getattr(config, "AGENT_LITELLM_API_KEY", "")),
+            (getattr(config, "TRANSLATE_MODEL", ""),
+             getattr(config, "TRANSLATE_ENDPOINT", ""),
+             getattr(config, "TRANSLATE_API_KEY", "")),
+        ]
+        arr = None
+        for _model, _base, _key in candidates:
+            if not _model:
+                continue
+            try:
+                arr = _ask(_model, _base, _key)
+                if arr:
+                    break
+            except Exception as _e:  # noqa: BLE001
+                print(f"⚠️ transition pick via {_model} failed ({str(_e)[:120]}) — trying fallback")
+        if not arr:
             return None
         out = []
         for item in arr[: len(main_clips) - 1]:
@@ -1889,6 +1914,28 @@ def main():
     )
 
     if success:
+        # Sidecar meta for the UI: which transitions were actually used at
+        # each cut + the music window — the timeline visualizes both.
+        try:
+            _t_uniform = float(args.transition or 0)
+            _mode = ("ai" if (args.transition_mode == "ai" and transitions)
+                     else ("uniform" if _t_uniform > 0 else "none"))
+            _meta = {
+                "transition_mode": _mode,
+                "transitions": (transitions if transitions else
+                                ([f"fade:{_t_uniform:.2f}"] * max(0, len(clips) - 1)
+                                 if _t_uniform > 0 else [])),
+                "audio": {
+                    "path": args.audio or "",
+                    "start": round(float(audio_start_time or 0.0), 2),
+                    "duration": round(float(audio_duration or 0.0), 2),
+                },
+                "clips": len(clips),
+            }
+            with open(os.path.splitext(args.output)[0] + ".render.json", "w", encoding="utf-8") as _mf:
+                json.dump(_meta, _mf, ensure_ascii=False, indent=2)
+        except Exception as _e:  # noqa: BLE001
+            print(f"(render meta sidecar skipped: {_e})")
         print(f"\nSuccess! Video saved to: {args.output}")
         return 0
     else:
