@@ -1088,17 +1088,9 @@ class ScanRequest(BaseModel):
 SCANNED: dict[str, list] = {"assets": [], "root": ""}
 
 
-@app.post("/api/assets/scan")
-def scan_assets(body: ScanRequest):
-    from src.asset_manager.scanner import scan_asset_directory
+def _assets_with_annotations(assets: list) -> list:
+    """Merge each scanned asset with its cloud + local annotation, if any."""
     from src.asset_manager.index_store import load_index
-    root = body.root.strip() or cfg("ASSET_ROOT_DIR", "resource/imports/")
-    abs_root = _resolve(root)
-    if not os.path.isdir(abs_root):
-        raise HTTPException(400, f"Folder not found: {abs_root}")
-    assets = scan_asset_directory(abs_root)
-    SCANNED["assets"] = assets
-    SCANNED["root"] = abs_root
     idx = load_index()
     local_store = _load_local_annotations()
     out = []
@@ -1114,7 +1106,43 @@ def scan_assets(body: ScanRequest):
         if _loc is not None:
             d["annotation_local"] = _loc.get("annotation")
         out.append(d)
-    return {"root": abs_root, "assets": out}
+    return out
+
+
+@app.post("/api/assets/scan")
+def scan_assets(body: ScanRequest):
+    from src.asset_manager.scanner import scan_asset_directory
+    root = body.root.strip() or cfg("ASSET_ROOT_DIR", "resource/imports/")
+    abs_root = _resolve(root)
+    if not os.path.isdir(abs_root):
+        raise HTTPException(400, f"Folder not found: {abs_root}")
+    assets = scan_asset_directory(abs_root)
+    SCANNED["assets"] = assets
+    SCANNED["root"] = abs_root
+    return {"root": abs_root, "assets": _assets_with_annotations(assets)}
+
+
+@app.get("/api/assets/scan")
+def last_scan():
+    """Restore the last scan without a manual re-scan (page refresh / restart).
+
+    Returns the in-memory scan if the server still holds one; otherwise runs a
+    scan of the configured root — cheap now that scanner.py caches probed
+    metadata on disk, so unchanged files are not re-hashed/re-probed.
+    """
+    from src.asset_manager.scanner import scan_asset_directory
+    if SCANNED["assets"]:
+        abs_root = SCANNED["root"]
+        assets = SCANNED["assets"]
+    else:
+        abs_root = _resolve(cfg("ASSET_ROOT_DIR", "resource/imports/"))
+        if not os.path.isdir(abs_root):
+            return {"root": abs_root, "assets": [], "scanned": False}
+        assets = scan_asset_directory(abs_root)
+        SCANNED["assets"] = assets
+        SCANNED["root"] = abs_root
+    return {"root": abs_root, "assets": _assets_with_annotations(assets),
+            "scanned": True}
 
 
 def _analysis_details(content_hash: str, variant: str = "") -> dict:

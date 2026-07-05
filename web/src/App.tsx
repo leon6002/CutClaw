@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   AudioLines, Clapperboard, FolderOpen, PenLine, Plus, Scissors,
-  Settings2, Sparkles, Video,
+  Settings2, SlidersHorizontal, Sparkles, Video,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -18,6 +18,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { api, useJob, type JobState } from "./api";
 import { ModelConfigProvider } from "./components/ModelConfig";
+import PipelineSettings from "./components/PipelineSettings";
 import AgentFlow from "./components/AgentFlow";
 import FloatingTerminal from "./components/FloatingTerminal";
 import JobDock from "./components/JobDock";
@@ -155,6 +156,7 @@ function deriveWorkflow(
 export default function App() {
   const [tab, setTab] = useState("assets");
   const [showSettings, setShowSettings] = useState(false);
+  const [showParams, setShowParams] = useState(false);
   const [projects, setProjects] = useState<any[]>([]);
   const [project, setProjectState] = useState<ProjectState | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -308,6 +310,10 @@ export default function App() {
               onClick={() => setShowSettings(true)}>
               <Settings2 className="h-3.5 w-3.5" /> 模型设置
             </Button>
+            <Button variant="outline" size="sm" className="h-8 gap-1 border-white/10 bg-white/[0.04] text-xs"
+              onClick={() => setShowParams(true)}>
+              <SlidersHorizontal className="h-3.5 w-3.5" /> 参数
+            </Button>
           </div>
         </header>
 
@@ -351,6 +357,7 @@ export default function App() {
         </main>
 
         {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+        <PipelineSettings open={showParams} onOpenChange={setShowParams} />
 
       <FloatingTerminal
         lines={pipelineJob.lines}
