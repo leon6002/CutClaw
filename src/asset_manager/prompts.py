@@ -85,16 +85,16 @@ AUDIO_ANNOTATION_PROMPT = """Below is a structured analysis of a music track pro
   "genre": "Inferred genre (e.g. 'cinematic orchestral', 'electronic pop', 'acoustic folk')",
   "emotion": "Dominant emotional tone",
   "energy_level": "<high | medium | low | building | varied>",
-  "bpm": <float>,
-  "sections_summary": "Brief summary of track structure (e.g. 'Intro 0-20s, Verse 20-50s, Chorus 50-80s, Outro 80-100s')",
+  "sections_summary": "Brief prose summary of the track structure (e.g. 'quiet intro, verses building into a big chorus, stripped-back outro')",
   "tags": ["tag1", "tag2", ...],
   "quality_score": <float 0-10>,
-  "suggested_use": "How to use this track (e.g. 'climax montage', 'calm intro', 'transition background')",
-  "duration_sec": <float>
+  "suggested_use": "How to use this track (e.g. 'climax montage', 'calm intro', 'transition background')"
 }}
 
 STRICT rules:
 - Only return valid JSON, no extra text.
+- Do NOT output BPM, durations or timestamps — all measurable numbers come
+  from signal analysis and are filled in by code. Words describe; instruments measure.
 """
 
 # ── Asset selector ─────────────────────────────────────────────────────────

@@ -94,19 +94,45 @@ Output ONLY valid JSON:
 
 AUDIO_SEG_KEYPOINT_PROMPT = """You are a professional music analyst for video editing. Analyze this audio segment and describe its characteristics for matching with video footage.
 
+MEASURED_TEMPO_LINE
+
 Focus on:
 - Musical style and instrumentation
 - Emotional atmosphere and mood
 - Energy dynamics and intensity changes
-- Rhythmic patterns and tempo feel
+- Rhythmic FEEL (driving, relaxed, floating, syncopated…)
+
+IMPORTANT: Do NOT invent numeric values (no BPM numbers, no energy scores) —
+tempo and energy are measured separately by signal analysis. Words only.
 
 Output ONLY valid JSON (no markdown, no explanation):
 {
   "summary": "Description of genre, instrumentation, and overall mood",
   "emotion": "Primary emotional tone (e.g., energetic, melancholic, uplifting, tense, romantic, triumphant, mysterious, nostalgic)",
-  "energy": "Energy level 1-10 with trend (e.g., '7, building intensity', '3, calm and steady', '9, explosive climax', '5, gradually fading')",
-  "rhythm": "Tempo and rhythmic feel (e.g., '128 BPM, driving electronic beat', '85 BPM, relaxed groove', '60 BPM, slow ambient pulse', 'free tempo, atmospheric')"
+  "energy": "Energy character in words (e.g., 'building intensity', 'calm and steady', 'explosive climax', 'gradually fading')",
+  "rhythm": "Rhythmic feel in words (e.g., 'driving electronic beat', 'relaxed groove', 'slow ambient pulse', 'free tempo, atmospheric')"
 }"""
+
+AUDIO_SECTION_NAMING_PROMPT = """You are a professional music analyst. The track's structural sections
+have ALREADY been measured by signal analysis — the boundaries are fixed facts, NOT yours to change.
+
+Measured sections:
+{sections_table}
+
+Measured tempo: {bpm} BPM (felt pulse), bar ≈ {bar}s. Global energy climax around {climax}s.
+
+Listen to the audio and, for EACH section index, give it a musical name and a short description
+of what happens there. Use standard terms: Intro, Verse, Chorus, Bridge, Build-up, Drop, Breakdown, Outro.
+
+Output ONLY valid JSON:
+{{
+  "summary": "Genre, mood and key characteristics in 1-2 sentences (words only)",
+  "sections": [
+    {{"index": 0, "name": "Intro", "description": "..."}},
+    {{"index": 1, "name": "Verse 1", "description": "..."}}
+  ]
+}}
+Do NOT output timestamps, BPM or any numeric values — those are already measured."""
 
 
 
@@ -768,6 +794,20 @@ def caption_audio_with_madmom_segments(
     keypoints = merged_keypoints
     print(f"\n✓ Total detected keypoints: {len(keypoints)} (from {len(detection_methods)} method(s))")
 
+    # ── FACTS LAYER: everything measurable is computed HERE, before any LLM ──
+    # Beat grid, energy curve, climax, and structural section boundaries come
+    # from signal analysis and are treated as ground truth. LLMs downstream
+    # only NAME and DESCRIBE — they never emit numbers.
+    print("\n[Step 1.15] Computing measured audio facts (beat grid / energy / structure)...")
+    from src.audio.audio_facts import compute_audio_facts
+    audio_facts = compute_audio_facts(audio_path, keypoints, audio_duration or 0.0)
+    if audio_facts.get("bpm_felt"):
+        print(f"  ✓ measured: bar={audio_facts.get('bar_sec')}s, felt {audio_facts.get('bpm_felt')} BPM, "
+              f"climax @{audio_facts.get('climax_sec')}s, "
+              f"{max(0, len(audio_facts.get('section_boundaries') or []) - 1)} measured sections")
+    else:
+        print("  ⚠ no reliable beat grid — facts partial, structure falls back to LLM")
+
     # Stage 1.5: 规则过滤 - 按照配置参数过滤分割点
     print("\n[Step 1.2] Applying rule-based filtering...")
     print(f"  Parameters: min_interval={min_interval}s, top_k={top_k_keypoints}, energy_percentile={energy_percentile}")
@@ -796,7 +836,54 @@ def caption_audio_with_madmom_segments(
     overall_summary = ""
     stage1_sections = []
 
-    for retry_attempt in range(MAX_RETRIES):
+    # ── Preferred path: boundaries are MEASURED; the LLM only names them ────
+    # This removes the whole class of LLM-timestamp bugs (out-of-range
+    # sections, JSON retries, boundary drift) — timestamps never come from a
+    # language model. The legacy LLM path below runs only when the signal
+    # segmentation is unusable.
+    _fact_bounds = audio_facts.get("section_boundaries") or []
+    if len(_fact_bounds) >= 3:
+        print("\nSections measured by signal analysis — LLM will only name/describe them.")
+        _stats = audio_facts.get("section_stats") or []
+        _rows = []
+        for _i in range(len(_fact_bounds) - 1):
+            _b0, _b1 = _fact_bounds[_i], _fact_bounds[_i + 1]
+            _st = _stats[_i] if _i < len(_stats) else {}
+            _rows.append(f"- index {_i}: {_b0:.1f}s → {_b1:.1f}s ({_b1 - _b0:.0f}s), "
+                         f"energy {_st.get('energy_mean', '?')} ({_st.get('energy_trend', '?')})")
+        _naming_prompt = AUDIO_SECTION_NAMING_PROMPT.format(
+            sections_table="\n".join(_rows),
+            bpm=audio_facts.get("bpm_felt", "?"),
+            bar=audio_facts.get("bar_sec", "?"),
+            climax=audio_facts.get("climax_sec", "?"),
+        )
+        _names: dict = {}
+        try:
+            _resp = call_audio_api(audio_path, _naming_prompt, temperature, top_p, max_tokens)
+            _pj = extract_json_from_text(_resp) or {}
+            overall_summary = str(_pj.get("summary", "") or "")
+            for _it in _pj.get("sections", []) or []:
+                try:
+                    _names[int(_it.get("index"))] = (
+                        str(_it.get("name", "")).strip(),
+                        str(_it.get("description", "")).strip(),
+                    )
+                except (TypeError, ValueError):
+                    continue
+        except Exception as _e:  # noqa: BLE001
+            print(f"  ⚠ naming call failed ({_e}) — using generic section names")
+        for _i in range(len(_fact_bounds) - 1):
+            _nm, _ds = _names.get(_i, ("", ""))
+            stage1_sections.append({
+                "name": _nm or f"Section {_i + 1}",
+                "description": _ds,
+                "Start_Time": seconds_to_mmss(_fact_bounds[_i]),
+                "End_Time": seconds_to_mmss(_fact_bounds[_i + 1]),
+            })
+        print(f"  ✓ {len(stage1_sections)} sections (boundaries measured, names by LLM)")
+
+    # Legacy LLM-boundary path — only when measured segmentation is unusable
+    for retry_attempt in range(0 if stage1_sections else MAX_RETRIES):
         if retry_attempt > 0:
             print(f"\n⚠ Retry attempt {retry_attempt + 1}/{MAX_RETRIES}...")
 
@@ -977,8 +1064,17 @@ def caption_audio_with_madmom_segments(
     print()
 
     # Stage 2.6: 将 Level 1 sections 的边界吸附到最近的分割点
+    # ONLY meaningful for LLM-guessed boundaries (which drift off-beat).
+    # Measured boundaries already sit on the downbeat grid — re-snapping them
+    # against the FILTERED keypoint subset mangles the sections (observed:
+    # shifted boundaries and even inverted start/end times).
+    _boundaries_are_measured = bool(audio_facts.get("section_boundaries")) and (
+        len(audio_facts.get("section_boundaries") or []) - 1 == len(stage1_sections))
     print("\n" + "-"*80)
-    print("[Step 2.6] Snapping Level 1 section boundaries to nearest keypoints...")
+    if _boundaries_are_measured:
+        print("[Step 2.6] Skipped — section boundaries are measured (already on the downbeat grid)")
+    else:
+        print("[Step 2.6] Snapping Level 1 section boundaries to nearest keypoints...")
     print("-"*80)
 
     # 获取所有分割点时间（包括音频开头和结尾）
@@ -1069,9 +1165,11 @@ def caption_audio_with_madmom_segments(
         sec['Start_Time'] = seconds_to_mmss(snapped['snapped_start'])
         sec['End_Time'] = seconds_to_mmss(snapped['snapped_end'])
         new_stage1_sections.append(sec)
-    stage1_sections = new_stage1_sections
-
-    print(f"✓ Section boundaries snapped to {len(keypoint_times)} keypoints")
+    if not _boundaries_are_measured:
+        stage1_sections = new_stage1_sections
+        print(f"✓ Section boundaries snapped to {len(keypoint_times)} keypoints")
+    else:
+        print("✓ Measured boundaries kept as-is (snap pass not applied)")
 
     # Stage 3: For each Level 1 section, create Level 2 sub-segments using filtered keypoints
     print("\n" + "="*80)
@@ -1272,11 +1370,23 @@ def caption_audio_with_madmom_segments(
             all_subsegments.append((section_idx, subseg_idx, subseg))
 
         # Initialize the section entry
+        # measured per-section stats (energy / trend / onset density) — attach
+        # by best time-overlap so downstream consumers (Screenwriter, selector)
+        # read REAL numbers instead of LLM prose
+        _measured = None
+        for _st in (audio_facts.get("section_stats") or []):
+            _ov = min(sec_end, _st.get("end_sec", 0)) - max(sec_start, _st.get("start_sec", 0))
+            if _ov > 0.5 * max(0.1, sec_end - sec_start):
+                _measured = {k: _st[k] for k in
+                             ("energy_mean", "energy_max", "energy_trend", "onset_density_per_10s")
+                             if k in _st}
+                break
         final_sections.append({
             "name": stage1_sec.get("name", f"Section {section_idx + 1}"),
             "description": stage1_sec.get("description", ""),
             "Start_Time": stage1_sec.get("Start_Time", seconds_to_mmss(sec_start)),
             "End_Time": stage1_sec.get("End_Time", seconds_to_mmss(sec_end)),
+            **({"measured": _measured} if _measured else {}),
             "detailed_analysis": {
                 "summary": "",
                 "sections": []
@@ -1347,9 +1457,15 @@ def caption_audio_with_madmom_segments(
         except Exception:
             seg_labels.append(f"seg {_sub_i + 1}")
 
+    _tempo_line = (
+        f"Measured tempo of this track: {audio_facts['bpm_felt']} BPM (felt pulse), "
+        f"bar ≈ {audio_facts.get('bar_sec')}s — use this as context for your wording."
+        if audio_facts.get("bpm_felt") else
+        "Tempo could not be reliably measured — describe the rhythmic feel in words only."
+    )
     caption_texts = generate_audio_captions_batch(
         audio_paths=valid_segment_paths,
-        prompt=AUDIO_SEG_KEYPOINT_PROMPT,
+        prompt=AUDIO_SEG_KEYPOINT_PROMPT.replace("MEASURED_TEMPO_LINE", _tempo_line),
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
@@ -1442,10 +1558,11 @@ def caption_audio_with_madmom_segments(
             "prompt": AUDIO_OVERALL_PROMPT.strip(),
             "summary": overall_summary
         },
-        # MEASURED tempo from the madmom downbeat grid — the only BPM in this
-        # system that comes from actual signal analysis. LLM-written "rhythm"
-        # text routinely invents genre-typical numbers (e.g. "128 BPM" for a
-        # 70 BPM track); downstream consumers must prefer this field.
+        # FACTS layer: every measurable value, from signal analysis only.
+        # LLM output above is descriptions — any numeric field downstream
+        # must read from here, never from LLM text.
+        "facts": audio_facts,
+        # kept for backward compatibility with earlier consumers
         "measured_tempo": ({
             "bar_sec": round(_bar, 3),
             "bpm_felt": round(240.0 / _bar, 1),

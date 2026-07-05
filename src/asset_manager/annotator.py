@@ -107,6 +107,9 @@ def _parse_json_strict(content: str | None) -> dict | None:
 
 def _bpm_from_caption_dict(caption_data: dict) -> float | None:
     try:
+        facts = caption_data.get("facts") or {}
+        if facts.get("bpm_felt"):
+            return float(facts["bpm_felt"])
         mt = caption_data.get("measured_tempo") or {}
         if mt.get("bpm_felt"):
             return float(mt["bpm_felt"])

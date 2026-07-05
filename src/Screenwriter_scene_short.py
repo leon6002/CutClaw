@@ -242,7 +242,9 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
     if not sections:
         return '0:00', _seconds_to_mmss(target_dur)
 
-    # Build sections_info for LLM
+    # Build sections_info for LLM — measured stats included so the choice is
+    # grounded in real energy/tempo data, not the LLM's prose impressions
+    facts = audio_db.get('facts') or {}
     sections_info = []
     for i, sec in enumerate(sections):
         sec_start = _to_audio_seconds(sec.get('Start_Time', 0))
@@ -252,6 +254,7 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
             "section_index": i,
             "name": sec.get('name', ''),
             "description": sec.get('description', ''),
+            **({"measured": sec.get('measured')} if sec.get('measured') else {}),
             "Start_Time": sec.get('Start_Time', ''),
             "End_Time": sec.get('End_Time', ''),
             "duration_seconds": dur,
@@ -290,8 +293,14 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
 
     feedback = None
     for attempt in range(1, config.AUDIO_SEGMENT_SELECTION_MAX_RETRIES + 1):
+        _facts_line = ""
+        if facts.get("bpm_felt"):
+            _facts_line = (f"\nMEASURED FACTS (signal analysis, trust these numbers): "
+                           f"felt tempo {facts['bpm_felt']} BPM, bar ≈ {facts.get('bar_sec')}s"
+                           + (f", global energy climax around {facts['climax_sec']}s"
+                              if facts.get('climax_sec') is not None else "") + "\n")
         prompt = SELECT_AUDIO_SEGMENT_PROMPT.format(
-            summary=summary,
+            summary=summary + _facts_line,
             sections_json=json.dumps(sections_info, indent=2, ensure_ascii=False),
             instruction=instruction,
             min_duration_sec=min_dur,

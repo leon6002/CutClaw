@@ -885,8 +885,8 @@ def params_suggestions(body: SuggestRequest):
                 if os.path.exists(_cj):
                     with open(_cj, "r", encoding="utf-8") as fh:
                         _cap = json.load(fh)
-                    _mt = _cap.get("measured_tempo") or {}
-                    measured_bpm = _mt.get("bpm_felt")
+                    measured_bpm = ((_cap.get("facts") or {}).get("bpm_felt")
+                                    or (_cap.get("measured_tempo") or {}).get("bpm_felt"))
                     if not measured_bpm:  # older caches: derive from downbeat gaps
                         _db = sorted(k["time"] for k in (_cap.get("_keypoints_detail") or [])
                                      if k.get("type") == "Downbeat")
