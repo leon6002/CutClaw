@@ -187,6 +187,7 @@ def annotate_video_asset(
     endpoint: str | None = None,
     api_key: str | None = None,
     progress_callback=None,
+    variant: str = "",
 ) -> VideoAnnotation:
     """Run full per-video analysis and distill into a VideoAnnotation.
 
@@ -201,7 +202,8 @@ def annotate_video_asset(
     # batch run would SKIP it forever — the per-step resume never got a
     # chance. Let it propagate; the asset stays 未标注 and the next run
     # resumes from the per-clip checkpoints.
-    content_hash = analyze_video(metadata.absolute_path, progress_callback=progress_callback)
+    content_hash = analyze_video(metadata.absolute_path, progress_callback=progress_callback,
+                                 variant=variant)
 
     # Distill scene summaries into compact annotation
     try:
@@ -210,7 +212,7 @@ def annotate_video_asset(
         from .prompts import VIDEO_ANNOTATION_SYSTEM, VIDEO_ANNOTATION_PROMPT
         import litellm
 
-        cache_dir = get_analysis_path(content_hash)
+        cache_dir = get_analysis_path(content_hash, variant)
         summaries_dir = os.path.join(cache_dir, "captions", "scene_summaries_video")
 
         # Build summary from scene analysis
@@ -528,6 +530,7 @@ def annotate_asset(
     endpoint: str | None = None,
     api_key: str | None = None,
     progress_callback=None,
+    variant: str = "",
 ) -> AssetAnnotation:
     """Route to the correct annotator based on asset_type."""
     m = model or _default_vlm_model()
@@ -535,7 +538,8 @@ def annotate_asset(
     key = api_key or _default_vlm_api_key()
 
     if isinstance(metadata, VideoAssetMetadata):
-        ann = annotate_video_asset(metadata, model=m, endpoint=ep, api_key=key, progress_callback=progress_callback)
+        ann = annotate_video_asset(metadata, model=m, endpoint=ep, api_key=key,
+                                   progress_callback=progress_callback, variant=variant)
     elif isinstance(metadata, ImageAssetMetadata):
         ann = annotate_image_asset(metadata, model=m, endpoint=ep, api_key=key)
     elif isinstance(metadata, AudioAssetMetadata):

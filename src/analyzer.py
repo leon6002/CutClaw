@@ -41,9 +41,11 @@ ANALYSIS_ROOT = os.path.join("Output", "analyzed")
 
 # ── Path helpers ───────────────────────────────────────────────────────────
 
-def get_analysis_path(content_hash: str) -> str:
-    """Return the cache directory for a given content hash."""
-    return os.path.join(ANALYSIS_ROOT, content_hash)
+def get_analysis_path(content_hash: str, variant: str = "") -> str:
+    """Cache directory for a content hash. `variant` separates parallel
+    annotation tracks (e.g. "local" for the on-device VLM) so cloud and
+    local results persist side by side: {hash}/ vs {hash}@local/."""
+    return os.path.join(ANALYSIS_ROOT, content_hash + (f"@{variant}" if variant else ""))
 
 
 def _ensure_ffmpeg_on_path() -> None:
@@ -466,6 +468,7 @@ def analyze_video(
     video_type: str = "film",
     force: bool = False,
     progress_callback=None,
+    variant: str = "",
 ) -> str:
     """Analyze a single video: shot detection → captions → scenes → scene summaries.
 
@@ -490,7 +493,7 @@ def analyze_video(
     if not content_hash:
         raise RuntimeError(f"Could not compute hash for: {abs_path}")
 
-    cache_dir = get_analysis_path(content_hash)
+    cache_dir = get_analysis_path(content_hash, variant)
 
     # Gather metadata regardless
     from src.asset_manager.scanner import probe_video_metadata

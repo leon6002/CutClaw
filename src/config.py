@@ -17,9 +17,9 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615164736_0674_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615165651_0680_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260615211535_0709_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
-AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\Judah Earl - Sand Drawing.mp3"
-INSTRUCTION = "剥离杂音，仅留弦乐与山谷回响，让栈道云海和蜿蜒河流徐徐展开，坠入自然梦境。"
+VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20241029121051_0072_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251213150209_0357_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251214092309_0372_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251214100656_0373_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
+AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\Adrian Disch,Rore - Auld Lang Syne.mp3"
+INSTRUCTION = "让滑雪的飞驰与山谷的静谧交织，在钢琴与弦乐中铺开一段冬日告别与重逢的回忆。"
 SRT_PATH = ""
 
 

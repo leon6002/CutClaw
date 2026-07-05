@@ -1070,6 +1070,7 @@ def scan_assets(body: ScanRequest):
     SCANNED["assets"] = assets
     SCANNED["root"] = abs_root
     idx = load_index()
+    local_store = _load_local_annotations()
     out = []
     for meta in assets:
         d = _dump(meta)
@@ -1078,14 +1079,18 @@ def scan_assets(body: ScanRequest):
         d["annotated"] = ann is not None
         if ann is not None:
             d["annotation"] = _dump(ann.annotation)
+        _loc = local_store.get(h)
+        d["annotated_local"] = _loc is not None
+        if _loc is not None:
+            d["annotation_local"] = _loc.get("annotation")
         out.append(d)
     return {"root": abs_root, "assets": out}
 
 
-def _analysis_details(content_hash: str) -> dict:
+def _analysis_details(content_hash: str, variant: str = "") -> dict:
     """Per-clip captions + scene summaries from the analyzed cache."""
     from src.analyzer import get_analysis_path
-    cache_dir = get_analysis_path(content_hash)
+    cache_dir = get_analysis_path(content_hash, variant)
     result = {"clips": [], "scenes": []}
     ckpt = os.path.join(cache_dir, "captions", "ckpt")
     if os.path.isdir(ckpt):
@@ -1109,13 +1114,14 @@ def _analysis_details(content_hash: str) -> dict:
 
 
 @app.get("/api/assets/{content_hash}/details")
-def asset_details(content_hash: str):
-    return _analysis_details(content_hash)
+def asset_details(content_hash: str, variant: str = ""):
+    return _analysis_details(content_hash, variant)
 
 
 class AnnotateRequest(BaseModel):
     content_hashes: list[str] = []   # empty → all new assets
     force: bool = False
+    provider: str = "cloud"          # "cloud" | "local" — parallel annotation tracks
 
 
 # Requests arriving while a batch is running are QUEUED and chained into a
@@ -1123,6 +1129,47 @@ class AnnotateRequest(BaseModel):
 # adds them to the line instead of being rejected/disabled.
 _ANNOTATE_QUEUE: list = []
 _ANNOTATE_LOCK = threading.Lock()
+
+_LOCAL_ANN_PATH = os.path.join(PROJECT_ROOT, "Output", "asset_index", "annotations_local.json")
+
+
+def _load_local_annotations() -> dict:
+    try:
+        with open(_LOCAL_ANN_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_local_annotations(results: list) -> int:
+    """Persist local-VLM annotations SEPARATELY from the cloud track."""
+    store = _load_local_annotations()
+    n = 0
+    for r in results:
+        if r is None:
+            continue
+        h = getattr(r, "content_hash", "") or getattr(getattr(r, "metadata", None), "content_hash", "")
+        if not h:
+            continue
+        store[h] = {"metadata": _dump(r.metadata), "annotation": _dump(r.annotation)}
+        n += 1
+    os.makedirs(os.path.dirname(_LOCAL_ANN_PATH), exist_ok=True)
+    with open(_LOCAL_ANN_PATH, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    return n
+
+
+def _local_vlm_entry() -> dict:
+    """The local model entry from the API pool (endpoint on 11434)."""
+    try:
+        with open(os.path.join(PROJECT_ROOT, "src", "api_pool.json"), "r", encoding="utf-8") as f:
+            for e in json.load(f):
+                if "11434" in str(e.get("endpoint", "")):
+                    return e
+    except Exception:  # noqa: BLE001
+        pass
+    return {"model": "openai/qwen2.5vl:latest",
+            "endpoint": "http://127.0.0.1:11434/v1", "api_key": "sk-local"}
 
 
 def _annotate_running_job():
@@ -1142,7 +1189,8 @@ def annotate(body: AnnotateRequest):
         running = _annotate_running_job()
         if running is not None:
             _ANNOTATE_QUEUE.append({"content_hashes": list(body.content_hashes or []),
-                                    "force": bool(body.force)})
+                                    "force": bool(body.force),
+                                    "provider": body.provider or "cloud"})
             running.add(f"[queue] +1 请求已排队（队列 {len(_ANNOTATE_QUEUE)}）")
             return {"job_id": None, "queued": True, "position": len(_ANNOTATE_QUEUE),
                     "message": f"已加入标注队列（第 {len(_ANNOTATE_QUEUE)} 位），当前批次完成后自动开始。"}
@@ -1215,7 +1263,50 @@ def annotate(body: AnnotateRequest):
                     job.meta.update({"stage": "", "stage_detail": ""})
                 job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
 
-            if body.force:
+            if body.provider == "local":
+                # LOCAL VLM track: sequential (single GPU), analysis cached
+                # under {hash}@local/, annotation persisted in
+                # annotations_local.json — parallel to the cloud track.
+                from src import config as _cfg
+                _lv = _local_vlm_entry()
+                _prev = (_cfg.VIDEO_ANALYSIS_MODEL, _cfg.VIDEO_ANALYSIS_ENDPOINT,
+                         _cfg.VIDEO_ANALYSIS_API_KEY,
+                         getattr(_cfg, "CAPTION_BATCH_SIZE", 64))
+                _cfg.VIDEO_ANALYSIS_MODEL = _lv["model"]
+                _cfg.VIDEO_ANALYSIS_ENDPOINT = _lv["endpoint"]
+                _cfg.VIDEO_ANALYSIS_API_KEY = _lv.get("api_key") or "sk-local"
+                _cfg.CAPTION_BATCH_SIZE = 4      # ollama parallel slots
+                job.add(f"[local] 使用本地模型 {_lv['model']} @ {_lv['endpoint']}")
+                results = []
+                try:
+                    for i, meta in enumerate(targets, 1):
+                        _files_state[meta.content_hash] = "r"
+                        _reset_file_view()
+                        job.meta.update({"current": i - 1, "total": len(targets),
+                                         "filename": getattr(meta, "file_name", "")})
+                        job.add(f"[file] {i}/{len(targets)} {getattr(meta, 'file_name', '')} (local)")
+                        _t0 = time.time()
+                        try:
+                            if body.force and getattr(meta, "asset_type", "video") == "video":
+                                analyze_video(getattr(meta, "absolute_path", ""),
+                                              force=True, progress_callback=_stage_cb,
+                                              variant="local")
+                            results.append(annotate_asset(
+                                meta, model=_lv["model"], endpoint=_lv["endpoint"],
+                                api_key=_lv.get("api_key") or "sk-local",
+                                progress_callback=_stage_cb, variant="local"))
+                            _files_state[meta.content_hash] = "d"
+                            job.add(f"[file] done in {time.time() - _t0:.0f}s")
+                        except Exception as e:  # noqa: BLE001
+                            _files_state[meta.content_hash] = "f"
+                            job.add(f"[file] 失败: {str(e)[:150]}")
+                        job.meta.update({"current": i, "stage": "", "stage_detail": ""})
+                finally:
+                    (_cfg.VIDEO_ANALYSIS_MODEL, _cfg.VIDEO_ANALYSIS_ENDPOINT,
+                     _cfg.VIDEO_ANALYSIS_API_KEY, _cfg.CAPTION_BATCH_SIZE) = _prev
+                _n = _save_local_annotations(results)
+                job.add(f"[local] 本地标注已持久化 {_n} 条 (annotations_local.json)")
+            elif body.force:
                 results = []
                 for i, meta in enumerate(targets, 1):
                     _files_state[meta.content_hash] = "r"
@@ -1251,14 +1342,19 @@ def annotate(body: AnnotateRequest):
                                          stage_callback=_stage_cb, start_callback=_start_cb)
                 upsert_annotations(results)
             # auto write-back: freshly annotated Immich-bound assets get their
-            # description updated in Immich (searchable there too)
+            # description updated in Immich (searchable there too).
+            # Local-track results are a parallel experiment — not written back.
             try:
+                if body.provider == "local":
+                    raise StopIteration
                 _wb = _writeback_annotations(
                     [getattr(r.metadata, "file_name", "") for r in results if r is not None])
                 if _wb.get("synced"):
                     job.add(f"[immich] 标注已回写 {_wb['synced']} 个资产描述")
                 for _e2 in _wb.get("errors", [])[:3]:
                     job.add(f"[immich] 回写失败: {_e2}")
+            except StopIteration:
+                pass
             except Exception as _e:  # noqa: BLE001
                 job.add(f"[immich] 回写跳过: {_e}")
 
@@ -1279,19 +1375,27 @@ def annotate(body: AnnotateRequest):
             _merged: list = []
             _force_any = False
             _scan_new = False
+            _next_provider = "cloud"
             with _ANNOTATE_LOCK:
-                while _ANNOTATE_QUEUE:
-                    _q = _ANNOTATE_QUEUE.pop(0)
-                    if _q.get("content_hashes"):
-                        _merged.extend(_q["content_hashes"])
-                    else:
-                        _scan_new = True
-                    _force_any = _force_any or bool(_q.get("force"))
+                if _ANNOTATE_QUEUE:
+                    _next_provider = _ANNOTATE_QUEUE[0].get("provider", "cloud")
+                    _rest = []
+                    for _q in _ANNOTATE_QUEUE:
+                        if _q.get("provider", "cloud") != _next_provider:
+                            _rest.append(_q)
+                            continue
+                        if _q.get("content_hashes"):
+                            _merged.extend(_q["content_hashes"])
+                        else:
+                            _scan_new = True
+                        _force_any = _force_any or bool(_q.get("force"))
+                    _ANNOTATE_QUEUE[:] = _rest
             if _merged or _scan_new:
                 try:
                     annotate(AnnotateRequest(
                         content_hashes=[] if _scan_new else list(dict.fromkeys(_merged)),
                         force=_force_any,
+                        provider=_next_provider,
                     ))
                     job.add("[queue] 队列中的请求已作为新批次启动")
                 except Exception as _e:  # noqa: BLE001

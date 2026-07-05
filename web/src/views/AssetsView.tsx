@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AudioLines, BookOpen, Bot, Camera, ClipboardList, Code2, Database, Drama,
+  AudioLines, BookOpen, Bot, Camera, ClipboardList, Code2, Cpu, Database, Drama,
   Eye, FileText, Film, FolderOpen, Images, Layers, Lightbulb, Loader2,
   Music2, Pin, Play, RefreshCw, ScanSearch, Search, SearchCode, Settings2, Sparkles, Tags,
 } from "lucide-react";
@@ -48,6 +48,9 @@ export interface Asset {
   file_size_mb?: number;
   annotated: boolean;
   annotation?: Record<string, any>;
+  /** parallel local-VLM track (annotations_local.json) */
+  annotated_local?: boolean;
+  annotation_local?: Record<string, any>;
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -224,15 +227,19 @@ function DetailView({
 }) {
   const [details, setDetails] = useState<{ clips: any[]; scenes: any[] } | null>(null);
   const [loading, setLoading] = useState(false);
+  // annotation track: cloud (API) vs local VLM — two parallel, persisted results
+  const [track, setTrack] = useState<"cloud" | "local">("cloud");
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => { setTrack("cloud"); }, [asset?.content_hash]);
 
   useEffect(() => {
     setDetails(null);
     if (!asset || asset.asset_type === "image") return;
     setLoading(true);
-    api<any>(`/api/assets/${asset.content_hash}/details`)
+    api<any>(`/api/assets/${asset.content_hash}/details${track === "local" ? "?variant=local" : ""}`)
       .then(setDetails).catch(() => {}).finally(() => setLoading(false));
-  }, [asset?.content_hash]);
+  }, [asset?.content_hash, track]);
 
   // full-page view: Esc = back, arrow keys = prev/next asset
   useEffect(() => {
@@ -255,7 +262,9 @@ function DetailView({
   };
   const clips = details?.clips ?? [];
   const scenes = details?.scenes ?? [];
-  const ann = asset.annotation ?? {};
+  const onLocal = track === "local";
+  const ann = (onLocal ? asset.annotation_local : asset.annotation) ?? {};
+  const hasAnn = onLocal ? !!asset.annotated_local : asset.annotated;
 
   return (
     <div>
@@ -268,9 +277,25 @@ function DetailView({
         <span className="max-w-[420px] truncate text-sm font-semibold text-slate-200">
           {asset.file_name || asset.file_path}
         </span>
-        {asset.annotated
+        {hasAnn
           ? <Badge variant="outline" className={qBadgeCls(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Badge>
           : <Badge variant="outline" className={NEW_CLS}>未标注</Badge>}
+        {/* annotation-track switcher — cloud API vs local VLM, both persisted */}
+        {asset.asset_type === "video" && (
+          <div className="ml-1 flex overflow-hidden rounded-lg border border-white/10">
+            <button
+              className={cn("px-2.5 py-1 text-[11px] transition-colors",
+                !onLocal ? "bg-cyan-500/15 text-cyan-300" : "text-slate-500 hover:text-slate-300")}
+              onClick={() => setTrack("cloud")}
+            >☁ 云端</button>
+            <button
+              className={cn("px-2.5 py-1 text-[11px] transition-colors",
+                onLocal ? "bg-violet-500/15 text-violet-300" : "text-slate-500 hover:text-slate-300")}
+              title={asset.annotated_local ? "查看本地 VLM 标注结果" : "该视频还没有本地 VLM 标注 — 卡片上点「本地」"}
+              onClick={() => setTrack("local")}
+            >🖥 本地</button>
+          </div>
+        )}
         {pos && <span className="text-xs text-slate-500">{pos}</span>}
         <div className="ml-auto flex items-center gap-2">
           <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] px-2.5 text-xs"
@@ -316,7 +341,9 @@ function DetailView({
           <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-300">
             <ClipboardList className="h-3.5 w-3.5 text-cyan-400" /> 标注总览
           </div>
-          {asset.annotated ? <AnnotationTable ann={ann} /> : <EmptyHint>尚未标注 — 点右上角「重新标注」</EmptyHint>}
+          {hasAnn
+            ? <AnnotationTable ann={ann} />
+            : <EmptyHint>{onLocal ? "本地轨道暂无标注 — 素材卡片上点「本地」按钮" : "尚未标注 — 点右上角「重新标注」"}</EmptyHint>}
         </div>
       </div>
 
@@ -439,7 +466,7 @@ const STAGE_LABELS: Record<string, string> = {
   scene_merge: "场景合并", scene_analysis: "场景分析",
 };
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, annBusy }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, onAnnotateLocal, annBusy }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
   /** this exact asset is currently being annotated (hash-keyed job state) */
@@ -454,6 +481,8 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
   annStageDetail?: string;
   /** start (re-)annotation of this asset */
   onAnnotate?: () => void;
+  /** start (re-)annotation with the LOCAL VLM (parallel track, videos only) */
+  onAnnotateLocal?: () => void;
   /** any annotation job is running (disables the button) */
   annBusy?: boolean;
 }) {
@@ -565,6 +594,12 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             {a.annotated
               ? <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(ann.quality_score ?? 0)))}>Q {fmtVal(ann.quality_score)}</Badge>
               : <Badge variant="outline" className={cn("text-[11px]", NEW_CLS)}>未标注</Badge>}
+            {a.annotated_local && (
+              <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300"
+                title="本地 VLM 标注（并行轨道）">
+                🖥 Q {fmtVal((a.annotation_local ?? {}).quality_score)}
+              </Badge>
+            )}
             {tags.map((t, i) => (
               <Badge key={i} variant="outline" className={cn("text-[11px]", TAG_CLS)}>{t}</Badge>
             ))}
@@ -573,22 +608,36 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             <p className="mt-1.5 line-clamp-2 text-xs text-slate-400">{ann.summary}</p>
           )}
           {onAnnotate && (
-            <Button
-              variant="outline" size="sm"
-              className={cn(
-                "mt-2.5 h-7 w-full gap-1.5 text-xs",
-                a.annotated
-                  ? "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-200"
-                  : "border-cyan-500/30 bg-cyan-500/[0.08] text-cyan-300 hover:bg-cyan-500/15",
+            <div className="mt-2.5 flex gap-1.5">
+              <Button
+                variant="outline" size="sm"
+                className={cn(
+                  "h-7 flex-1 gap-1.5 text-xs",
+                  a.annotated
+                    ? "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-200"
+                    : "border-cyan-500/30 bg-cyan-500/[0.08] text-cyan-300 hover:bg-cyan-500/15",
+                )}
+                disabled={annBusy}
+                onClick={(e) => { e.stopPropagation(); onAnnotate(); }}
+              >
+                {annotating || queued || queuedLocal
+                  ? <Loader2 className="h-3 w-3 animate-spin" />
+                  : a.annotated ? <RefreshCw className="h-3 w-3" /> : <Tags className="h-3 w-3" />}
+                {annotating ? "标注中…" : (queued || queuedLocal) ? "排队中…" : a.annotated ? "重新标注" : "标注"}
+              </Button>
+              {onAnnotateLocal && (
+                <Button
+                  variant="outline" size="sm"
+                  className="h-7 gap-1 border-violet-500/30 bg-violet-500/[0.08] px-2 text-xs text-violet-300 hover:bg-violet-500/15"
+                  disabled={annBusy}
+                  title={a.annotated_local ? "用本地 VLM 重新标注（并行轨道，不覆盖云端结果）" : "用本地 VLM 标注（3090，不消耗 API）"}
+                  onClick={(e) => { e.stopPropagation(); onAnnotateLocal(); }}
+                >
+                  <Cpu className="h-3 w-3" />
+                  {a.annotated_local ? "本地重标" : "本地"}
+                </Button>
               )}
-              disabled={annBusy}
-              onClick={(e) => { e.stopPropagation(); onAnnotate(); }}
-            >
-              {annotating || queued || queuedLocal
-                ? <Loader2 className="h-3 w-3 animate-spin" />
-                : a.annotated ? <RefreshCw className="h-3 w-3" /> : <Tags className="h-3 w-3" />}
-              {annotating ? "标注中…" : (queued || queuedLocal) ? "排队中…" : a.annotated ? "重新标注" : "标注"}
-            </Button>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -889,11 +938,11 @@ export default function AssetsView({
     setScanning(false);
   };
 
-  const annotate = async (hashes: string[] = [], force = false) => {
+  const annotate = async (hashes: string[] = [], force = false, provider: "cloud" | "local" = "cloud") => {
     setError("");
     try {
       const r = await api<{ job_id: string | null; queued?: boolean; message?: string }>("/api/assets/annotate", {
-        method: "POST", body: JSON.stringify({ content_hashes: hashes, force }),
+        method: "POST", body: JSON.stringify({ content_hashes: hashes, force, provider }),
       });
       if (r.job_id) setAnnJobId(r.job_id);
       else if (r.queued) setLocalQueued((s0) => new Set([...s0, ...hashes]));
@@ -1314,6 +1363,10 @@ export default function AssetsView({
                     if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;
                     annotate([a.content_hash], a.annotated);
                   }}
+                  onAnnotateLocal={a.asset_type === "video" ? () => {
+                    if (a.annotated_local && !window.confirm(`用本地 VLM 重新标注「${a.file_name || a.file_path}」？只更新本地轨道，不影响云端结果。`)) return;
+                    annotate([a.content_hash], !!a.annotated_local, "local");
+                  } : undefined}
                 />
               ))}
             </div>
