@@ -24,7 +24,6 @@ import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
-import ImmichBrowser from "../components/ImmichBrowser";
 import type { ProjectState } from "../App";
 
 const SELECT_STEPS = [
@@ -215,11 +214,12 @@ function ClipPanel({ clip, onSeek }: { clip: any; onSeek: (s: number) => void })
 
 // ── detail sheet ────────────────────────────────────────────────────────────
 
-function DetailSheet({
-  asset, onClose, onReannotate, busy, annMeta,
+function DetailView({
+  asset, onClose, onReannotate, busy, annMeta, onPrev, onNext, pos,
 }: {
   asset: Asset | null; onClose: () => void; onReannotate: (a: Asset) => void;
   busy: boolean; annMeta?: Record<string, any>;
+  onPrev?: () => void; onNext?: () => void; pos?: string;
 }) {
   const [details, setDetails] = useState<{ clips: any[]; scenes: any[] } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -233,6 +233,19 @@ function DetailSheet({
       .then(setDetails).catch(() => {}).finally(() => setLoading(false));
   }, [asset?.content_hash]);
 
+  // full-page view: Esc = back, arrow keys = prev/next asset
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      if (e.key === "Escape") onClose();
+      else if (e.key === "ArrowLeft" && onPrev) onPrev();
+      else if (e.key === "ArrowRight" && onNext) onNext();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onPrev, onNext]);
+
   if (!asset) return null;
   const src = mediaUrl(asset.absolute_path || asset.file_path);
   const seek = (s: number) => {
@@ -244,25 +257,33 @@ function DetailSheet({
   const ann = asset.annotation ?? {};
 
   return (
-    <Sheet open onOpenChange={(o) => !o && onClose()}>
-      {/* NOTE: no backdrop-blur here — Chrome's backdrop-filter breaks hit
-          testing on nested <video> controls (same bug fixed in RenderView) */}
-      <SheetContent side="right" className="w-full overflow-y-auto border-white/10 bg-slate-950 p-5 sm:max-w-[920px]"
-        style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}>
-        <SheetHeader className="p-0 pb-3">
-          <SheetTitle className="flex flex-wrap items-center gap-2 pr-8 text-sm">
-            <span className="truncate">{asset.file_name || asset.file_path}</span>
-            {asset.annotated
-              ? <Badge variant="outline" className={qBadgeCls(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Badge>
-              : <Badge variant="outline" className={NEW_CLS}>未标注</Badge>}
-            <Button variant="outline" size="sm"
-              className="ml-auto h-7 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
-              disabled={busy} onClick={() => onReannotate(asset)}>
-              {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-              重新标注
-            </Button>
-          </SheetTitle>
-        </SheetHeader>
+    <div>
+      {/* full-page header: back / title / nav / actions */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" className="h-8 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+          onClick={onClose} title="返回素材库 (Esc)">
+          ← 返回素材库
+        </Button>
+        <span className="max-w-[420px] truncate text-sm font-semibold text-slate-200">
+          {asset.file_name || asset.file_path}
+        </span>
+        {asset.annotated
+          ? <Badge variant="outline" className={qBadgeCls(Number(ann.quality_score ?? 0))}>Q {fmtVal(ann.quality_score)}</Badge>
+          : <Badge variant="outline" className={NEW_CLS}>未标注</Badge>}
+        {pos && <span className="text-xs text-slate-500">{pos}</span>}
+        <div className="ml-auto flex items-center gap-2">
+          <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] px-2.5 text-xs"
+            disabled={!onPrev} onClick={onPrev} title="上一个 (←)">←</Button>
+          <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] px-2.5 text-xs"
+            disabled={!onNext} onClick={onNext} title="下一个 (→)">→</Button>
+          <Button variant="outline" size="sm"
+            className="h-8 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+            disabled={busy} onClick={() => onReannotate(asset)}>
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            重新标注
+          </Button>
+        </div>
+      </div>
 
         {/* in-sheet progress: annotation triggered from here must be visible HERE */}
         {busy && (
@@ -277,23 +298,29 @@ function DetailSheet({
           </div>
         )}
 
-        <div className="drawer-player">
-          {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[340px] w-full rounded-lg bg-black" />}
-          {asset.asset_type === "image" && <img src={src} className="max-h-[340px] w-full rounded-lg bg-black object-contain" />}
+      {/* top split: player left, annotation overview right — full page width */}
+      <div className="mb-4 flex flex-wrap items-start gap-4">
+        <div className="min-w-[360px] flex-[3] basis-[520px]">
+          {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[480px] w-full rounded-xl bg-black" />}
+          {asset.asset_type === "image" && <img src={src} className="max-h-[480px] w-full rounded-xl bg-black object-contain" />}
           {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls className="w-full" />}
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1.5 text-xs text-slate-500">
             {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
             {asset.width ? `${asset.width}×${asset.height} · ` : ""}
             {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
             {asset.absolute_path || asset.file_path}
           </div>
         </div>
+        <div className="min-w-[320px] flex-[2] basis-[360px] rounded-xl border border-white/[0.07] bg-white/[0.02] p-3.5">
+          <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-300">
+            <ClipboardList className="h-3.5 w-3.5 text-cyan-400" /> 标注总览
+          </div>
+          {asset.annotated ? <AnnotationTable ann={ann} /> : <EmptyHint>尚未标注 — 点右上角「重新标注」</EmptyHint>}
+        </div>
+      </div>
 
-        <Tabs defaultValue={asset.asset_type === "video" ? "clips" : "overview"}>
+      <Tabs defaultValue={asset.asset_type === "video" ? "clips" : asset.asset_type === "audio" ? "beats" : "raw"}>
           <TabsList className="bg-white/[0.05]">
-            <TabsTrigger value="overview" className="gap-1.5 text-xs">
-              <ClipboardList className="h-3.5 w-3.5" />标注总览
-            </TabsTrigger>
             {asset.asset_type === "video" && (
               <>
                 <TabsTrigger value="clips" className="gap-1.5 text-xs">
@@ -313,10 +340,6 @@ function DetailSheet({
               <Code2 className="h-3.5 w-3.5" />原始标注
             </TabsTrigger>
           </TabsList>
-
-          <TabsContent value="overview" className="pt-3">
-            {asset.annotated ? <AnnotationTable ann={ann} /> : <EmptyHint>尚未标注 — 点击右上角「重新标注」</EmptyHint>}
-          </TabsContent>
 
           {asset.asset_type === "video" && (
             <>
@@ -404,8 +427,7 @@ function DetailSheet({
             <pre className="rawjson">{JSON.stringify(ann, null, 2)}</pre>
           </TabsContent>
         </Tabs>
-      </SheetContent>
-    </Sheet>
+    </div>
   );
 }
 
@@ -792,7 +814,52 @@ export default function AssetsView({
   const [interrupted, setInterrupted] = useState<{ unfinished: number } | null>(null);
   // cards queued while another batch runs (server chains them automatically)
   const [localQueued, setLocalQueued] = useState<Set<string>>(new Set());
-  const [immichOpen, setImmichOpen] = useState(false);
+  // asset source: local folder vs the Immich library (full-page grid mode)
+  const [source, setSource] = useState<"local" | "immich">("local");
+  const [imStatus, setImStatus] = useState<{ version?: string; videos?: number } | null>(null);
+  const [imItems, setImItems] = useState<any[]>([]);
+  const [imQuery, setImQuery] = useState("");
+  const [imLoading, setImLoading] = useState(false);
+  const [imPicked, setImPicked] = useState<Set<string>>(new Set());
+  const [imPage, setImPage] = useState(1);
+  const [imImporting, setImImporting] = useState(false);
+  const [imMsg, setImMsg] = useState("");
+
+  const imSearch = async (q: string, page = 1, append = false) => {
+    setImLoading(true);
+    try {
+      const r = await api<{ items: any[] }>("/api/immich/search", {
+        method: "POST", body: JSON.stringify({ query: q, size: 36, page }),
+      });
+      setImItems((prev) => (append ? [...prev, ...r.items] : r.items));
+      setImPage(page);
+    } catch (e: any) { setImMsg(`搜索失败：${e.message}`); }
+    setImLoading(false);
+  };
+
+  const openImmich = () => {
+    setSource("immich");
+    if (!imStatus) {
+      api<any>("/api/immich/status")
+        .then((st) => { setImStatus(st); imSearch(""); })
+        .catch((e) => setImMsg(e.message || "无法连接 Immich — 检查 IMMICH_URL / IMMICH_API_KEY"));
+    }
+  };
+
+  const imImport = async () => {
+    if (imPicked.size === 0) return;
+    setImImporting(true); setImMsg("");
+    try {
+      const r = await api<{ imported: string[]; skipped: string[]; errors: string[] }>(
+        "/api/immich/import", { method: "POST", body: JSON.stringify({ ids: [...imPicked] }) });
+      setImMsg(`✓ 导入 ${r.imported.length} 个代理` +
+        (r.skipped.length ? ` · 复用已有 ${r.skipped.length}` : "") +
+        (r.errors.length ? ` · 失败 ${r.errors.length}` : ""));
+      setImPicked(new Set());
+      scan();
+    } catch (e: any) { setImMsg(`导入失败：${e.message}`); }
+    setImImporting(false);
+  };
   useEffect(() => {
     api<any>("/api/jobs/current/annotate")
       .then((r) => {
@@ -886,6 +953,21 @@ export default function AssetsView({
   const selSel = selJob.meta.selection;
   const glass = "rounded-2xl border-white/[0.07] bg-slate-900/50";
 
+  // ── full-page detail view (Option A: replaces the grid, no overlay) ──
+  if (detail) {
+    const di = shown.findIndex((x) => x.content_hash === detail.content_hash);
+    return (
+      <DetailView
+        asset={detail} busy={busy} annMeta={annJob.meta}
+        onClose={() => setDetail(null)}
+        onReannotate={(a) => annotate([a.content_hash], a.annotated)}
+        onPrev={di > 0 ? () => setDetail(shown[di - 1]) : undefined}
+        onNext={di >= 0 && di < shown.length - 1 ? () => setDetail(shown[di + 1]) : undefined}
+        pos={di >= 0 ? `${di + 1} / ${shown.length}` : undefined}
+      />
+    );
+  }
+
   return (
     <div>
       {/* ── ① command bar: scan → annotate. Low-frequency stuff lives in popovers ── */}
@@ -903,10 +985,6 @@ export default function AssetsView({
               onClick={scan} disabled={scanning}>
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               扫描
-            </Button>
-            <Button variant="outline" className="h-9 gap-1.5 border-violet-500/25 bg-violet-500/[0.06] text-violet-300 hover:bg-violet-500/15"
-              onClick={() => setImmichOpen(true)}>
-              🖼 Immich 库
             </Button>
             {/* primary CTA follows the workflow state */}
             {scanned && newCount > 0 && (
@@ -1075,7 +1153,99 @@ export default function AssetsView({
             </div>
           )}
 
-      {scanned ? (
+      {/* ── source tabs: local folder vs Immich library (full-page, no drawer) ── */}
+      <div className="mt-4 flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-1" style={{ width: "fit-content" }}>
+        <button
+          onClick={() => setSource("local")}
+          className={cn(
+            "flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors",
+            source === "local" ? "bg-cyan-500/15 text-cyan-300" : "text-slate-400 hover:text-slate-200",
+          )}>
+          本地素材{assets.length ? ` (${assets.length})` : ""}
+        </button>
+        <button
+          onClick={openImmich}
+          className={cn(
+            "flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors",
+            source === "immich" ? "bg-violet-500/15 text-violet-300" : "text-slate-400 hover:text-slate-200",
+          )}>
+          🖼 Immich 库{imStatus?.videos ? ` (${imStatus.videos.toLocaleString()})` : ""}
+        </button>
+      </div>
+
+      {source === "immich" ? (
+        <>
+          <div className="my-4 flex flex-wrap items-center gap-3">
+            <div className="relative flex-1 basis-[360px]">
+              <Search className="absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+              <Input
+                className="h-9 w-full border-white/10 bg-black/25 pl-8 text-xs"
+                placeholder="CLIP 语义搜索（英文效果最佳，如 two women running in flower field）— 回车搜索，留空显示最新"
+                value={imQuery}
+                onChange={(e) => setImQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && imSearch(imQuery)}
+              />
+            </div>
+            <Button variant="outline" className="h-9 border-white/10 bg-white/[0.04] text-xs"
+              onClick={() => imSearch(imQuery)} disabled={imLoading}>
+              {imLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "搜索"}
+            </Button>
+            {imMsg && <span className="text-xs text-emerald-400">{imMsg}</span>}
+            <div className="ml-auto flex items-center gap-2">
+              {imPicked.size > 0 && (
+                <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
+                  onClick={() => setImPicked(new Set())}>清空 ({imPicked.size})</Button>
+              )}
+              <Button size="sm"
+                className="h-8 gap-1.5 bg-violet-500 text-xs font-semibold text-white hover:bg-violet-400"
+                disabled={imPicked.size === 0 || imImporting}
+                onClick={imImport}>
+                {imImporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                导入代理到本地 ({imPicked.size})
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
+            {imItems.map((it: any) => (
+              <button
+                key={it.id}
+                className={cn(
+                  "group relative overflow-hidden rounded-lg border text-left transition-all",
+                  imPicked.has(it.id)
+                    ? "border-violet-400/70 shadow-[0_0_12px_rgba(167,139,250,0.3)]"
+                    : "border-white/[0.08] hover:border-white/25",
+                )}
+                onClick={() => setImPicked((s0) => {
+                  const n = new Set(s0);
+                  if (n.has(it.id)) n.delete(it.id); else n.add(it.id);
+                  return n;
+                })}
+              >
+                <img src={it.thumb} loading="lazy" className="aspect-video w-full object-cover" />
+                {imPicked.has(it.id) && (
+                  <span className="absolute top-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-violet-400 text-xs font-bold text-slate-950">✓</span>
+                )}
+                <div className="truncate bg-black/55 px-1.5 py-0.5 text-[10.5px] text-slate-300">{it.name}</div>
+              </button>
+            ))}
+          </div>
+          {imItems.length === 0 && !imLoading && (
+            <EmptyHint>{imMsg || "没有结果"}</EmptyHint>
+          )}
+          {imItems.length >= 36 && (
+            <div className="mt-3 text-center">
+              <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
+                disabled={imLoading} onClick={() => imSearch(imQuery, imPage + 1, true)}>
+                {imLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "加载更多"}
+              </Button>
+            </div>
+          )}
+          <p className="mt-3 text-[11px] text-slate-600">
+            导入的是 Immich 转码代理（约 3-10MB/个），标注/剪辑全程用代理，4K 原片仅渲染时按需读取。
+          </p>
+        </>
+      ) : scanned ? (
         <>
           <div className="my-4 flex flex-wrap items-center gap-3">
             <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-1">
@@ -1186,14 +1356,6 @@ export default function AssetsView({
         <EmptyHint>点击「扫描」发现素材文件</EmptyHint>
       )}
 
-      {immichOpen && (
-        <ImmichBrowser onClose={() => setImmichOpen(false)} onImported={() => scan()} />
-      )}
-      <DetailSheet
-        asset={detail} busy={busy} annMeta={annJob.meta}
-        onClose={() => setDetail(null)}
-        onReannotate={(a) => annotate([a.content_hash], a.annotated)}
-      />
     </div>
   );
 }
