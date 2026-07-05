@@ -560,6 +560,7 @@ def batch_annotate(
     new_assets: list,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     stage_callback: Optional[Callable[[str, str, str], None]] = None,
+    start_callback: Optional[Callable[[str], None]] = None,
     max_concurrent: int = 3,
     model: str | None = None,
     endpoint: str | None = None,
@@ -588,8 +589,19 @@ def batch_annotate(
         if progress_callback:
             progress_callback(completed, total, fn)
 
+    def _starting(fn: str):
+        # progress_callback fires on COMPLETION only — without a start signal
+        # the UI cannot know which file is actually being worked on (a 1-file
+        # job would show no activity at all until it finished)
+        if start_callback:
+            try:
+                start_callback(fn)
+            except Exception:
+                pass
+
     # Videos: sequential
     for meta in videos:
+        _starting(meta.file_name)
         try:
             result = annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key, progress_callback=stage_callback)
             results.append(result)
@@ -601,11 +613,10 @@ def batch_annotate(
     if images:
         batch_size = min(max_concurrent, len(images))
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = {
-                executor.submit(
-                    annotate_asset, meta, model, endpoint, api_key, stage_callback
-                ): meta for meta in images
-            }
+            def _run_image(meta):
+                _starting(meta.file_name)
+                return annotate_asset(meta, model, endpoint, api_key, stage_callback)
+            futures = {executor.submit(_run_image, meta): meta for meta in images}
             for future in as_completed(futures):
                 meta = futures[future]
                 try:
@@ -616,6 +627,7 @@ def batch_annotate(
 
     # Audio: sequential
     for meta in audios:
+        _starting(meta.file_name)
         try:
             result = annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key, progress_callback=stage_callback)
             results.append(result)

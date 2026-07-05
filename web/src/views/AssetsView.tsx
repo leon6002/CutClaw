@@ -407,11 +407,13 @@ function DetailSheet({
 
 // ── asset card ──────────────────────────────────────────────────────────────
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
-  /** this exact file is currently being annotated (live from the job meta) */
+  /** this exact asset is currently being annotated (hash-keyed job state) */
   annotating?: boolean;
+  /** waiting in the current annotation batch */
+  queued?: boolean;
 }) {
   const ann = a.annotation ?? {};
   const src = mediaUrl(a.absolute_path || a.file_path);
@@ -490,6 +492,11 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating }: {
           {annotating && (
             <span className="absolute top-2 right-1.5 flex items-center gap-1 rounded-full border border-cyan-400/50 bg-black/70 px-2 py-0.5 text-[10.5px] text-cyan-300">
               <Loader2 className="h-3 w-3 animate-spin" /> 标注中
+            </span>
+          )}
+          {queued && !annotating && (
+            <span className="absolute top-2 right-1.5 rounded-full border border-amber-400/40 bg-black/70 px-2 py-0.5 text-[10.5px] text-amber-300">
+              排队中
             </span>
           )}
         </div>
@@ -913,7 +920,8 @@ export default function AssetsView({
                   key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
                   picked={a.asset_type === "audio" ? a.content_hash === pickedAudio : picked.has(a.content_hash)}
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
-                  annotating={busy && !!annJob.meta.filename && annJob.meta.filename === (a.file_name || a.file_path)}
+                  annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
+                  queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
                 />
               ))}
             </div>

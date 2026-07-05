@@ -633,7 +633,13 @@ def annotate(body: AnnotateRequest):
         return {"job_id": None, "message": "All assets already annotated."}
 
     job = Job("annotate")
-    job.meta.update({"current": 0, "total": len(targets), "filename": ""})
+    # per-asset states keyed by content hash — the ONLY reliable way for the
+    # UI to mark cards (filename matching breaks: the completion callback
+    # reports the file that just FINISHED, and names aren't stable keys)
+    _files_state = {t.content_hash: "p" for t in targets}          # p/r/d
+    _name_to_hash = {getattr(t, "file_name", ""): t.content_hash for t in targets}
+    job.meta.update({"current": 0, "total": len(targets), "filename": "",
+                     "files": _files_state})
     JOBS[job.id] = job
 
     def _run():
@@ -649,7 +655,8 @@ def annotate(body: AnnotateRequest):
             if body.force:
                 results = []
                 for i, meta in enumerate(targets, 1):
-                    job.meta.update({"current": i, "total": len(targets),
+                    _files_state[meta.content_hash] = "r"
+                    job.meta.update({"current": i - 1, "total": len(targets),
                                      "filename": getattr(meta, "file_name", "")})
                     job.add(f"[file] {i}/{len(targets)} {getattr(meta, 'file_name', '')}")
                     ap = getattr(meta, "absolute_path", "")
@@ -658,14 +665,26 @@ def annotate(body: AnnotateRequest):
                     elif getattr(meta, "asset_type", "") == "audio":
                         analyze_audio(ap, force=True)
                     results.append(annotate_asset(meta))
+                    _files_state[meta.content_hash] = "d"
+                    job.meta.update({"current": i})
                 upsert_annotations(results)
             else:
                 def _stage_cb(stage, status, detail):
                     job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
+                def _start_cb(filename):
+                    h = _name_to_hash.get(filename)
+                    if h:
+                        _files_state[h] = "r"
+                    job.meta.update({"filename": filename})
+                    job.add(f"[file] start {filename}")
                 def _file_cb(current, total, filename):
-                    job.meta.update({"current": current, "total": total, "filename": filename})
-                    job.add(f"[file] {current}/{total} {filename}")
-                results = batch_annotate(targets, progress_callback=_file_cb, stage_callback=_stage_cb)
+                    h = _name_to_hash.get(filename)
+                    if h:
+                        _files_state[h] = "d"
+                    job.meta.update({"current": current, "total": total})
+                    job.add(f"[file] {current}/{total} {filename} done")
+                results = batch_annotate(targets, progress_callback=_file_cb,
+                                         stage_callback=_stage_cb, start_callback=_start_cb)
                 upsert_annotations(results)
             job.add(f"DONE — {len(results)} assets annotated")
             job.status = "done"
