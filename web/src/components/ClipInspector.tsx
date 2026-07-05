@@ -168,10 +168,22 @@ export function ClipCaption({ clip, playhead = -1 }: { clip: ClipMapEntry | null
 
 /** Focus card pinned beside the player: the CURRENT shot's full script,
  * always in the same spot — no hunting inside the scrolling list. */
-export function ActiveClipCard({ clip, index }: { clip: ClipMapEntry | null; index: number }) {
+export function ActiveClipCard({ clip, index, playhead = -1, onReplace }: {
+  clip: ClipMapEntry | null; index: number; playhead?: number;
+  /** "这个镜头我不满意" — swap it for another highlight-pool moment */
+  onReplace?: (clip: ClipMapEntry) => void;
+}) {
   const [zh] = useZhFlag();
   const zhMap = useZh([clip?.content, clip?.analysis], zh);
   const disp = (t?: string) => (zh && t && zhMap[t]) || t;
+  // split a dense "[a-b s] … [b-c s] …" caption into per-timestamp rows so it
+  // reads as a scannable list instead of one wall of run-together text.
+  const analysisText = disp(clip?.analysis);
+  const segs = analysisText ? parseDenseSegments(analysisText) : null;
+  const srcNow =
+    clip && playhead >= 0 && clip.src_start !== null
+      ? clip.src_start + Math.max(0, playhead - clip.out_start)
+      : -1;
   // FIXED height: content changes with every shot — if the card grew/shrank
   // with its text, everything below would jump on each cut.
   return (
@@ -188,6 +200,15 @@ export function ActiveClipCard({ clip, index }: { clip: ClipMapEntry | null; ind
             <span className="truncate tabular-nums text-slate-500">
               ← {clip.video} [{clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s]
             </span>
+            {onReplace && (
+              <button
+                className="ml-auto shrink-0 rounded-md border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[10.5px] text-amber-300 hover:bg-amber-500/20"
+                title="不满意这个镜头?告诉 AI 原因,从高光池换一个(该区间进入拒绝名单,以后也不会再选)"
+                onClick={(e) => { e.stopPropagation(); onReplace(clip); }}
+              >
+                换掉
+              </button>
+            )}
           </div>
           <div className="mt-2 shrink-0 rounded-lg bg-black/25 px-2.5 py-1.5">
             <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
@@ -197,8 +218,30 @@ export function ActiveClipCard({ clip, index }: { clip: ClipMapEntry | null; ind
           </div>
           <div className="mt-1.5 flex min-h-0 flex-1 flex-col rounded-lg bg-black/25 px-2.5 py-1.5">
             <div className="shrink-0 text-[9px] uppercase tracking-wider text-emerald-400/70">VLM 实际看到</div>
-            <div className="min-h-0 flex-1 overflow-y-auto text-[11.5px] leading-snug text-slate-200">
-              {disp(clip.analysis) || <span className="text-slate-500">（该源时间段无缓存描述）</span>}
+            <div className="mt-1 min-h-0 flex-1 space-y-1 overflow-y-auto pr-0.5 text-[11.5px] leading-snug text-slate-200">
+              {segs ? (
+                segs.map((s, i) => {
+                  const on = srcNow >= s.a && srcNow < s.b;
+                  return (
+                    <div
+                      key={i}
+                      className={
+                        "flex gap-1.5 rounded border-l-2 py-0.5 pl-1.5 pr-1 transition-colors " +
+                        (on
+                          ? "border-emerald-400 bg-emerald-400/10"
+                          : "border-white/10")
+                      }
+                    >
+                      <span className="shrink-0 tabular-nums text-[10px] leading-[18px] text-emerald-300/80">
+                        {s.a}–{s.b}s
+                      </span>
+                      <span className={on ? "text-slate-100" : "text-slate-300"}>{s.t}</span>
+                    </div>
+                  );
+                })
+              ) : (
+                analysisText || <span className="text-slate-500">（该源时间段无缓存描述）</span>
+              )}
             </div>
           </div>
         </>

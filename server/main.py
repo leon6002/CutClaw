@@ -28,6 +28,10 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
+# Point LiteLLM at the local cost map (no GitHub fetch) — must run before any
+# `import litellm` in this process. See src/utils/litellm_local.py.
+import src.utils.litellm_local  # noqa: F401,E402
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -1327,6 +1331,54 @@ def last_scan():
             "scanned": True}
 
 
+class ByPathsRequest(BaseModel):
+    paths: list[str] = []
+
+
+_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+_AUDIO_EXTS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma"}
+
+
+@app.post("/api/assets/by_paths")
+def assets_by_paths(body: ByPathsRequest):
+    """Resolve a list of project asset PATHS to their cached annotations (matched
+    via the annotation index by absolute path / basename). Powers the pipeline
+    canvas: shows which assets are in play + opens each one's annotation. Assets
+    with no annotation still come back (type inferred from extension)."""
+    from src.asset_manager.index_store import load_index
+    idx = load_index()
+    by_path: dict = {}
+    for ann in idx.values():
+        ap = getattr(ann.metadata, "absolute_path", "") or ""
+        if ap:
+            by_path[os.path.normcase(os.path.abspath(ap))] = ann
+            by_path[os.path.basename(ap)] = ann
+
+    def _infer_type(path: str) -> str:
+        ext = os.path.splitext(path)[1].lower()
+        return "audio" if ext in _AUDIO_EXTS else "video" if ext in _VIDEO_EXTS else "video"
+
+    out = []
+    seen = set()
+    for path in body.paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        ann = (by_path.get(os.path.normcase(os.path.abspath(_resolve(path))))
+               or by_path.get(os.path.basename(path)))
+        d = {
+            "path": path,
+            "file_name": os.path.basename(path),
+            "asset_type": ann.asset_type if ann else _infer_type(path),
+            "content_hash": ann.content_hash if ann else "",
+            "annotated": ann is not None,
+        }
+        if ann is not None:
+            d["annotation"] = _dump(ann.annotation)
+        out.append(d)
+    return {"assets": out}
+
+
 def _analysis_details(content_hash: str, variant: str = "") -> dict:
     """Per-clip captions + scene summaries from the analyzed cache."""
     from src.analyzer import get_analysis_path
@@ -2286,11 +2338,17 @@ def _apply_progress_ev(job: Job, ev: dict):
             t["total"] = total
         idx = ev.get("idx", -1)
         event = ev.get("event", "")
+        if event == "stage":
+            # coarse 'which sub-step' label for a phase (e.g. screenwriter:
+            # 选择音乐段落 → 生成分镜脚本). Lives on the task, not in the LLM
+            # call trace, so it never pollutes the prompt/reply workbench.
+            t["stage_label"] = str(ev.get("note", ""))[:40]
+            return
         if event == "step" and isinstance(idx, int) and idx >= 0:
             # detailed agent iteration step — stored in traces, fetched on demand
             traces = job.meta.setdefault("traces", {}).setdefault(name, {})
             lst = traces.setdefault(str(idx), [])
-            lst.append({k: ev[k] for k in ("phase", "iter", "max_iter", "elapsed", "tool", "args", "reply", "verdict", "result", "note") if k in ev})
+            lst.append({k: ev[k] for k in ("phase", "iter", "max_iter", "elapsed", "tool", "args", "reply", "verdict", "result", "note", "stage") if k in ev})
             if len(lst) > 80:
                 del lst[:len(lst) - 80]
             t.setdefault("iters", {})[str(idx)] = f"{ev.get('iter', '?')}/{ev.get('max_iter', '?')}"
@@ -2344,6 +2402,40 @@ def _derive_shot_point_path(video_paths: list, audio_path: str, instruction: str
         pass
     proj = f"{primary_hash or 'unknown'}_{audio_id}"
     return os.path.join(config.VIDEO_DATABASE_FOLDER, 'Output', proj, f"shot_point_{iid}.json")
+
+
+@app.get("/api/pipeline/shots")
+def pipeline_shots(project_id: str):
+    """Final selected shots (shot_point.json): each shot's source video + time
+    slices. Powers the canvas's per-shot clip nodes + preview. Returns [] until
+    the shot plan exists."""
+    try:
+        p = _load_project(project_id)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(404, "project not found")
+    sp = _derive_shot_point_path(p.get("videos", []), p.get("audio", ""), p.get("instruction", ""))
+    if not os.path.isfile(sp):
+        return {"shots": []}
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"shots": []}
+    out = []
+    for s in (data if isinstance(data, list) else []):
+        if not isinstance(s, dict):
+            continue
+        default_src = s.get("video_path") or ""
+        clips = [{
+            "video_path": c.get("video_path") or default_src,
+            "start": c.get("start"), "end": c.get("end"), "duration": c.get("duration"),
+        } for c in (s.get("clips") or []) if isinstance(c, dict)]
+        out.append({
+            "section_idx": s.get("section_idx"), "shot_idx": s.get("shot_idx"),
+            "video_path": default_src, "is_stitched": bool(s.get("is_stitched")),
+            "fallback": bool(s.get("fallback")), "clips": clips,
+        })
+    return {"shots": out}
 
 
 class PipelineRequest(BaseModel):
@@ -2645,6 +2737,105 @@ def render(body: RenderRequest):
     except Exception as e:
         raise HTTPException(500, str(e))
     return {"job_id": job.id, "output": out}
+
+
+class ShotReplaceRequest(BaseModel):
+    shot_point: str
+    section_idx: int
+    shot_idx: int
+    reason: str = ""     # user's words: 太晃 / 和上一个重复 / 太暗 …
+
+
+@app.post("/api/shots/replace")
+def replace_shot(body: ShotReplaceRequest):
+    """Swap ONE shot the user dislikes for the best unused highlight-pool
+    moment. The rejected range goes into the project's rejections.json —
+    a persistent taste memory future picks must avoid too."""
+    from src.utils.time_format_convert import hhmmss_to_seconds as _ts
+    from src.utils.media_utils import seconds_to_hhmmss as _hh
+    import src.config as _cfg
+    abs_point = _resolve(body.shot_point)
+    if not os.path.exists(abs_point):
+        raise HTTPException(404, "shot_point 不存在")
+    with open(abs_point, "r", encoding="utf-8") as f:
+        shots = json.load(f)
+    tgt = next((s for s in shots if s.get("section_idx") == body.section_idx
+                and s.get("shot_idx") == body.shot_idx), None)
+    if not tgt:
+        raise HTTPException(404, "找不到该镜头")
+    proj = os.path.dirname(abs_point)
+    try:
+        with open(os.path.join(proj, "highlight_pool.json"), "r", encoding="utf-8") as f:
+            pool = json.load(f).get("moments", [])
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "该项目没有高光池(旧流水线产物)— 重跑一次流水线后可用")
+
+    old = tgt["clips"][0]
+    old_src, old_s, old_e = old.get("video_path", ""), _ts(old["start"]), _ts(old["end"])
+    rej_path = os.path.join(proj, "rejections.json")
+    try:
+        with open(rej_path, "r", encoding="utf-8") as f:
+            rejections = json.load(f)
+    except Exception:  # noqa: BLE001
+        rejections = []
+    rejections.append({"video_path": old_src, "start": old_s, "end": old_e,
+                       "reason": body.reason, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    gap = float(getattr(_cfg, "SHOT_MIN_GAP_SEC", 2.0) or 2.0)
+    need = float(tgt.get("target_duration") or (old_e - old_s) or 3.0)
+
+    def _norm(p):
+        return os.path.normcase(os.path.normpath(p or ""))
+
+    forbidden = [(r["video_path"], float(r["start"]), float(r["end"])) for r in rejections]
+    for s in shots:
+        if s is tgt:
+            continue
+        for c in s.get("clips", []):
+            forbidden.append((c.get("video_path", ""), _ts(c["start"]), _ts(c["end"])))
+
+    _reason = body.reason or ""
+    _want_steady = any(k in _reason for k in ("晃", "抖", "快", "晕", "歪"))
+    _hate_similar = any(k in _reason for k in ("重复", "一样", "相似", "雷同"))
+
+    pick = None
+    for m in sorted(pool, key=lambda x: -x.get("score", 0)):
+        if float(m.get("duration", 0)) < need - 1.0:
+            continue
+        if _want_steady and 0 <= float(m.get("stability", -1)) < 7.0:
+            continue
+        _sim_r = 60.0 if _hate_similar else 20.0
+        if _norm(m.get("video_path")) == _norm(old_src) and \
+                abs(float(m["start"]) - old_s) < _sim_r:
+            continue
+        c0 = (float(m["start"]) + float(m["end"])) / 2.0
+        w_s = max(0.0, c0 - need / 2.0)
+        w_e = w_s + need
+        clash = False
+        for (fsrc, fs, fe) in forbidden:
+            if _norm(fsrc) == _norm(m.get("video_path")) and w_s < fe + gap and w_e > fs - gap:
+                clash = True
+                break
+        if not clash:
+            pick = (m, w_s, w_e)
+            break
+    if not pick:
+        raise HTTPException(409, "高光池里找不到不冲突的替代镜头 — 换个说法或重跑流水线扩充素材")
+
+    m, w_s, w_e = pick
+    import shutil
+    shutil.copy2(abs_point, abs_point + ".bak")
+    tgt["clips"] = [{"shot": 1, "start": _hh(round(w_s, 2)), "end": _hh(round(w_e, 2)),
+                     "duration": round(w_e - w_s, 2), "video_path": m["video_path"]}]
+    tgt["video_path"] = m["video_path"]
+    tgt["total_duration"] = round(w_e - w_s, 2)
+    tgt["replaced"] = True
+    tgt["replace_reason"] = body.reason
+    with open(abs_point, "w", encoding="utf-8") as f:
+        json.dump(shots, f, ensure_ascii=False, indent=2)
+    with open(rej_path, "w", encoding="utf-8") as f:
+        json.dump(rejections, f, ensure_ascii=False, indent=2)
+    return {"ok": True, "new_clip": tgt["clips"][0],
+            "moment": {"id": m.get("id"), "score": m.get("score"), "desc": m.get("desc", "")[:120]}}
 
 
 def _ts_to_sec(v) -> float:

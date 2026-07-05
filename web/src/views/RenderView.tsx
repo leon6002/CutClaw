@@ -67,6 +67,25 @@ export default function RenderView({
     if (v.paused) v.play().catch(() => {});
   };
 
+  const replaceShot = async (c: { section_idx: number; shot_idx: number }) => {
+    const reason = window.prompt(
+      "为什么不满意这个镜头?(可留空;写「晃」会要求替代镜头更稳,写「重复」会避开相似画面)", "") ?? null;
+    if (reason === null) return;   // 取消
+    try {
+      const r = await api<{ ok: boolean; new_clip: any; moment: any }>("/api/shots/replace", {
+        method: "POST",
+        body: JSON.stringify({
+          shot_point: shotPoint, section_idx: c.section_idx,
+          shot_idx: c.shot_idx, reason,
+        }),
+      });
+      reloadClipMap();
+      window.alert(`已换为高光池 ${r.moment.id}(${(r.moment.score * 10).toFixed(1)} 分):\n${r.moment.desc}\n\n重新渲染后生效;被换掉的区间已进入拒绝名单。`);
+    } catch (e: any) {
+      window.alert(`换镜头失败:${e.message}`);
+    }
+  };
+
   const shotPoint = project.shotPoint;
   const { clips: clipMap, error: clipMapError, reload: reloadClipMap } = useClipMap(shotPoint);
   const activeIdx = activeClipAt(clipMap, playhead);
@@ -390,7 +409,7 @@ export default function RenderView({
                   List height is capped so both columns end together — no
                   page-long scroll, no blank space under the player. */}
               <div className="min-w-[360px] flex-[2] basis-[400px]">
-                <ActiveClipCard clip={activeClip} index={activeIdx} />
+                <ActiveClipCard clip={activeClip} index={activeIdx} playhead={playhead} onReplace={replaceShot} />
                 <div className="mt-3">
                   <ClipInspector
                     clips={clipMap} currentTime={playhead} error={clipMapError}
