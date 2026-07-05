@@ -188,6 +188,15 @@ VIDEO_ANALYSIS_API_KEY = "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL"
 CAPTION_BATCH_SIZE = 64
 # Batch size for parallel clip captioning/analysis.
 
+# ── Immich integration ──────────────────────────────────────────────────────
+IMMICH_URL = "http://127.0.0.1:2284"
+# Immich server base URL (no trailing /api).
+IMMICH_API_KEY = "W5pz9hmfuosYcXdNUmRmLM6nGAb2tfYMWSR3wmBMVmo"
+# API key — needs asset.read/view/download + search permissions only.
+IMMICH_PATH_MAP = ""
+# Optional "container_prefix::host_prefix" mapping (e.g. "/data/upload::D:/immich/upload")
+# to read ORIGINALS directly from the Immich volume at render time (zero-copy).
+
 VIDEO_CAPTION_MAX_FRAMES = 24
 # Max frames per clip-captioning VLM call, selected MOTION-AWARE (uniform
 # anchors + highest inter-frame-change peaks), so sub-2s action moments are

@@ -373,6 +373,8 @@ CONFIG_KEYS = [
     "AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY",
     # concurrency knobs — maximize hardware/API utilization during annotation
     "ANNOTATE_VIDEO_WORKERS", "CAPTION_BATCH_SIZE", "VIDEO_CAPTION_MAX_FRAMES",
+    # Immich integration
+    "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_PATH_MAP",
 ]
 
 
@@ -556,6 +558,124 @@ def asset_thumb(hash: str, path: str = ""):
         if not os.path.exists(tp):
             raise HTTPException(500, "thumbnail extraction failed")
     return FileResponse(tp, media_type="image/jpeg")
+
+
+# ── Immich integration ──────────────────────────────────────────────────────
+# The user's real library (6k+ videos) lives in Immich, which already provides
+# transcoded 1080p playback proxies, thumbnails, checksums and CLIP semantic
+# search. Analysis runs on the FEW-MB proxy (originals are never copied);
+# originals are fetched only for the handful of clips that reach the render.
+
+def _immich_req(path: str, method: str = "GET", body: dict | None = None,
+                raw: bool = False, timeout: int = 60):
+    import urllib.request
+    base = str(cfg("IMMICH_URL", "http://127.0.0.1:2284")).rstrip("/")
+    key = str(cfg("IMMICH_API_KEY", ""))
+    if not key:
+        raise HTTPException(400, "IMMICH_API_KEY 未配置")
+    req = urllib.request.Request(
+        base + "/api" + path, method=method,
+        headers={"x-api-key": key, "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            return data if raw else json.loads(data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"Immich 请求失败: {e}")
+
+
+def _slim_immich_asset(a: dict) -> dict:
+    exif = a.get("exifInfo") or {}
+    return {
+        "id": a.get("id"),
+        "name": a.get("originalFileName", ""),
+        "duration": a.get("duration", ""),
+        "width": exif.get("exifImageWidth"),
+        "height": exif.get("exifImageHeight"),
+        "taken_at": a.get("fileCreatedAt", ""),
+        "thumb": f"/api/immich/thumb/{a.get('id')}",
+    }
+
+
+@app.get("/api/immich/status")
+def immich_status():
+    about = _immich_req("/server/about")
+    stats = _immich_req("/server/statistics")
+    return {"version": about.get("version"), "videos": stats.get("videos"),
+            "photos": stats.get("photos"), "usage": stats.get("usage")}
+
+
+class ImmichSearch(BaseModel):
+    query: str = ""
+    size: int = 24
+    page: int = 1
+
+
+@app.post("/api/immich/search")
+def immich_search(body: ImmichSearch):
+    size = max(1, min(60, body.size))
+    if body.query.strip():
+        r = _immich_req("/search/smart", "POST",
+                        {"query": body.query.strip(), "type": "VIDEO",
+                         "size": size, "page": body.page})
+    else:
+        r = _immich_req("/search/metadata", "POST",
+                        {"type": "VIDEO", "size": size, "page": body.page,
+                         "withExif": True, "order": "desc"})
+    items = (r.get("assets") or {}).get("items", [])
+    return {"items": [_slim_immich_asset(a) for a in items],
+            "next": (r.get("assets") or {}).get("nextPage")}
+
+
+@app.get("/api/immich/thumb/{asset_id}")
+def immich_thumb(asset_id: str):
+    tdir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_thumbs")
+    os.makedirs(tdir, exist_ok=True)
+    safe = "".join(c for c in asset_id if c.isalnum() or c == "-")
+    tp = os.path.join(tdir, f"{safe}.jpg")
+    if not os.path.exists(tp):
+        data = _immich_req(f"/assets/{safe}/thumbnail?size=preview", raw=True)
+        with open(tp, "wb") as f:
+            f.write(data)
+    return FileResponse(tp, media_type="image/jpeg")
+
+
+class ImmichImport(BaseModel):
+    ids: list[str] = []
+
+
+@app.post("/api/immich/import")
+def immich_import(body: ImmichImport):
+    """Download playback PROXIES (a few MB each — never the 4K originals) into
+    the asset root so the normal scan → annotate flow picks them up. The
+    Immich asset id is embedded in the filename for render-time original swap."""
+    root = str(cfg("ASSET_ROOT_DIR", "resource/imports") or "resource/imports")
+    dest_dir = os.path.join(_resolve(root), "immich")
+    os.makedirs(dest_dir, exist_ok=True)
+    imported, skipped, errors = [], [], []
+    for aid in body.ids[:50]:
+        safe = "".join(c for c in aid if c.isalnum() or c == "-")
+        try:
+            info = _immich_req(f"/assets/{safe}")
+            stem = os.path.splitext(str(info.get("originalFileName") or safe))[0]
+            stem = "".join(c for c in stem if c not in '\\/:*?"<>|')
+            fname = f"{stem}__im-{safe[:8]}.mp4"
+            fp = os.path.join(dest_dir, fname)
+            if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                skipped.append(fname)
+                continue
+            data = _immich_req(f"/assets/{safe}/video/playback", raw=True, timeout=300)
+            with open(fp, "wb") as f:
+                f.write(data)
+            imported.append(fname)
+        except HTTPException as e:
+            errors.append(f"{aid[:8]}: {e.detail}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{aid[:8]}: {e}")
+    return {"imported": imported, "skipped": skipped, "errors": errors,
+            "dest": dest_dir}
 
 
 # ── Assets ──────────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
+import ImmichBrowser from "../components/ImmichBrowser";
 import type { ProjectState } from "../App";
 
 const SELECT_STEPS = [
@@ -791,6 +792,7 @@ export default function AssetsView({
   const [interrupted, setInterrupted] = useState<{ unfinished: number } | null>(null);
   // cards queued while another batch runs (server chains them automatically)
   const [localQueued, setLocalQueued] = useState<Set<string>>(new Set());
+  const [immichOpen, setImmichOpen] = useState(false);
   useEffect(() => {
     api<any>("/api/jobs/current/annotate")
       .then((r) => {
@@ -901,6 +903,10 @@ export default function AssetsView({
               onClick={scan} disabled={scanning}>
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               扫描
+            </Button>
+            <Button variant="outline" className="h-9 gap-1.5 border-violet-500/25 bg-violet-500/[0.06] text-violet-300 hover:bg-violet-500/15"
+              onClick={() => setImmichOpen(true)}>
+              🖼 Immich 库
             </Button>
             {/* primary CTA follows the workflow state */}
             {scanned && newCount > 0 && (
@@ -1169,6 +1175,9 @@ export default function AssetsView({
         <EmptyHint>点击「扫描」发现素材文件</EmptyHint>
       )}
 
+      {immichOpen && (
+        <ImmichBrowser onClose={() => setImmichOpen(false)} onImported={() => scan()} />
+      )}
       <DetailSheet
         asset={detail} busy={busy} annMeta={annJob.meta}
         onClose={() => setDetail(null)}
