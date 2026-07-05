@@ -238,6 +238,7 @@ function DetailView({
   const [details, setDetails] = useState<{
     clips: any[]; scenes: any[]; sound_highlights?: any[];
     highlight_pool?: any[]; highlight_pool_version?: number;
+    highlight_pool_progress?: { done: number; total: number; note?: string };
   } | null>(null);
   const [poolBuilding, setPoolBuilding] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -276,9 +277,12 @@ function DetailView({
         if (d.highlight_pool && (d.highlight_pool_version ?? 1) >= 2) {
           setDetails(d);
           setPoolBuilding(false);
+        } else if (d.highlight_pool_progress) {
+          // surface live progress without clobbering the rest of the view
+          setDetails((prev) => ({ ...(prev ?? d), highlight_pool_progress: d.highlight_pool_progress }));
         }
       } catch { /* keep polling */ }
-    }, 5000);
+    }, 2500);
     return () => window.clearInterval(t);
   }, [poolBuilding, asset?.content_hash]);
 
@@ -569,6 +573,9 @@ function DetailView({
                   + <b className="text-violet-300">15% 声音高光</b>（原声含真实人声/笑声）
                   + <b className="text-slate-300">5% 有人物</b>。
                   内容 &lt;3/5 或实测画质 &lt;3.5/10 的片段直接淘汰不入池。选材优先制按此排名把镜头锚定在真实瞬间上。
+                  <span className="text-slate-500">
+                    评分本身<b className="text-emerald-400">不调用任何模型 API</b>（本地/云端都不调）：VLM 分数读取标注时已缓存的结果，画质与人声均为本机计算。
+                  </span>
                 </div>
                 {!details?.highlight_pool ? (
                   <div className="py-6 text-center">
@@ -578,8 +585,28 @@ function DetailView({
                       disabled={poolBuilding} onClick={() => buildPool()}
                     >
                       {poolBuilding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                      {poolBuilding ? "评分中…（逐段实测画质，长视频约 1-3 分钟）" : "构建高光评分"}
+                      {poolBuilding ? "评分中…" : "构建高光评分"}
                     </Button>
+                    {poolBuilding && (
+                      <div className="mt-3 text-xs text-slate-400">
+                        {details?.highlight_pool_progress ? (
+                          <>
+                            <span className="text-cyan-300">
+                              {details.highlight_pool_progress.done}/{details.highlight_pool_progress.total} 段
+                            </span>
+                            {details.highlight_pool_progress.note && (
+                              <span className="ml-2 text-slate-500">{details.highlight_pool_progress.note}</span>
+                            )}
+                            <div className="mx-auto mt-1.5 h-1.5 w-56 overflow-hidden rounded-full bg-white/[0.08]">
+                              <div className="h-full bg-cyan-400 transition-all"
+                                style={{ width: `${Math.min(100, details.highlight_pool_progress.done / Math.max(1, details.highlight_pool_progress.total) * 100)}%` }} />
+                            </div>
+                          </>
+                        ) : (
+                          <span className="text-slate-500">启动中…（逐段实测画质，长视频约 1-3 分钟，纯本地计算）</span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <>

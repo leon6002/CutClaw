@@ -60,11 +60,13 @@ def _source_pool(content_hash: str) -> list:
     if can_measure:
         from src.utils.stability import measure_stability
 
-    moments = []
     ckpt_dir = os.path.join(cache_dir, "captions", "ckpt")
     if not os.path.isdir(ckpt_dir):
         return []
+
+    # gather candidate segments first so progress has a real total
     seen = set()
+    candidates = []
     for fn in sorted(os.listdir(ckpt_dir)):
         if not fn.endswith(".json"):
             continue
@@ -82,55 +84,76 @@ def _source_pool(content_hash: str) -> list:
             if e - s < 1.6 or (round(s, 1), round(e, 1)) in seen:
                 continue
             seen.add((round(s, 1), round(e, 1)))
-            _vq_obj = seg.get("visual_quality") or {}
-            vq = _vq_obj.get("score") or 3
-            try:
-                vq = float(vq)
-            except (TypeError, ValueError):
-                vq = 3.0
-            if vq < 3:
-                continue          # VLM already flagged it weak — not pool material
-            stab = -1.0
-            stab_detail = {}
-            if can_measure:
-                _st = measure_stability(src_path, s, e, samples=3)
-                stab = float(_st.get("score", -1))
-                stab_detail = {"rel_sharp": _st.get("rel_sharp"),
-                               "disorder": _st.get("disorder")}
-                if 0 <= stab < 3.5:
-                    continue      # measured blur/violent motion — never a highlight
-            voice = highlights_in_range(shl, s, e, min_overlap=0.5)
-            cp = seg.get("character_presence") or {}
-            people = bool(cp.get("main_character_visible") or cp.get("people_present")
-                          or cp.get("other_people_visible"))
-            score = (0.40 * (vq / 5.0)
-                     + 0.40 * ((stab / 10.0) if stab >= 0 else 0.55)
-                     + 0.15 * (1.0 if voice else 0.0)
-                     + 0.05 * (1.0 if people else 0.0))
-            _ct = scene_capture_time(src_capture, s)
-            moments.append({
-                "video_path": src_path,
-                "source_hash": content_hash,
-                "start": round(s, 2),
-                "end": round(e, 2),
-                "duration": round(e - s, 2),
-                "desc": str(seg.get("content_description") or "")[:300],
-                "vlm_q": vq,
-                # rationale: the VLM's own words on WHY this quality score
-                "vlm_notes": str(_vq_obj.get("notes") or "")[:200],
-                "stability": stab,
-                "stability_detail": stab_detail,
-                "sound": bool(voice),
-                "people": people,
-                "score": round(score, 3),
-                "capture_time": _ct.strftime("%Y-%m-%dT%H:%M:%S") if _ct else None,
-            })
+            candidates.append((s, e, seg))
+
+    # live progress for the UI (polled via the details endpoint). No model
+    # calls happen here — VLM scores are read from the annotation cache;
+    # footage quality is measured locally (OpenCV), voices via local VAD.
+    progress_path = os.path.join(cache_dir, "highlight_pool.progress.json")
+
+    def _progress(done: int, note: str = ""):
+        try:
+            with open(progress_path, "w", encoding="utf-8") as f:
+                json.dump({"done": done, "total": len(candidates), "note": note}, f)
+        except Exception:  # noqa: BLE001
+            pass
+
+    moments = []
+    for _ci, (s, e, seg) in enumerate(candidates):
+        _progress(_ci, f"实测画质 {s:.1f}-{e:.1f}s")
+        _vq_obj = seg.get("visual_quality") or {}
+        vq = _vq_obj.get("score") or 3
+        try:
+            vq = float(vq)
+        except (TypeError, ValueError):
+            vq = 3.0
+        if vq < 3:
+            continue          # VLM already flagged it weak — not pool material
+        stab = -1.0
+        stab_detail = {}
+        if can_measure:
+            _st = measure_stability(src_path, s, e, samples=3)
+            stab = float(_st.get("score", -1))
+            stab_detail = {"rel_sharp": _st.get("rel_sharp"),
+                           "disorder": _st.get("disorder")}
+            if 0 <= stab < 3.5:
+                continue      # measured blur/violent motion — never a highlight
+        voice = highlights_in_range(shl, s, e, min_overlap=0.5)
+        cp = seg.get("character_presence") or {}
+        people = bool(cp.get("main_character_visible") or cp.get("people_present")
+                      or cp.get("other_people_visible"))
+        score = (0.40 * (vq / 5.0)
+                 + 0.40 * ((stab / 10.0) if stab >= 0 else 0.55)
+                 + 0.15 * (1.0 if voice else 0.0)
+                 + 0.05 * (1.0 if people else 0.0))
+        _ct = scene_capture_time(src_capture, s)
+        moments.append({
+            "video_path": src_path,
+            "source_hash": content_hash,
+            "start": round(s, 2),
+            "end": round(e, 2),
+            "duration": round(e - s, 2),
+            "desc": str(seg.get("content_description") or "")[:300],
+            "vlm_q": vq,
+            # rationale: the VLM's own words on WHY this quality score
+            "vlm_notes": str(_vq_obj.get("notes") or "")[:200],
+            "stability": stab,
+            "stability_detail": stab_detail,
+            "sound": bool(voice),
+            "people": people,
+            "score": round(score, 3),
+            "capture_time": _ct.strftime("%Y-%m-%dT%H:%M:%S") if _ct else None,
+        })
 
     try:
         with open(pool_path, "w", encoding="utf-8") as f:
             json.dump({"version": _POOL_VERSION, "moments": moments}, f,
                       ensure_ascii=False, indent=1)
     except Exception:  # noqa: BLE001
+        pass
+    try:
+        os.remove(progress_path)   # done — the pool file itself signals ready
+    except OSError:
         pass
     return moments
 

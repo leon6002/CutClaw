@@ -1380,6 +1380,15 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
             result["highlight_pool_version"] = _hd.get("version", 1)
         except Exception:  # noqa: BLE001
             pass
+    else:
+        # live progress while the background scorer runs
+        pp = os.path.join(get_analysis_path(content_hash), "highlight_pool.progress.json")
+        if os.path.exists(pp):
+            try:
+                with open(pp, "r", encoding="utf-8") as f:
+                    result["highlight_pool_progress"] = json.load(f)
+            except Exception:  # noqa: BLE001
+                pass
     return result
 
 
@@ -1440,6 +1449,13 @@ def asset_highlight_pool(body: HighlightPoolRequest):
                     return {"status": "ready"}
         except Exception:  # noqa: BLE001
             pass
+    # already building? (progress file heartbeats every segment) — don't spawn twins
+    prog_path = os.path.join(cache_dir, "highlight_pool.progress.json")
+    try:
+        if os.path.exists(prog_path) and time.time() - os.path.getmtime(prog_path) < 120:
+            return {"status": "building"}
+    except OSError:
+        pass
     if os.path.exists(pool_path):
         try:
             os.remove(pool_path)   # stale version / force → rebuild
