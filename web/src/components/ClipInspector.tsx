@@ -140,6 +140,7 @@ export function ClipInspector({
 }) {
   const activeIdx = useMemo(() => activeClipAt(clips, currentTime), [clips, currentTime]);
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const listRef = useRef<HTMLDivElement>(null);
   const [zh, setZh] = useZhFlag();
   const zhMap = useZh(
     (clips ?? []).flatMap((c) => [c.content, c.analysis]),
@@ -148,8 +149,18 @@ export function ClipInspector({
   const disp = (t?: string) => (zh && t && zhMap[t]) || t;
 
   useEffect(() => {
-    if (activeIdx >= 0) {
-      rowRefs.current[activeIdx]?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // Scroll ONLY the inspector's own list. scrollIntoView would also scroll
+    // every scrollable ancestor — dragging the whole PAGE down on each cut
+    // while the video plays.
+    const el = rowRefs.current[activeIdx];
+    const box = listRef.current;
+    if (!el || !box) return;
+    const r = el.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    if (r.top < b.top) {
+      box.scrollTo({ top: box.scrollTop + (r.top - b.top), behavior: "smooth" });
+    } else if (r.bottom > b.bottom) {
+      box.scrollTo({ top: box.scrollTop + (r.bottom - b.bottom), behavior: "smooth" });
     }
   }, [activeIdx]);
 
@@ -185,7 +196,7 @@ export function ClipInspector({
           >原文</button>
         </div>
       </div>
-    <div className="max-h-[440px] space-y-1.5 overflow-y-auto pr-1">
+    <div ref={listRef} className="max-h-[440px] space-y-1.5 overflow-y-auto pr-1">
       {clips.map((c, i) => {
         const active = i === activeIdx;
         const score = matchScore(c.content, c.analysis);
