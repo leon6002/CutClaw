@@ -2072,8 +2072,11 @@ class ParallelShotOrchestrator:
             return None
         gap = float(getattr(config, 'SHOT_MIN_GAP_SEC', 0.0) or 0.0)
 
-        if b - a <= need:
-            # moment shorter than the slot → widen symmetrically around it
+        if b - a <= need or anchor.get('sound'):
+            # moment shorter than the slot → widen symmetrically around it.
+            # VOICE moments also stay centered: the laughter/talk lives in
+            # these exact seconds — sliding for sharpness would cut it out
+            # and the BGM duck would have nothing to reveal.
             c = (a + b) / 2.0
             cands = [(max(0.0, c - need / 2.0), max(0.0, c - need / 2.0) + need)]
         else:

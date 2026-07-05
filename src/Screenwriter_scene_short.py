@@ -861,6 +861,8 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
             "video_path": m.get("video_path", ""),
             "start": float(m.get("start", 0.0)),
             "end": float(m.get("end", 0.0)),
+            # voice moments must not be slid off during the anchored trim
+            "sound": bool(m.get("sound")),
         }
         n += 1
     if n:

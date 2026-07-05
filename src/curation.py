@@ -20,7 +20,7 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 2   # v2: rationale fields (vlm_notes, stability detail) for the UI
+_POOL_VERSION = 3   # v3: stability score gained an apparent-speed penalty — re-score
 
 
 def _source_pool(content_hash: str) -> list:

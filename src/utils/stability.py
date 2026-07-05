@@ -109,7 +109,12 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
     sharp_score = 10.0 * min(1.0, rel / 0.75) ** 0.8
     # erratic flow beyond 0.12 w/s eats up to half the score
     disorder_pen = min(1.0, max(0.0, (disorder - 0.12) / 0.25))
-    score = sharp_score * (1.0 - 0.5 * disorder_pen)
+    # APPARENT SPEED penalty — user feedback: smooth-but-fast drone sweeps
+    # score 10 on sharpness/disorder yet feel dizzy in a calm memory montage.
+    # Gentle glides measure ~0.02-0.29 widths/s (keep full marks); beyond
+    # 0.30 w/s the motion starts to dominate the frame and gets penalized.
+    speed_pen = min(1.0, max(0.0, (speed - 0.30) / 0.45))
+    score = sharp_score * (1.0 - 0.5 * disorder_pen) * (1.0 - 0.6 * speed_pen)
     return {
         "score": round(score, 1),
         "rel_sharp": round(rel, 2),
