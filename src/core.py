@@ -1096,8 +1096,11 @@ class EditorCoreAgent:
             return set()
 
     def _construct_messages(self):
+        from src.prompt import character_policy
+        _, _subject_priority = character_policy()
         user_prompt = (
             EDITOR_USER_PROMPT
+            .replace("EDITOR_SUBJECT_PRIORITY_PLACEHOLDER", _subject_priority)
             .replace("SCENE_EXPLORATION_RANGE_PLACEHOLDER", str(getattr(config, 'SCENE_EXPLORATION_RANGE', 3)))
             .replace("MIN_PROTAGONIST_RATIO_PLACEHOLDER", f"{config.MIN_PROTAGONIST_RATIO * 100:.0f}")
             .replace("MIN_ACCEPTABLE_SHOT_DURATION_PLACEHOLDER", str(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)))

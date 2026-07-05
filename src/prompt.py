@@ -537,8 +537,7 @@ VIDEO_SUMMARY_PLACEHOLDER
 
 You are a professional tiktok editor specializing in creating short video.
 
-**MAIN CHARACTER: MAIN_CHARACTER_PLACEHOLDER**
-**CRITICAL RULE: Every selected scene MUST feature MAIN_CHARACTER_PLACEHOLDER as the primary visual subject. Do NOT select scenes without the main character — no establishing shots, no cutaways, no transition shots, no empty environments, no crowd scenes where the main character is absent or barely visible.**
+CHARACTER_POLICY_PLACEHOLDER
 
 **YOUR PRIMARY GOAL:**
 Select 8-15 scenes that create the BEST MATCH between:
@@ -591,18 +590,19 @@ Rate each scene's alignment with instruction:
 
 **Scene Selection Guidelines:**
 1. **Visual Variety**: Mix different shot types (action, close-ups, wide shots) while maintaining instruction alignment
-2. **Main Character Focus (MANDATORY)**: MAIN_CHARACTER_PLACEHOLDER must be the PRIMARY visual subject in EVERY selected scene. Immediately discard any scene where MAIN_CHARACTER_PLACEHOLDER is absent, barely visible, or not the focal point. No exceptions for establishing shots, cutaways, empty environments, or crowd scenes.
-3. **DISTRIBUTION (CRITICAL)**: Scenes MUST be spread across the ENTIRE video timeline.
-   - Divide the available TOTAL_SCENE_COUNT_PLACEHOLDER scenes into thirds: early (0–33%), middle (33–66%), late (66–100%)
-   - Select scenes from ALL THREE thirds — do NOT cluster selections in any single region
-   - If you find yourself picking mostly from one section, force yourself to find alternatives in the other sections
-4. **Total Count**: Pick 8-15 scenes total
-5. **Available Scenes**: Scene indices run from 0 to MAX_SCENE_INDEX_PLACEHOLDER (TOTAL_SCENE_COUNT_PLACEHOLDER scenes total)
+2. **Subject Focus**: follow the SUBJECT POLICY above — it defines whether scenes must center a named character (film mode) or whether scenery and human moments should be balanced (travel/memory mode).
+3. **DISTRIBUTION (CRITICAL)**: Spread your picks across ALL available scenes so the montage isn't stuck on one location.
+   - The available scene ids are: AVAILABLE_SCENE_IDS_PLACEHOLDER (chronological order).
+   - Split THAT list into thirds (early / middle / late) and include at least one id from each third.
+   - When only a few scenes exist, make sure EVERY available scene id appears at least once.
+   - You may (and should) reuse the same scene id multiple times to fill the timeline.
+4. **Total Count**: Pick 8-15 scenes total (repeats allowed)
+5. **Available Scenes (STRICT)**: You may ONLY use scene ids from this exact list: AVAILABLE_SCENE_IDS_PLACEHOLDER (TOTAL_SCENE_COUNT_PLACEHOLDER scenes). These are the ONLY scenes that exist — ids not in this list have NO footage and MUST NOT be referenced.
 
 **DISTRIBUTION SELF-CHECK before outputting:**
-Count how many scenes you picked from each third. If any third has 0 scenes, replace one of your picks with a scene from that third.
+Confirm every scene id you used is in AVAILABLE_SCENE_IDS_PLACEHOLDER, and that each third of that list is represented. Do NOT invent ids to satisfy the spread.
 
-**No Hallucination**: Only use scenes explicitly described in the input.
+**No Hallucination**: Only use scenes explicitly described in the input (the ids in AVAILABLE_SCENE_IDS_PLACEHOLDER).
 
 **INPUT DATA:**
 - Audio Summary: AUDIO_SUMMARY_PLACEHOLDER
@@ -626,8 +626,7 @@ RELATED_VIDEO_PLACEHOLDER
 [Role]
 You are a professional music video editor creating a shot-by-shot plan based on pure visual storytelling.
 
-[MAIN CHARACTER: MAIN_CHARACTER_PLACEHOLDER]
-**MANDATORY RULE: Every single shot MUST feature MAIN_CHARACTER_PLACEHOLDER as the primary visual subject. Never plan a shot without the main character — no empty environments, no establishing shots without the character, no cutaways, no transition shots, no crowd scenes where MAIN_CHARACTER_PLACEHOLDER is absent or not the clear focal point. If a scene does not clearly feature MAIN_CHARACTER_PLACEHOLDER, do not use it.**
+CHARACTER_POLICY_PLACEHOLDER
 
 [YOUR PRIMARY GOAL]
 For EACH music segment, select the ONE shot that creates the STRONGEST ALIGNMENT with:
@@ -829,7 +828,7 @@ MISSION: Select the Best Video Clip
 
 [Your Goal]
 Find ONE continuous video clip (or multiple nearby shots that can be stitched together) that:
-✓ Features the MAIN CHARACTER in a compelling, iconic moment
+✓ Shows the planned subject/imagery at its most compelling
 ✓ Matches the target duration: VIDEO_LENGTH_PLACEHOLDER seconds
 ✓ Aligns with the target emotion: CURRENT_VIDEO_EMOTION_PLACEHOLDER
 ✓ Fits the narrative content: CURRENT_VIDEO_CONTENT_PLACEHOLDER
@@ -889,12 +888,7 @@ freeing a call for analysis.
 
 [Critical Selection Criteria]
 
-🎯 PRIORITY 1: Main Character Presence
-- The protagonist must be CLEARLY VISIBLE and the FOCAL POINT of the shot
-- Aim for protagonist_ratio ≥ MIN_PROTAGONIST_RATIO_PLACEHOLDER% (can go as low as 40% if emotion is very strong)
-- Prefer close-ups (CU), medium close-ups (MCU), or medium shots (MS)
-- AVOID: Wide shots where the character is a tiny distant figure
-- AVOID: Shots of minor characters, extras, or crowd scenes without the protagonist
+EDITOR_SUBJECT_PRIORITY_PLACEHOLDER
 
 🎬 PRIORITY 2: Visual Quality & Emotion
 - Visual quality score should be ≥ 4 (accept 3 if emotion is perfect)
@@ -964,6 +958,47 @@ Examples:
 Ready? Start with semantic_neighborhood_retrieval!
 ========================================
 """
+
+# ── Subject policy: film mode centers a named protagonist; travel/memory mode
+# treats scenery as first-class and people-moments as emotional gold. The old
+# hardcoded main-character mandate made the planner/editor systematically
+# reject drone vistas — the core material of travel footage.
+CHARACTER_POLICY_FILM = """**MAIN CHARACTER: MAIN_CHARACTER_PLACEHOLDER**
+**MANDATORY RULE: Every single shot MUST feature MAIN_CHARACTER_PLACEHOLDER as the primary visual subject. Never plan a shot without the main character — no empty environments, no establishing shots without the character, no cutaways, no transition shots, no crowd scenes where MAIN_CHARACTER_PLACEHOLDER is absent or not the clear focal point.**"""
+
+CHARACTER_POLICY_TRAVEL = """**SUBJECT POLICY (travel/memory montage):**
+This footage is a lived journey, not a character film. Scenery, drone vistas and
+environment shots are FIRST-CLASS material — never reject a beautiful shot for
+lacking people. When real people DO appear (companions walking, laughing,
+waving, playing), those moments carry the emotion of the memory: prefer them
+over pure scenery of comparable quality, especially at emotional peaks. Mix
+wide establishing beauty with human moments the way a travel filmmaker would."""
+
+EDITOR_SUBJECT_PRIORITY_FILM = """🎯 PRIORITY 1: Main Character Presence
+- The protagonist must be CLEARLY VISIBLE and the FOCAL POINT of the shot
+- Aim for protagonist_ratio ≥ MIN_PROTAGONIST_RATIO_PLACEHOLDER% (can go as low as 40% if emotion is very strong)
+- Prefer close-ups (CU), medium close-ups (MCU), or medium shots (MS)
+- AVOID: Wide shots where the character is a tiny distant figure
+- AVOID: Shots of minor characters, extras, or crowd scenes without the protagonist"""
+
+EDITOR_SUBJECT_PRIORITY_TRAVEL = """🎯 PRIORITY 1: Real, beautiful moments (travel/memory)
+- Wide scenic shots and drone vistas are welcome — do NOT penalize a shot for lacking people
+- When trimming output shows "measured_quality", prefer ranges ≥5 and NEVER commit below 4 (auto-rejected)
+- Ranges flagged "sound_highlight" carry real voices/laughter — they are the emotional core, prefer them
+- When people appear in frame (companions, action, interaction), favor those ranges over empty scenery of similar quality"""
+
+
+def character_policy(main_character: str | None = None) -> tuple[str, str]:
+    """(policy_block, editor_priority_block) for the current mode."""
+    from src import config
+    name = (main_character or getattr(config, "MAIN_CHARACTER_NAME", "") or "").strip()
+    is_film = getattr(config, "VIDEO_TYPE", "film") == "film" and \
+        name and name.lower() != "the main character"
+    if is_film:
+        return (CHARACTER_POLICY_FILM.replace("MAIN_CHARACTER_PLACEHOLDER", name),
+                EDITOR_SUBJECT_PRIORITY_FILM)
+    return (CHARACTER_POLICY_TRAVEL, EDITOR_SUBJECT_PRIORITY_TRAVEL)
+
 
 EDITOR_FINISH_PROMPT = (
     "This is your LAST tool call. Call `commit` NOW with your best time range in the "

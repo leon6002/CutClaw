@@ -83,9 +83,14 @@ def get_missing_shot_plan_parts(output_data: dict) -> list[str]:
 
 # Call counter so the UI trace can number the Screenwriter's LLM calls
 _SW_CALLS = {"n": 0}
+# Current sub-step label — stamped onto every LLM-call event so the UI can group
+# each call under the sub-step it belongs to (选择音乐段落 / 生成分镜脚本 / …).
+_SW_STAGE = {"cur": ""}
 
 
 def _sw_emit(**payload):
+    # tag every call event with the sub-step in progress (unless caller overrode)
+    payload.setdefault("stage", _SW_STAGE["cur"])
     try:
         from src.utils.progress import emit_progress
         emit_progress("screenwriter_llm", 1, 0, "step", **payload)
@@ -104,8 +109,9 @@ def _sw_state(event: str):
 def _sw_stage(label: str):
     """Coarse 'which sub-step' label for the screenwriter phase (音乐段→结构→
     分镜→开场白→保存). Surfaced on the canvas so the phase isn't a black box
-    between LLM calls. Separate 'stage' event — does NOT pollute the LLM call
-    trace / prompt-reply workbench."""
+    between LLM calls. Emits a 'stage' event AND records the current label so
+    subsequent LLM-call events are stamped with it (per-sub-step call grouping)."""
+    _SW_STAGE["cur"] = label
     try:
         from src.utils.progress import emit_progress
         emit_progress("screenwriter_llm", 1, 0, "stage", note=label)
@@ -547,7 +553,10 @@ def generate_structure_proposal(
     ]
     audio_structure = json.dumps(filtered_sections, indent=2, ensure_ascii=False)
 
+    from src.prompt import character_policy
+    _policy, _ = character_policy(main_character)
     prompt = GENERATE_STRUCTURE_PROPOSAL_PROMPT
+    prompt = prompt.replace("CHARACTER_POLICY_PLACEHOLDER", _policy)
     prompt = prompt.replace("TOTAL_SCENE_COUNT_PLACEHOLDER", str(scene_count))
     prompt = prompt.replace("MAX_SCENE_INDEX_PLACEHOLDER", str(max_scene_index))
     prompt = prompt.replace("AVAILABLE_SCENE_IDS_PLACEHOLDER", str(usable_ids))
@@ -630,7 +639,10 @@ def generate_shot_plan(
     else:
         music_json = str(music_detailed_structure or '')
 
+    from src.prompt import character_policy
+    _policy, _ = character_policy(main_character)
     prompt = GENERATE_SHOT_PLAN_PROMPT
+    prompt = prompt.replace("CHARACTER_POLICY_PLACEHOLDER", _policy)
     prompt = prompt.replace("AUDIO_SUMMARY_PLACEHOLDER", music_json)
     prompt = prompt.replace("VIDEO_SECTION_INFO_PLACEHOLDER", str(video_section_proposal))
     prompt = prompt.replace("INSTRUCTION_PLACEHOLDER", user_instruction)
