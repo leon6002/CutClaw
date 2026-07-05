@@ -6,6 +6,9 @@ import re
 
 import streamlit as st
 
+from src.utils.env_keys import env_expr_name, resolve_env_expr, write_env_var
+from src.utils.ui_state import UI_STATE_KEYS, read_state, write_state
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "src", "config.py")
 
@@ -36,14 +39,33 @@ def _read_config() -> dict:
 
 def cfg(key: str, fallback: str = "") -> str:
     """Get a config value as a plain string (strips quotes)."""
+    # UI-remembered inputs live in Output/ui_state.json, not the tracked config.py.
+    if key in UI_STATE_KEYS:
+        v = read_state(key)
+        if v is not None:
+            return v
     raw = _read_config().get(key, fallback)
+    resolved = resolve_env_expr(raw)
+    if resolved is not None:
+        return resolved
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         return raw[1:-1]
     return raw
 
 
 def save_config(key: str, value: str):
-    """Overwrite a single key in config.py."""
+    """Overwrite a single key in config.py (secrets → .env, UI inputs → ui_state.json)."""
+    # UI-remembered input → gitignored state file, never back into config.py.
+    if key in UI_STATE_KEYS:
+        write_state(key, value)
+        return
+    # Env-backed secret (KEY = os.getenv(...)): write the value into .env so
+    # the literal key never lands in the git-tracked config.py.
+    env_name = env_expr_name(_read_config().get(key, ""))
+    if env_name:
+        if value != os.getenv(env_name, ""):
+            write_env_var(env_name, value)
+        return
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         content = f.read()
     try:

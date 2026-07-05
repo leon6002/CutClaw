@@ -1,0 +1,44 @@
+[
+  {
+    "name": "Gemini Flash (bboluo)",
+    "model": "openai/[L]gemini-3-flash-preview",
+    "endpoint": "https://bboluo.com/v1",
+    "api_key": "",
+    "multimodal": true
+  },
+  {
+    "name": "本地 Qwen2.5-VL 7B (3090)",
+    "model": "openai/qwen2.5vl:latest",
+    "endpoint": "http://127.0.0.1:11434/v1",
+    "api_key": "sk-local",
+    "multimodal": true
+  },
+  {
+    "name": "DeepSeek V4 Pro",
+    "model": "deepseek/deepseek-v4-pro",
+    "endpoint": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "multimodal": false
+  },
+  {
+    "name": "DeepSeek V4 Flash",
+    "model": "deepseek/deepseek-v4-flash",
+    "endpoint": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "multimodal": false
+  },
+  {
+    "name": "GLM-5.2 (Z.ai)",
+    "model": "openai/glm-5.2",
+    "endpoint": "https://api.z.ai/api/paas/v4",
+    "api_key": "",
+    "multimodal": false
+  },
+  {
+    "name": "gemini(google)",
+    "model": "gemini/gemini-flash-latest",
+    "endpoint": "",
+    "api_key": "",
+    "multimodal": true
+  }
+]

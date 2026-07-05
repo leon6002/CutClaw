@@ -24,11 +24,13 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 # ==============================================================================
 
 # ------------------ UI Remembered Inputs ------------------ #
-# These are saved automatically by the app when you change sidebar fields.
-
-VIDEO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\DJI_20241029121051_0072_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251213150209_0357_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251214092309_0372_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20251214100656_0373_D.MP4||E:\\apps\\CutClaw\\resource\\imports\\DJI_20260621145043_0819_D.MP4"
-AUDIO_PATH = "E:\\apps\\CutClaw\\resource\\imports\\Adrian Disch,Rore - Auld Lang Syne.mp3"
-INSTRUCTION = "让滑雪的飞驰与山谷的静谧交织，在钢琴与弦乐中铺开一段冬日告别与重逢的回忆。"
+# Last-used sidebar fields — application STATE, not config. The real values are
+# persisted per-machine in Output/ui_state.json (gitignored); the UI reads/writes
+# them there via src/utils/ui_state.py. Kept here only as empty defaults so the
+# keys still exist for readers — do NOT hardcode paths here (they'd be committed).
+VIDEO_PATH = ""
+AUDIO_PATH = ""
+INSTRUCTION = ""
 SRT_PATH = ""
 
 

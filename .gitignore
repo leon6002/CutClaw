@@ -52,3 +52,9 @@ web/dist/
 # runtime job snapshots
 Output/jobs/
 Output/
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+src/api_pool.json

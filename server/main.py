@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.utils.env_keys import env_expr_name, resolve_env_expr, write_env_var
+from src.utils.ui_state import UI_STATE_KEYS, read_state, write_state
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "src", "config.py")
 
@@ -60,6 +61,11 @@ def _read_config() -> dict:
 
 
 def cfg(key: str, fallback: str = "") -> str:
+    # UI-remembered inputs live in Output/ui_state.json, not the tracked config.py.
+    if key in UI_STATE_KEYS:
+        v = read_state(key)
+        if v is not None:
+            return v
     raw = _read_config().get(key, fallback)
     resolved = resolve_env_expr(raw)
     if resolved is not None:
@@ -70,6 +76,10 @@ def cfg(key: str, fallback: str = "") -> str:
 
 
 def save_config(key: str, value: str):
+    # UI-remembered input → gitignored state file, never back into config.py.
+    if key in UI_STATE_KEYS:
+        write_state(key, value)
+        return
     # Env-backed secret (KEY = os.getenv(...)): write the value into .env so
     # the literal key never lands in the git-tracked config.py.
     env_name = env_expr_name(_read_config().get(key, ""))
@@ -83,7 +93,9 @@ def save_config(key: str, value: str):
         float(value)
         new_val = value
     except ValueError:
-        new_val = json.dumps(value, ensure_ascii=False)
+        # bools/None must stay bare literals — a quoted "False" is truthy
+        new_val = value if value in ("True", "False", "None") \
+            else json.dumps(value, ensure_ascii=False)
     pattern = rf'^({re.escape(key)}\s*=\s*).*'
     if re.search(pattern, content, flags=re.MULTILINE):
         content = re.sub(pattern, lambda m: f"{m.group(1)}{new_val}", content, flags=re.MULTILINE)
@@ -387,6 +399,12 @@ CONFIG_KEYS = [
     "ANNOTATE_VIDEO_WORKERS", "CAPTION_BATCH_SIZE", "VIDEO_CAPTION_MAX_FRAMES",
     # Immich integration
     "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_PATH_MAP",
+    # pipeline tuning (参数设置 UI)
+    "SOUND_HIGHLIGHT_THRESHOLD",
+    "STABILITY_CHECK_ENABLED", "STABILITY_MIN_SCORE",
+    "AGENT_MAX_ITERATIONS", "PARALLEL_SHOT_MAX_WORKERS", "PARALLEL_SHOT_MAX_RERUNS",
+    "SHOT_MIN_GAP_SEC", "ALLOW_DURATION_TOLERANCE", "MIN_ACCEPTABLE_SHOT_DURATION",
+    "MAX_SHOTS_PER_CLIP",
 ]
 
 
