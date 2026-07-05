@@ -655,8 +655,18 @@ def immich_search(body: ImmichSearch):
                         {"type": "VIDEO", "size": size, "page": body.page,
                          "withExif": True, "order": "desc"})
     items = (r.get("assets") or {}).get("items", [])
-    return {"items": [_slim_immich_asset(a) for a in items],
-            "next": (r.get("assets") or {}).get("nextPage")}
+    # flag assets already imported (by Immich id + original checksum) so the UI
+    # can show 已导入 and block accidental re-imports — same-name distinct
+    # assets (iPhone reuses IMG_xxxx) otherwise look like duplicates.
+    imap = _load_immich_map()
+    imported_ids = {v.get("id") for v in imap.values() if v.get("id")}
+    imported_cks = {v.get("checksum") for v in imap.values() if v.get("checksum")}
+    slim = []
+    for a in items:
+        d = _slim_immich_asset(a)
+        d["imported"] = (d.get("id") in imported_ids) or (a.get("checksum") in imported_cks)
+        slim.append(d)
+    return {"items": slim, "next": (r.get("assets") or {}).get("nextPage")}
 
 
 @app.get("/api/immich/thumb/{asset_id}")
@@ -703,10 +713,16 @@ def immich_import(body: ImmichImport):
         try:
             info = _immich_req(f"/assets/{safe}")
             checksum = info.get("checksum", "")
-            # content-level dedup: same original already imported under any name
+            # content-level dedup: same original already imported under any name.
+            # But only skip if the bound proxy still EXISTS on disk — if the user
+            # deleted it to reclaim space, fall through and re-download (analysis
+            # stays reusable, keyed by the original checksum, not the proxy).
             if checksum and checksum in known_checksums:
-                skipped.append(known_checksums[checksum])
-                continue
+                bound = known_checksums[checksum]
+                bound_fp = os.path.join(dest_dir, bound)
+                if os.path.exists(bound_fp) and os.path.getsize(bound_fp) > 0:
+                    skipped.append(bound)
+                    continue
             stem = os.path.splitext(str(info.get("originalFileName") or safe))[0]
             stem = "".join(c for c in stem if c not in '\\/:*?"<>|')
             fname = f"{stem}__im-{safe[:8]}.mp4"
@@ -1088,6 +1104,90 @@ class ScanRequest(BaseModel):
 SCANNED: dict[str, list] = {"assets": [], "root": ""}
 
 
+def _immich_identity(checksum: str) -> str:
+    """Stable analysis key for an Immich asset, derived from the ORIGINAL's
+    checksum (Immich's base64 SHA-1). The proxy's own bytes-hash changes across
+    re-downloads/re-transcodes; the original's checksum does not — so keying by
+    it makes analysis survive proxy churn. base64 → base64url for a path-safe,
+    collision-free directory name."""
+    safe = checksum.replace("+", "-").replace("/", "_").rstrip("=")
+    return f"im-{safe}"
+
+
+def _migrate_analysis_identity(old_hash: str, new_key: str) -> None:
+    """One-time self-heal: move analysis + annotations from a volatile proxy
+    bytes-hash key to the stable Immich checksum key, so pre-existing analysis
+    isn't orphaned by the switch. No-op once already migrated."""
+    from src.analyzer import get_analysis_path
+    from src.asset_manager.index_store import load_index, save_index
+    # analysis cache dirs (cloud + local variant)
+    for variant in ("", "local"):
+        old_dir = get_analysis_path(old_hash, variant)
+        new_dir = get_analysis_path(new_key, variant)
+        if os.path.isdir(old_dir) and not os.path.isdir(new_dir):
+            try:
+                os.replace(old_dir, new_dir)
+            except OSError:
+                pass
+    # cloud annotation index
+    try:
+        idx = load_index()
+        if old_hash in idx and new_key not in idx:
+            ann = idx.pop(old_hash)
+            ann.content_hash = new_key
+            try:
+                ann.metadata.content_hash = new_key
+            except Exception:  # noqa: BLE001
+                pass
+            idx[new_key] = ann
+            save_index(idx)
+    except Exception:  # noqa: BLE001
+        pass
+    # local annotation store
+    try:
+        store = _load_local_annotations()
+        if old_hash in store and new_key not in store:
+            store[new_key] = store.pop(old_hash)
+            with open(_LOCAL_ANN_PATH, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_immich_identity(assets: list) -> list:
+    """Re-key Immich-bound proxies to the ORIGINAL's stable checksum in place.
+
+    The scanner keys every file by its bytes-hash; for an Immich proxy that hash
+    is volatile (a re-download can re-transcode → new bytes). We rewrite
+    content_hash to `im-<checksum>` so analysis/annotations stay attached to the
+    ORIGINAL forever, and migrate any analysis that was cached under the old
+    bytes-hash the first time we see each asset."""
+    imap = _load_immich_map()
+    if not imap:
+        return assets
+    from src.analyzer import get_analysis_path
+    for meta in assets:
+        fname = getattr(meta, "file_name", "") or os.path.basename(
+            getattr(meta, "absolute_path", "") or getattr(meta, "file_path", ""))
+        bind = imap.get(fname)
+        if not bind:
+            continue
+        checksum = bind.get("checksum")
+        if not checksum:
+            continue
+        stable = _immich_identity(checksum)
+        old = getattr(meta, "content_hash", "")
+        # Migrate only when analysis actually sits under the old bytes-hash key
+        # — a cheap isdir check keeps steady-state scans from re-reading the
+        # index once everything's already migrated.
+        if old and old != stable and (
+                os.path.isdir(get_analysis_path(old))
+                or os.path.isdir(get_analysis_path(old, "local"))):
+            _migrate_analysis_identity(old, stable)
+        meta.content_hash = stable
+    return assets
+
+
 def _assets_with_annotations(assets: list) -> list:
     """Merge each scanned asset with its cloud + local annotation, if any."""
     from src.asset_manager.index_store import load_index
@@ -1116,7 +1216,7 @@ def scan_assets(body: ScanRequest):
     abs_root = _resolve(root)
     if not os.path.isdir(abs_root):
         raise HTTPException(400, f"Folder not found: {abs_root}")
-    assets = scan_asset_directory(abs_root)
+    assets = _apply_immich_identity(scan_asset_directory(abs_root))
     SCANNED["assets"] = assets
     SCANNED["root"] = abs_root
     return {"root": abs_root, "assets": _assets_with_annotations(assets)}
@@ -1138,7 +1238,7 @@ def last_scan():
         abs_root = _resolve(cfg("ASSET_ROOT_DIR", "resource/imports/"))
         if not os.path.isdir(abs_root):
             return {"root": abs_root, "assets": [], "scanned": False}
-        assets = scan_asset_directory(abs_root)
+        assets = _apply_immich_identity(scan_asset_directory(abs_root))
         SCANNED["assets"] = assets
         SCANNED["root"] = abs_root
     return {"root": abs_root, "assets": _assets_with_annotations(assets),
@@ -1186,6 +1286,18 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
                     break
             except Exception:  # noqa: BLE001
                 pass
+    # highlight-pool scores (curation-first) — any version renders; missing
+    # rationale fields simply hide in the UI
+    hp = os.path.join(get_analysis_path(content_hash), "highlight_pool.json")
+    if os.path.exists(hp):
+        try:
+            with open(hp, "r", encoding="utf-8") as f:
+                _hd = json.load(f)
+            result["highlight_pool"] = sorted(
+                _hd.get("moments", []), key=lambda m: -m.get("score", 0))
+            result["highlight_pool_version"] = _hd.get("version", 1)
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
@@ -1220,6 +1332,49 @@ def asset_sound_highlights(body: SoundHighlightRequest):
         abs_path, cache_path=os.path.join(cache_dir, "sound_highlights.json"),
         threshold=body.threshold)
     return {"segments": segs}
+
+
+class HighlightPoolRequest(BaseModel):
+    content_hash: str
+    force: bool = False
+
+
+@app.post("/api/assets/highlight_pool")
+def asset_highlight_pool(body: HighlightPoolRequest):
+    """Build (or rebuild) one source's highlight-pool scores in the background.
+
+    First build measures footage quality per dense segment (1-3 min for a
+    long video) — runs detached; the UI polls details until the file lands."""
+    from src.analyzer import get_analysis_path
+    from src.curation import _POOL_VERSION
+    cache_dir = get_analysis_path(body.content_hash)
+    if not os.path.isdir(cache_dir):
+        raise HTTPException(400, "该素材还没有分析缓存 — 先标注一次")
+    pool_path = os.path.join(cache_dir, "highlight_pool.json")
+    if os.path.exists(pool_path) and not body.force:
+        try:
+            with open(pool_path, "r", encoding="utf-8") as f:
+                if int(json.load(f).get("version", 0)) >= _POOL_VERSION:
+                    return {"status": "ready"}
+        except Exception:  # noqa: BLE001
+            pass
+    if os.path.exists(pool_path):
+        try:
+            os.remove(pool_path)   # stale version / force → rebuild
+        except OSError:
+            pass
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {PROJECT_ROOT!r})\n"
+        "from src.curation import _source_pool\n"
+        f"_source_pool({body.content_hash!r})\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    subprocess.Popen([sys.executable, "-c", code], cwd=PROJECT_ROOT, env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    return {"status": "building"}
 
 
 class AnnotateRequest(BaseModel):
@@ -1394,7 +1549,8 @@ def annotate(body: AnnotateRequest):
                             if body.force and getattr(meta, "asset_type", "video") == "video":
                                 analyze_video(getattr(meta, "absolute_path", ""),
                                               force=True, progress_callback=_stage_cb,
-                                              variant="local")
+                                              variant="local",
+                                              content_hash=getattr(meta, "content_hash", "") or None)
                             results.append(annotate_asset(
                                 meta, model=_lv["model"], endpoint=_lv["endpoint"],
                                 api_key=_lv.get("api_key") or "sk-local",
@@ -1420,7 +1576,8 @@ def annotate(body: AnnotateRequest):
                     job.add(f"[file] {i}/{len(targets)} {getattr(meta, 'file_name', '')}")
                     ap = getattr(meta, "absolute_path", "")
                     if getattr(meta, "asset_type", "video") == "video":
-                        analyze_video(ap, force=True, progress_callback=_stage_cb)
+                        analyze_video(ap, force=True, progress_callback=_stage_cb,
+                                      content_hash=getattr(meta, "content_hash", "") or None)
                     elif getattr(meta, "asset_type", "") == "audio":
                         analyze_audio(ap, force=True)
                     results.append(annotate_asset(meta))

@@ -225,7 +225,11 @@ function DetailView({
   busy: boolean; annMeta?: Record<string, any>;
   onPrev?: () => void; onNext?: () => void; pos?: string;
 }) {
-  const [details, setDetails] = useState<{ clips: any[]; scenes: any[]; sound_highlights?: any[] } | null>(null);
+  const [details, setDetails] = useState<{
+    clips: any[]; scenes: any[]; sound_highlights?: any[];
+    highlight_pool?: any[]; highlight_pool_version?: number;
+  } | null>(null);
+  const [poolBuilding, setPoolBuilding] = useState(false);
   const [loading, setLoading] = useState(false);
   // annotation track: cloud (API) vs local VLM — two parallel, persisted results
   const [track, setTrack] = useState<"cloud" | "local">("cloud");
@@ -233,6 +237,40 @@ function DetailView({
   // VAD sensitivity: lower = more sensitive + wider segments
   const [shlThr, setShlThr] = useState(() => Number(localStorage.getItem("cutclaw_shl_thr") || 0.5));
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  const buildPool = async (force = false) => {
+    if (!asset) return;
+    setPoolBuilding(true);
+    try {
+      const r = await api<{ status: string }>("/api/assets/highlight_pool", {
+        method: "POST",
+        body: JSON.stringify({ content_hash: asset.content_hash, force }),
+      });
+      if (r.status === "ready") {
+        const d = await api<any>(`/api/assets/${asset.content_hash}/details`);
+        setDetails(d);
+        setPoolBuilding(false);
+      }
+      // "building" → the polling effect below picks it up
+    } catch {
+      setPoolBuilding(false);
+    }
+  };
+
+  // poll while the background scorer runs (first build measures every segment)
+  useEffect(() => {
+    if (!poolBuilding || !asset) return;
+    const t = window.setInterval(async () => {
+      try {
+        const d = await api<any>(`/api/assets/${asset.content_hash}/details${track === "local" ? "?variant=local" : ""}`);
+        if (d.highlight_pool && (d.highlight_pool_version ?? 1) >= 2) {
+          setDetails(d);
+          setPoolBuilding(false);
+        }
+      } catch { /* keep polling */ }
+    }, 5000);
+    return () => window.clearInterval(t);
+  }, [poolBuilding, asset?.content_hash]);
 
   const detectHighlights = async (thr = shlThr) => {
     if (!asset) return;
@@ -426,6 +464,9 @@ function DetailView({
                 <TabsTrigger value="scenes" className="gap-1.5 text-xs">
                   <Layers className="h-3.5 w-3.5" />场景 ({scenes.length})
                 </TabsTrigger>
+                <TabsTrigger value="pool" className="gap-1.5 text-xs">
+                  <Sparkles className="h-3.5 w-3.5" />高光评分{details?.highlight_pool ? ` (${details.highlight_pool.length})` : ""}
+                </TabsTrigger>
               </>
             )}
             {asset.asset_type === "audio" && (
@@ -506,6 +547,79 @@ function DetailView({
                       );
                     })}
                   </div>
+                )}
+              </TabsContent>
+
+              <TabsContent value="pool" className="pt-3">
+                <div className="mb-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-[11px] leading-relaxed text-slate-400">
+                  总分 = <b className="text-cyan-300">40% 内容质量</b>（VLM 评画面构图/光线/叙事价值，附评语）
+                  + <b className="text-cyan-300">40% 实测画质</b>（从真实帧测量：清晰度相对<b>本片自身基线</b>的比值 + 光流紊乱度——运动模糊是剧烈晃动的物理指纹，非 AI 猜测）
+                  + <b className="text-violet-300">15% 声音高光</b>（原声含真实人声/笑声）
+                  + <b className="text-slate-300">5% 有人物</b>。
+                  内容 &lt;3/5 或实测画质 &lt;3.5/10 的片段直接淘汰不入池。选材优先制按此排名把镜头锚定在真实瞬间上。
+                </div>
+                {!details?.highlight_pool ? (
+                  <div className="py-6 text-center">
+                    <Button
+                      variant="outline"
+                      className="gap-1.5 border-cyan-500/30 bg-cyan-500/[0.08] text-xs text-cyan-300"
+                      disabled={poolBuilding} onClick={() => buildPool()}
+                    >
+                      {poolBuilding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                      {poolBuilding ? "评分中…（逐段实测画质，长视频约 1-3 分钟）" : "构建高光评分"}
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    {(details.highlight_pool_version ?? 1) < 2 && (
+                      <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-300">
+                        旧版评分（缺评分理由明细）
+                        <button className="underline hover:text-amber-200" disabled={poolBuilding}
+                          onClick={() => buildPool(true)}>
+                          {poolBuilding ? "重建中…" : "重建"}
+                        </button>
+                      </div>
+                    )}
+                    <div className="max-h-[560px] space-y-1.5 overflow-y-auto pr-1">
+                      {details.highlight_pool.map((m: any, i: number) => (
+                        <div key={i}
+                          className="cursor-pointer rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 hover:border-cyan-500/30"
+                          onClick={() => seek(m.start)} title="点击跳转试看"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={cn("text-[11px] font-bold", i < 5 ? "text-amber-300" : "text-slate-500")}>#{i + 1}</span>
+                            <span className="tabular-nums text-[11px] text-slate-400">{m.start?.toFixed(1)}–{m.end?.toFixed(1)}s ({m.duration?.toFixed(1)}s)</span>
+                            <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(m.score ?? 0) * 10))}>
+                              总分 {(Number(m.score ?? 0) * 10).toFixed(1)}
+                            </Badge>
+                            {m.sound && <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300">🎙 人声 +15%</Badge>}
+                            {m.people && <Badge variant="outline" className="border-white/15 bg-white/[0.05] text-[10px] text-slate-300">👤 有人 +5%</Badge>}
+                          </div>
+                          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10.5px] text-slate-400">
+                            <span className="flex items-center gap-1.5">
+                              内容 {Number(m.vlm_q ?? 0).toFixed(0)}/5
+                              <span className="inline-block h-1.5 w-14 overflow-hidden rounded-full bg-white/[0.08]">
+                                <span className="block h-full bg-cyan-400" style={{ width: `${Math.min(100, Number(m.vlm_q ?? 0) / 5 * 100)}%` }} />
+                              </span>
+                            </span>
+                            <span className="flex items-center gap-1.5">
+                              实测画质 {Number(m.stability) >= 0 ? `${Number(m.stability).toFixed(1)}/10` : "未测"}
+                              <span className="inline-block h-1.5 w-14 overflow-hidden rounded-full bg-white/[0.08]">
+                                <span className="block h-full bg-emerald-400" style={{ width: `${Math.max(0, Math.min(100, Number(m.stability ?? 0) * 10))}%` }} />
+                              </span>
+                              {m.stability_detail?.rel_sharp !== undefined && m.stability_detail?.rel_sharp !== null && (
+                                <span className="text-slate-600">清晰度 {(Number(m.stability_detail.rel_sharp) * 100).toFixed(0)}% 基线 · 紊乱 {Number(m.stability_detail.disorder ?? 0).toFixed(2)}</span>
+                              )}
+                            </span>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-[11.5px] text-slate-300">{m.desc}</p>
+                          {m.vlm_notes && (
+                            <p className="mt-0.5 line-clamp-1 text-[10.5px] italic text-slate-500">评语：{m.vlm_notes}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </>
                 )}
               </TabsContent>
             </>
@@ -994,6 +1108,25 @@ export default function AssetsView({
       .then((r) => { if (r.job) setSelJobId(r.job.id); }).catch(() => {});
   }, []);
 
+  // Restore the last scan on mount so a page refresh (or backend restart)
+  // doesn't force a manual re-scan. Cheap: the server serves it from memory,
+  // or re-scans against the on-disk metadata cache (unchanged files skip
+  // hashing + ffprobe).
+  useEffect(() => {
+    setScanning(true);
+    api<{ root: string; assets: Asset[]; scanned?: boolean }>("/api/assets/scan")
+      .then((r) => {
+        if (r.assets?.length) {
+          setAssets(r.assets);
+          setScanned(true);
+          if (r.root) setRoot((cur) => cur || r.root);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setScanning(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const scan = async () => {
     setError(""); setScanning(true);
     try {
@@ -1331,20 +1464,30 @@ export default function AssetsView({
             {imItems.map((it: any) => (
               <button
                 key={it.id}
+                disabled={it.imported}
+                title={it.imported ? "该素材已导入本地（按内容识别，不会重复）" : undefined}
                 className={cn(
                   "group relative overflow-hidden rounded-lg border text-left transition-all",
-                  imPicked.has(it.id)
-                    ? "border-violet-400/70 shadow-[0_0_12px_rgba(167,139,250,0.3)]"
-                    : "border-white/[0.08] hover:border-white/25",
+                  it.imported
+                    ? "cursor-default border-emerald-500/40"
+                    : imPicked.has(it.id)
+                      ? "border-violet-400/70 shadow-[0_0_12px_rgba(167,139,250,0.3)]"
+                      : "border-white/[0.08] hover:border-white/25",
                 )}
-                onClick={() => setImPicked((s0) => {
-                  const n = new Set(s0);
-                  if (n.has(it.id)) n.delete(it.id); else n.add(it.id);
-                  return n;
-                })}
+                onClick={() => {
+                  if (it.imported) return;
+                  setImPicked((s0) => {
+                    const n = new Set(s0);
+                    if (n.has(it.id)) n.delete(it.id); else n.add(it.id);
+                    return n;
+                  });
+                }}
               >
-                <img src={it.thumb} loading="lazy" className="aspect-video w-full object-cover" />
-                {imPicked.has(it.id) && (
+                <img src={it.thumb} loading="lazy"
+                  className={cn("aspect-video w-full object-cover", it.imported && "opacity-40")} />
+                {it.imported ? (
+                  <span className="absolute top-1.5 left-1.5 rounded-full border border-emerald-400/50 bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">已导入</span>
+                ) : imPicked.has(it.id) && (
                   <span className="absolute top-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-violet-400 text-xs font-bold text-slate-950">✓</span>
                 )}
                 <div className="truncate bg-black/55 px-1.5 py-0.5 text-[10.5px] text-slate-300">{it.name}</div>

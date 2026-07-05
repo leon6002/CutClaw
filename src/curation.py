@@ -20,7 +20,7 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 1
+_POOL_VERSION = 2   # v2: rationale fields (vlm_notes, stability detail) for the UI
 
 
 def _source_pool(content_hash: str) -> list:
@@ -82,7 +82,8 @@ def _source_pool(content_hash: str) -> list:
             if e - s < 1.6 or (round(s, 1), round(e, 1)) in seen:
                 continue
             seen.add((round(s, 1), round(e, 1)))
-            vq = ((seg.get("visual_quality") or {}).get("score") or 3)
+            _vq_obj = seg.get("visual_quality") or {}
+            vq = _vq_obj.get("score") or 3
             try:
                 vq = float(vq)
             except (TypeError, ValueError):
@@ -90,8 +91,12 @@ def _source_pool(content_hash: str) -> list:
             if vq < 3:
                 continue          # VLM already flagged it weak — not pool material
             stab = -1.0
+            stab_detail = {}
             if can_measure:
-                stab = float(measure_stability(src_path, s, e, samples=3).get("score", -1))
+                _st = measure_stability(src_path, s, e, samples=3)
+                stab = float(_st.get("score", -1))
+                stab_detail = {"rel_sharp": _st.get("rel_sharp"),
+                               "disorder": _st.get("disorder")}
                 if 0 <= stab < 3.5:
                     continue      # measured blur/violent motion — never a highlight
             voice = highlights_in_range(shl, s, e, min_overlap=0.5)
@@ -111,7 +116,10 @@ def _source_pool(content_hash: str) -> list:
                 "duration": round(e - s, 2),
                 "desc": str(seg.get("content_description") or "")[:300],
                 "vlm_q": vq,
+                # rationale: the VLM's own words on WHY this quality score
+                "vlm_notes": str(_vq_obj.get("notes") or "")[:200],
                 "stability": stab,
+                "stability_detail": stab_detail,
                 "sound": bool(voice),
                 "people": people,
                 "score": round(score, 3),
