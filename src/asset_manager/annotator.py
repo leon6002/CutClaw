@@ -448,6 +448,11 @@ def annotate_audio_asset(
                     parsed = _parse_json_strict(content)
                     if parsed and isinstance(parsed, dict):
                         parsed["duration_sec"] = metadata.duration_sec
+                        # LLM-guessed bpm is unreliable (anchors on genre clichés);
+                        # override with the madmom-measured felt pulse when present
+                        _mt = caption_data.get("measured_tempo") or {}
+                        if _mt.get("bpm_felt"):
+                            parsed["bpm"] = float(_mt["bpm_felt"])
                         return AudioAnnotation(**parsed)
                 except Exception:
                     if attempt == 1:

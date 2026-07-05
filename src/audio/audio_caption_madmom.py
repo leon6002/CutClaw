@@ -1442,6 +1442,15 @@ def caption_audio_with_madmom_segments(
             "prompt": AUDIO_OVERALL_PROMPT.strip(),
             "summary": overall_summary
         },
+        # MEASURED tempo from the madmom downbeat grid — the only BPM in this
+        # system that comes from actual signal analysis. LLM-written "rhythm"
+        # text routinely invents genre-typical numbers (e.g. "128 BPM" for a
+        # 70 BPM track); downstream consumers must prefer this field.
+        "measured_tempo": ({
+            "bar_sec": round(_bar, 3),
+            "bpm_felt": round(240.0 / _bar, 1),
+            "note": "240/bar_sec assuming 4/4; felt pulse from madmom downbeats",
+        } if _bar > 0 else None),
         "sections": final_sections,
         # Debug: 保存分割点详细信息
         "_keypoints_detail": [

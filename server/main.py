@@ -865,13 +865,46 @@ def params_suggestions(body: SuggestRequest):
     audio_desc = "（未选择音乐）"
     audio_dur = 0.0
     aa = _find(p.get("audio", ""))
+    # MEASURED tempo beats any annotation: annotation.bpm historically came from
+    # an LLM guess (it would answer genre clichés like "128" for a 70 BPM song).
+    # Derive the felt pulse from the madmom downbeat grid cached in the audio's
+    # analyzed captions — works for old caches too.
+    measured_bpm = None
+    try:
+        _ap = os.path.normcase(os.path.abspath(_resolve(p.get("audio", "") or "")))
+        if _ap:
+            for _md in glob.glob(os.path.join(PROJECT_ROOT, "Output", "analyzed", "*", "metadata.json")):
+                try:
+                    with open(_md, "r", encoding="utf-8") as fh:
+                        _meta = json.load(fh)
+                except Exception:
+                    continue
+                if os.path.normcase(str(_meta.get("absolute_path", ""))) != _ap:
+                    continue
+                _cj = os.path.join(os.path.dirname(_md), "captions.json")
+                if os.path.exists(_cj):
+                    with open(_cj, "r", encoding="utf-8") as fh:
+                        _cap = json.load(fh)
+                    _mt = _cap.get("measured_tempo") or {}
+                    measured_bpm = _mt.get("bpm_felt")
+                    if not measured_bpm:  # older caches: derive from downbeat gaps
+                        _db = sorted(k["time"] for k in (_cap.get("_keypoints_detail") or [])
+                                     if k.get("type") == "Downbeat")
+                        _gaps = sorted(b - a for a, b in zip(_db, _db[1:]) if 0.8 <= b - a <= 8.0)
+                        if len(_gaps) >= 4:
+                            _bar = _gaps[len(_gaps) // 2]
+                            measured_bpm = round(240.0 / _bar, 1)
+                break
+    except Exception:
+        measured_bpm = None
     if aa:
         audio_dur = float(getattr(aa.metadata, "duration_sec", 0) or 0)
-        bpm = getattr(aa.annotation, "bpm", None)
+        bpm = measured_bpm or getattr(aa.annotation, "bpm", None)
+        bpm_tag = "（实测律动）" if measured_bpm else "（估计，未实测）"
         energy = getattr(aa.annotation, "energy_level", None)
         genre = getattr(aa.annotation, "genre", None)
         audio_desc = (f"时长 {audio_dur:.0f}s"
-                      + (f"，BPM {bpm}" if bpm else "")
+                      + (f"，BPM {bpm}{bpm_tag}" if bpm else "")
                       + (f"，能量 {energy}" if energy else "")
                       + (f"，曲风 {genre}" if genre else ""))
     elif p.get("audio"):
