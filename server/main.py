@@ -763,6 +763,81 @@ def immich_import(body: ImmichImport):
 _CUTCLAW_MARK = "─── CutClaw AI 标注 ───"
 
 
+# ── per-file capture time & location (cached — computed once per file) ─────
+_MEDIA_META_PATH = os.path.join(PROJECT_ROOT, "Output", "cache", "media_meta.json")
+_MEDIA_META: dict | None = None
+_MEDIA_META_LOCK = threading.Lock()
+
+
+def _media_meta_for(abs_path: str, file_name: str) -> dict:
+    """{"capture_time": iso|None, "location": str|None} for one media file.
+
+    capture_time: filename pattern → container creation_time (capture_time.py).
+    location: Immich exifInfo city/state/country when the file is an Immich
+    proxy (reverse-geocoded by Immich), else the QuickTime GPS tag as coords.
+    Cached by file name in Output/cache/media_meta.json — both values come
+    from the ORIGINAL recording, so re-downloads/transcodes don't change them.
+    """
+    global _MEDIA_META
+    with _MEDIA_META_LOCK:
+        if _MEDIA_META is None:
+            try:
+                with open(_MEDIA_META_PATH, "r", encoding="utf-8") as f:
+                    _MEDIA_META = json.load(f)
+            except Exception:  # noqa: BLE001
+                _MEDIA_META = {}
+        if file_name in _MEDIA_META:
+            return _MEDIA_META[file_name]
+
+    meta: dict = {"capture_time": None, "location": None}
+    try:
+        from src.utils.capture_time import get_capture_time
+        ct = get_capture_time(abs_path or file_name)
+        if ct is not None:
+            meta["capture_time"] = ct.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:  # noqa: BLE001
+        pass
+    # location: Immich-bound proxies get the city Immich reverse-geocoded
+    try:
+        entry = _load_immich_map().get(file_name)
+        if entry and entry.get("id"):
+            info = _immich_req(f"/assets/{entry['id']}", timeout=15)
+            ex = info.get("exifInfo") or {}
+            parts = [p for p in (ex.get("city"), ex.get("state") or ex.get("country")) if p]
+            if parts:
+                meta["location"] = " · ".join(dict.fromkeys(parts))
+            elif ex.get("latitude") is not None and ex.get("longitude") is not None:
+                meta["location"] = f"{float(ex['latitude']):.3f}, {float(ex['longitude']):.3f}"
+    except Exception:  # noqa: BLE001
+        pass
+    # fallback: QuickTime/MP4 GPS tag (phones embed ISO6709)
+    if not meta["location"] and abs_path and os.path.exists(abs_path):
+        try:
+            fp = os.path.join(PROJECT_ROOT, "tools", "ffmpeg", "ffprobe.exe")
+            if not os.path.exists(fp):
+                fp = "ffprobe"
+            r = subprocess.run(
+                [fp, "-v", "error", "-show_entries",
+                 "format_tags=location,com.apple.quicktime.location.ISO6709",
+                 "-of", "default=nw=1", abs_path],
+                capture_output=True, text=True, timeout=15)
+            m = re.search(r"([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)", r.stdout or "")
+            if m:
+                meta["location"] = f"{float(m.group(1)):.3f}, {float(m.group(2)):.3f}"
+        except Exception:  # noqa: BLE001
+            pass
+
+    with _MEDIA_META_LOCK:
+        _MEDIA_META[file_name] = meta
+        try:
+            os.makedirs(os.path.dirname(_MEDIA_META_PATH), exist_ok=True)
+            with open(_MEDIA_META_PATH, "w", encoding="utf-8") as f:
+                json.dump(_MEDIA_META, f, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            pass
+    return meta
+
+
 def _load_immich_map() -> dict:
     p = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_map.json")
     try:
@@ -1205,6 +1280,13 @@ def _assets_with_annotations(assets: list) -> list:
         d["annotated_local"] = _loc is not None
         if _loc is not None:
             d["annotation_local"] = _loc.get("annotation")
+        # journey metadata from the ORIGINAL recording (cached per file)
+        try:
+            mm = _media_meta_for(d.get("absolute_path") or "", d.get("file_name") or "")
+            d["capture_time"] = mm.get("capture_time")
+            d["location"] = mm.get("location")
+        except Exception:  # noqa: BLE001
+            pass
         out.append(d)
     return out
 

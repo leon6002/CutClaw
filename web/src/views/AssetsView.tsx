@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   AudioLines, BookOpen, Bot, Camera, ClipboardList, Code2, Cpu, Database, Drama,
@@ -51,6 +51,16 @@ export interface Asset {
   /** parallel local-VLM track (annotations_local.json) */
   annotated_local?: boolean;
   annotation_local?: Record<string, any>;
+  /** journey metadata from the original recording */
+  capture_time?: string | null;
+  location?: string | null;
+}
+
+/** "12-13 15:02" from an ISO capture time */
+export function fmtCapture(ct?: string | null): string {
+  if (!ct) return "";
+  const m = ct.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  return m ? `${m[1]}-${m[2]} ${m[3]}:${m[4]}` : "";
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -389,6 +399,8 @@ function DetailView({
           {asset.asset_type === "image" && <img src={src} className="max-h-[480px] w-full rounded-xl bg-black object-contain" />}
           {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls className="w-full" />}
           <div className="mt-1.5 text-xs text-slate-500">
+            {asset.capture_time && <span className="text-slate-400">📅 {fmtCapture(asset.capture_time)} · </span>}
+            {asset.location && <span className="text-slate-400">📍 {asset.location} · </span>}
             {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
             {asset.width ? `${asset.width}×${asset.height} · ` : ""}
             {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
@@ -773,6 +785,12 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             {a.width ? `${a.width}×${a.height} · ` : ""}
             {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
           </div>
+          {(a.capture_time || a.location) && (
+            <div className="mt-0.5 truncate text-[11px] text-slate-500">
+              {a.capture_time && <span>📅 {fmtCapture(a.capture_time)}</span>}
+              {a.location && <span className="ml-1.5">📍 {a.location}</span>}
+            </div>
+          )}
           <div className="mt-1.5 flex flex-wrap gap-1">
             {a.annotated
               ? <Badge variant="outline" className={cn("text-[11px]", qBadgeCls(Number(ann.quality_score ?? 0)))}>Q {fmtVal(ann.quality_score)}</Badge>
@@ -993,6 +1011,9 @@ export default function AssetsView({
   const [typeTab, setTypeTab] = useState<string>("video");
   const [annWb, setAnnWb] = useState<{ task: string; idx?: number } | null>(null);
   const [query, setQuery] = useState("");
+  const [sortBy, setSortBy] = useState<"score" | "time_desc" | "time_asc">("score");
+  const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "local" | "none">("all");
+  const [tagFilter, setTagFilter] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
   // manual selection: video/image hashes (multi) + audio hash (single)
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -1196,11 +1217,44 @@ export default function AssetsView({
   const byType = (t: string) => assets.filter((a) => a.asset_type === t);
   const newCount = assets.filter((a) => !a.annotated).length;
   const q = query.trim().toLowerCase();
+
+  const assetTags = (a: Asset): string[] => [
+    ...(Array.isArray(a.annotation?.tags) ? a.annotation!.tags : []),
+    ...(Array.isArray(a.annotation?.visual_tags) ? a.annotation!.visual_tags : []),
+    ...(Array.isArray(a.annotation_local?.tags) ? a.annotation_local!.tags : []),
+  ];
+  const assetScore = (a: Asset) =>
+    Number(a.annotation?.quality_score ?? a.annotation_local?.quality_score ?? -1);
+
+  // tag dropdown options: most frequent tags within the current type
+  const tagOptions = useMemo(() => {
+    const freq = new Map<string, number>();
+    byType(typeTab).forEach((a) => assetTags(a).forEach((t) => {
+      const s = String(t).trim();
+      if (s) freq.set(s, (freq.get(s) ?? 0) + 1);
+    }));
+    return [...freq.entries()].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([t]) => t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assets, typeTab]);
+
   const shown = byType(typeTab)
     .filter((a) => !q ||
       (a.file_name || a.file_path).toLowerCase().includes(q) ||
       JSON.stringify(a.annotation ?? {}).toLowerCase().includes(q))
-    .sort((a, b) => (b.annotation?.quality_score ?? -1) - (a.annotation?.quality_score ?? -1));
+    .filter((a) => annFilter === "all" ? true
+      : annFilter === "cloud" ? a.annotated
+        : annFilter === "local" ? !!a.annotated_local
+          : (!a.annotated && !a.annotated_local))
+    .filter((a) => !tagFilter || assetTags(a).includes(tagFilter))
+    .sort((a, b) => {
+      if (sortBy === "time_desc") return (b.capture_time ?? "").localeCompare(a.capture_time ?? "");
+      if (sortBy === "time_asc") {
+        // assets without capture time sink to the end
+        const ta = a.capture_time ?? "9999", tb = b.capture_time ?? "9999";
+        return ta.localeCompare(tb);
+      }
+      return assetScore(b) - assetScore(a);
+    });
 
   const selSel = selJob.meta.selection;
   const glass = "rounded-2xl border-white/[0.07] bg-slate-900/50";
@@ -1540,6 +1594,34 @@ export default function AssetsView({
             <span className="text-xs text-slate-500">
               共 {assets.length} 个素材 · {assets.length - newCount} 已标注 · {newCount} 新
             </span>
+            {/* sort & filter — journey time / score / tags / annotation tracks */}
+            <select
+              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              value={sortBy} onChange={(e) => setSortBy(e.target.value as any)}
+            >
+              <option value="score">按评分 高→低</option>
+              <option value="time_desc">按拍摄时间 新→旧</option>
+              <option value="time_asc">按拍摄时间 旧→新</option>
+            </select>
+            <select
+              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              value={annFilter} onChange={(e) => setAnnFilter(e.target.value as any)}
+            >
+              <option value="all">全部标注状态</option>
+              <option value="cloud">☁ 已云端标注</option>
+              <option value="local">🖥 已本地标注</option>
+              <option value="none">未标注</option>
+            </select>
+            <select
+              className="h-7 max-w-[130px] rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              value={tagFilter} onChange={(e) => setTagFilter(e.target.value)}
+            >
+              <option value="">全部 tag</option>
+              {tagOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            {(annFilter !== "all" || tagFilter) && (
+              <span className="text-[11px] text-cyan-300">筛出 {shown.length} 个</span>
+            )}
             <div className="ml-auto flex items-center gap-2">
               <span className="text-[11px] text-slate-600">勾选卡片=手动选材</span>
               <Button
