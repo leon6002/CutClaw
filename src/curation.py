@@ -1,4 +1,4 @@
-"""Curation-first: the project's HIGHLIGHT POOL — real, measured moments.
+﻿"""Curation-first: the project's HIGHLIGHT POOL — real, measured moments.
 
 The script-first flow had the Screenwriter invent idealized shots and sent
 an agent per shot hunting for fiction ("素材可能不符" flags, failures,
@@ -20,7 +20,7 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 4   # v4: per-second scan trims camera-adjustment wobble off moments
+_POOL_VERSION = 5   # v5: camera-roll (tilt) penalty in the measured score
 
 
 def _source_pool(content_hash: str) -> list:

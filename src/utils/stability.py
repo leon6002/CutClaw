@@ -89,7 +89,7 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
         dur = max(0.0, end_sec - start_sec)
         if dur < 0.3 or n < 10:
             return {"score": -1.0}
-        sharps, disorders, speeds = [], [], []
+        sharps, disorders, speeds, tilts = [], [], [], []
         for i in range(samples):
             t = start_sec + (i + 0.5) * dur / samples
             f0 = min(max(0, int(t * fps)), n - 2)
@@ -100,6 +100,19 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
             speeds.append(float(np.median(mag)) / 320.0 * fps)      # widths/s
             disorders.append(float(np.std(mag)) / 320.0 * fps)
             sharps.append(_sharp(g0))
+            # camera roll: near-vertical structures (trees/poles) deviating
+            # from vertical = crooked gimbal. Needs enough lines to trust.
+            _edges = cv2.Canny(g0, 60, 160)
+            _lines = cv2.HoughLinesP(_edges, 1, np.pi / 180, threshold=40,
+                                     minLineLength=40, maxLineGap=6)
+            if _lines is not None:
+                _devs = []
+                for _l in _lines[:, 0]:
+                    _ang = np.degrees(np.arctan2(float(_l[3] - _l[1]), float(_l[2] - _l[0])))
+                    if abs(abs(_ang) - 90) <= 25:
+                        _devs.append(abs(abs(_ang) - 90))
+                if len(_devs) >= 6:
+                    tilts.append(float(np.median(_devs)))
 
     rel = float(np.median(sharps)) / base
     disorder = float(np.median(disorders))
@@ -114,7 +127,13 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
     # Gentle glides measure ~0.02-0.29 widths/s (keep full marks); beyond
     # 0.30 w/s the motion starts to dominate the frame and gets penalized.
     speed_pen = min(1.0, max(0.0, (speed - 0.30) / 0.45))
-    score = sharp_score * (1.0 - 0.5 * disorder_pen) * (1.0 - 0.6 * speed_pen)
+    # TILT penalty — user found a shot with a badly crooked gimbal (measured
+    # 9.1° vs 1.8° for straight footage). Requires ≥2 frames with enough
+    # vertical structure; unmeasurable scenes (open water/sky) are exempt.
+    tilt = round(float(np.median(tilts)), 1) if len(tilts) >= 2 else None
+    tilt_pen = min(1.0, max(0.0, (tilt - 4.0) / 5.0)) if tilt is not None else 0.0
+    score = (sharp_score * (1.0 - 0.5 * disorder_pen)
+             * (1.0 - 0.6 * speed_pen) * (1.0 - 0.7 * tilt_pen))
     return {
         "score": round(score, 1),
         "rel_sharp": round(rel, 2),
@@ -122,6 +141,7 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
         "baseline": round(base, 0),
         "disorder": round(disorder, 3),
         "speed": round(speed, 3),
+        "tilt": tilt,
     }
 
 
