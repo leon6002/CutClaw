@@ -153,14 +153,14 @@ function SegGrid({
       {total <= 24 ? (
         <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 xl:grid-cols-3">
           {cells.map((s, i) => {
-            const lab = t.labels?.[String(i)];
+            const lab = prettyLabel(t.labels?.[String(i)]);
             const iter = t.iters?.[String(i)];
             return (
               <button
                 key={i}
-                className={cn("seg-chip", `chip-${s}`, sel === i && "chip-sel", !jobId && "cursor-default")}
-                title={`#${i + 1}${lab ? ` ${lab}` : ""} · ${STATE_TXT[s]}${jobId ? "（点击查看轨迹）" : ""}`}
-                onClick={jobId ? () => onSelect(sel === i ? null : i) : undefined}
+                className={cn("seg-chip", `chip-${s}`, sel === i && "chip-sel", (!jobId || s === "p") && "cursor-default")}
+                title={`#${i + 1}${lab ? ` ${lab}` : ""} · ${STATE_TXT[s]}${jobId && s !== "p" ? "（点击查看轨迹）" : ""}`}
+                onClick={jobId && s !== "p" ? () => onSelect(sel === i ? null : i) : undefined}
               >
                 <span className={cn("h-2 w-2 shrink-0 rounded-full", STATE_DOT[s])} />
                 <span className="shrink-0 font-mono text-[10px] text-slate-500">#{i + 1}</span>
@@ -174,14 +174,14 @@ function SegGrid({
       ) : (
         <div className="flex flex-wrap gap-[3px]">
           {cells.map((s, i) => {
-            const lab = t.labels?.[String(i)];
+            const lab = prettyLabel(t.labels?.[String(i)]);
             const iter = t.iters?.[String(i)];
             return (
               <div
                 key={i}
-                className={cn("seg", `seg-${s}`, jobId && "cursor-pointer", sel === i && "seg-sel")}
-                title={`#${i + 1}${lab ? ` ${lab}` : ""}${iter ? ` · iter ${iter}` : ""} · ${STATE_TXT[s]}${jobId ? "（点击查看轨迹）" : ""}`}
-                onClick={jobId ? () => onSelect(sel === i ? null : i) : undefined}
+                className={cn("seg", `seg-${s}`, jobId && s !== "p" && "cursor-pointer", sel === i && "seg-sel")}
+                title={`#${i + 1}${lab ? ` ${lab}` : ""}${iter ? ` · iter ${iter}` : ""} · ${STATE_TXT[s]}${jobId && s !== "p" ? "（点击查看轨迹）" : ""}`}
+                onClick={jobId && s !== "p" ? () => onSelect(sel === i ? null : i) : undefined}
               />
             );
           })}
@@ -199,7 +199,7 @@ function SegGrid({
           >
             <InlineTrace
               jobId={jobId} task={name} idx={sel}
-              label={t.labels?.[String(sel)]} iters={t.iters?.[String(sel)]}
+              label={prettyLabel(t.labels?.[String(sel)])} iters={t.iters?.[String(sel)]}
               onClose={() => onSelect(null)}
               onOpenWorkbench={() => onOpenWorkbench?.(sel)}
             />
@@ -214,6 +214,16 @@ function SegGrid({
  * Fine-grained execution monitor. Cells open a quick inline glance; the full
  * immersive workbench is owned by the parent view (onOpenWorkbench).
  */
+/** Humanize internal unit labels: "0_30_shot0_sub0" -> "0–30s", "scene_3.json" -> "场景 4" */
+function prettyLabel(lab?: string): string | undefined {
+  if (!lab) return lab;
+  let m = /^(\d+)_(\d+)_shot\d+(?:_sub\d+)?/.exec(lab);
+  if (m) return `${m[1]}–${m[2]}s`;
+  m = /^scene_(\d+)\.json$/.exec(lab);
+  if (m) return `场景 ${Number(m[1]) + 1}`;
+  return lab;
+}
+
 export default function TaskGrids({
   tasks, jobId, jobRunning, onRetryFailed, onOpenWorkbench,
 }: {

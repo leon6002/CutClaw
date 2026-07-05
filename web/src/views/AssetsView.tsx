@@ -582,6 +582,82 @@ function Waveform({ seed }: { seed: string }) {
   );
 }
 
+// ── annotation batch progress panel ─────────────────────────────────────────
+
+const ANN_STAGES: Array<[string, string]> = [
+  ["shot_detection", "镜头检测"], ["captioning", "片段理解"],
+  ["dense_caption", "密集描述"], ["scene_merge", "场景合并"], ["scene_analysis", "场景分析"],
+];
+
+function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
+  meta: Record<string, any>; jobId: string | null;
+  onOpenWorkbench: (task: string, idx?: number) => void;
+}) {
+  const files: Record<string, string> = meta.files ?? {};
+  const names: Record<string, string> = meta.names ?? {};
+  const order = Object.keys(files);
+  const doneN = order.filter((h) => files[h] === "d").length;
+  const stages: Record<string, string> = meta.file_stages ?? {};
+  const hasStages = Object.keys(stages).length > 0;
+
+  return (
+    <div className="mt-3 rounded-xl border border-white/[0.06] bg-black/20 px-3.5 py-3">
+      {/* ① batch dots — every file in this run at a glance */}
+      <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap gap-1">
+          {order.map((h) => (
+            <span
+              key={h} title={names[h] || h}
+              className={cn(
+                "h-2.5 w-2.5 rounded-full transition-colors",
+                files[h] === "d" ? "bg-emerald-400"
+                  : files[h] === "r" ? "animate-pulse bg-cyan-400 ring-2 ring-cyan-400/40"
+                    : "bg-slate-700",
+              )}
+            />
+          ))}
+        </div>
+        <span className="text-xs text-slate-400">{doneN}/{order.length} 完成</span>
+        <span className="min-w-0 flex-1 truncate text-right text-xs font-medium text-cyan-300">
+          {meta.filename || ""}
+        </span>
+      </div>
+
+      {/* ② stage stepper for the CURRENT file */}
+      {hasStages && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-y-1">
+          {ANN_STAGES.map(([k, label], i) => {
+            const st = stages[k];
+            const active = st === "running";
+            const detail = active && meta.stage === k ? String(meta.stage_detail || "") : "";
+            return (
+              <div key={k} className="flex items-center">
+                {i > 0 && <span className="mx-1 h-px w-3.5 bg-white/10" />}
+                <span className={cn(
+                  "flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] whitespace-nowrap",
+                  st === "done" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                    : st === "skip" ? "border-white/10 bg-white/[0.03] text-slate-500"
+                      : active ? "border-cyan-400/40 bg-cyan-500/10 text-cyan-300"
+                        : "border-white/10 bg-white/[0.02] text-slate-600",
+                )}>
+                  {active && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {st === "done" && <span>✓</span>}
+                  {st === "skip" && <span title="缓存命中，已跳过">⏭</span>}
+                  {label}
+                  {detail && /%$/.test(detail) ? ` ${detail}` : ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ③ per-file segment grids (reset on every file server-side) */}
+      <TaskGrids tasks={meta.tasks ?? {}} jobId={jobId} onOpenWorkbench={onOpenWorkbench} />
+    </div>
+  );
+}
+
 // ── main view ───────────────────────────────────────────────────────────────
 
 const TYPE_TABS = [
@@ -611,10 +687,9 @@ export default function AssetsView({
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [pickedAudio, setPickedAudio] = useState("");
   const [pickApplied, setPickApplied] = useState(false);
-  // command-bar popovers + collapsible annotation detail
+  // command-bar popovers
   const [modelsOpen, setModelsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [showAnnDetail, setShowAnnDetail] = useState(false);
 
   const busy = annJob.status === "running";
 
@@ -809,38 +884,20 @@ export default function AssetsView({
             <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">{error}</div>
           )}
 
-          {/* slim progress strip — details on demand; the JobDock mirrors this globally */}
+          {/* annotation batch panel: file dots + stage stepper + per-file grids */}
           {busy && (
-            <div className="mt-3">
-              <div className="flex items-center gap-3">
-                <Progress
-                  value={Math.round(((annJob.meta.current ?? 0) / Math.max(annJob.meta.total ?? 1, 1)) * 100)}
-                  className="h-2 flex-1 bg-white/[0.06]"
+            <>
+              <AnnotationProgress
+                meta={annJob.meta} jobId={annJobId}
+                onOpenWorkbench={(task, idx) => setAnnWb({ task, idx })}
+              />
+              {annWb && annJobId && (annJob.meta.tasks ?? {})[annWb.task] && (
+                <AgentWorkbench
+                  name={annWb.task} t={annJob.meta.tasks[annWb.task]} jobId={annJobId}
+                  initialIdx={annWb.idx} onClose={() => setAnnWb(null)}
                 />
-                <span className="shrink-0 text-xs text-slate-400">
-                  {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
-                </span>
-                <button
-                  className="shrink-0 text-xs text-cyan-400 hover:text-cyan-300"
-                  onClick={() => setShowAnnDetail((v) => !v)}>
-                  {showAnnDetail ? "收起详情" : "分段详情"}
-                </button>
-              </div>
-              {showAnnDetail && (
-                <>
-                  <TaskGrids
-                    tasks={annJob.meta.tasks ?? {}} jobId={annJobId}
-                    onOpenWorkbench={(task, idx) => setAnnWb({ task, idx })}
-                  />
-                  {annWb && annJobId && (annJob.meta.tasks ?? {})[annWb.task] && (
-                    <AgentWorkbench
-                      name={annWb.task} t={annJob.meta.tasks[annWb.task]} jobId={annJobId}
-                      initialIdx={annWb.idx} onClose={() => setAnnWb(null)}
-                    />
-                  )}
-                </>
               )}
-            </div>
+            </>
           )}
           {annJob.status === "error" && (
             <div className="mt-3">

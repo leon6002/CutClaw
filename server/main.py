@@ -639,8 +639,18 @@ def annotate(body: AnnotateRequest):
     _files_state = {t.content_hash: "p" for t in targets}          # p/r/d
     _name_to_hash = {getattr(t, "file_name", ""): t.content_hash for t in targets}
     job.meta.update({"current": 0, "total": len(targets), "filename": "",
-                     "files": _files_state})
+                     "files": _files_state,
+                     "names": {t.content_hash: getattr(t, "file_name", "") for t in targets},
+                     "file_stages": {}})
     JOBS[job.id] = job
+
+    def _reset_file_view():
+        """Segment grids & stage stepper are scoped to the CURRENT file — old
+        files' units (and their failures) must not bleed into the new one."""
+        job.meta["tasks"] = {}
+        job.meta["file_stages"] = {}
+        job.meta["stage"] = ""
+        job.meta["stage_detail"] = ""
 
     def _run():
         _reload_runtime_config()
@@ -654,11 +664,14 @@ def annotate(body: AnnotateRequest):
 
             def _stage_cb(stage, status, detail):
                 # per-card stage line ("镜头检测 42% / 片段理解 …") — surfaced live
-                # on the running asset's card in the grid
+                # on the running asset's card + the stage stepper
+                _fs = job.meta.setdefault("file_stages", {})
                 if status in ("start", "progress"):
+                    _fs[stage] = "running"
                     job.meta.update({"stage": stage,
                                      "stage_detail": str(detail or "")[:60]})
                 elif status in ("done", "skip"):
+                    _fs[stage] = "done" if status == "done" else "skip"
                     job.meta.update({"stage": "", "stage_detail": ""})
                 job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
 
@@ -666,6 +679,7 @@ def annotate(body: AnnotateRequest):
                 results = []
                 for i, meta in enumerate(targets, 1):
                     _files_state[meta.content_hash] = "r"
+                    _reset_file_view()
                     job.meta.update({"current": i - 1, "total": len(targets),
                                      "filename": getattr(meta, "file_name", "")})
                     job.add(f"[file] {i}/{len(targets)} {getattr(meta, 'file_name', '')}")
@@ -683,6 +697,7 @@ def annotate(body: AnnotateRequest):
                     h = _name_to_hash.get(filename)
                     if h:
                         _files_state[h] = "r"
+                    _reset_file_view()
                     job.meta.update({"filename": filename})
                     job.add(f"[file] start {filename}")
                 def _file_cb(current, total, filename):
