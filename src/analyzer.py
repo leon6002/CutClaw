@@ -82,20 +82,27 @@ def _save_metadata(cache_dir: str, metadata: dict):
 # ── Video analysis ─────────────────────────────────────────────────────────
 
 def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
-                         video_reader, video_fps: float, config) -> list[dict] | None:
-    """Run dense captioning on a time range: extract frames → VLM → segments."""
+                         video_reader, video_fps: float, config,
+                         reader_lock=None) -> list[dict] | None:
+    """Run dense captioning on a time range: extract frames → VLM → segments.
+
+    reader_lock: when clips are processed in parallel threads, decord readers
+    are NOT thread-safe — frame extraction is serialized under this lock while
+    the (dominant) VLM network calls overlap freely.
+    """
     try:
         import litellm
         from src.utils.media_utils import array_to_base64, seconds_to_hhmmss
         from src.video.deconstruction.video_caption import SYSTEM_PROMPT, messages as caption_msgs
         # One unified, content-adaptive prompt — describes people OR scenery, no toggle.
         from src.prompt import DENSE_CAPTION_PROMPT_FILM as _dense_tmpl
+        import contextlib
 
         vr = video_reader
         if vr is None:
             return None
 
-        # Extract evenly-spaced frames
+        # Extract evenly-spaced frames (decord access serialized when parallel)
         max_frames = 12
         start_f = max(0, int(start_sec * video_fps))
         end_f = min(int(end_sec * video_fps), len(vr) - 1)
@@ -106,7 +113,8 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         indices = list(range(start_f, end_f + 1, step))[:max_frames]
         if indices[-1] != end_f:
             indices.append(end_f)
-        frames = vr.get_batch(indices).asnumpy()
+        with (reader_lock if reader_lock is not None else contextlib.nullcontext()):
+            frames = vr.get_batch(indices).asnumpy()
         b64_frames = [array_to_base64(frames[i]) for i in range(len(frames))]
 
         # Build prompt
@@ -342,28 +350,43 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
         _dense_t0 = time.time()
         _reader = vr.get("video_reader") if isinstance(vr, dict) else None
         _video_fps = float(_reader.get_avg_fps()) if _reader else 24.0
-        for _cf in _need_dense:
+
+        # Parallel: VLM latency dominates (5-60s per clip) while frame
+        # extraction is fast — serialize decord access under a lock and let
+        # the network calls overlap. Sequentially this step took N×latency.
+        import threading as _threading
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _rd_lock = _threading.Lock()
+        _workers = max(1, min(int(getattr(config, "CAPTION_BATCH_SIZE", 4) or 4), len(_need_dense)))
+
+        def _dense_one(_cf: str):
             _cp = os.path.join(shots_dir, _cf)
             try:
                 with open(_cp, "r", encoding="utf-8") as _f2:
                     _cd = json.load(_f2)
             except Exception:
-                continue
+                return
             _dr = _cd.get("duration", {})
             _clip_start = _dr.get("clip_start_time", "00:00:00")
             _clip_end = _dr.get("clip_end_time", "00:00:05")
-            # Parse to seconds
             _start_sec = sum(float(x) * m for x, m in zip(reversed(str(_clip_start).split(":")), [1, 60, 3600]))
             _end_sec = sum(float(x) * m for x, m in zip(reversed(str(_clip_end).split(":")), [1, 60, 3600]))
             if _end_sec <= _start_sec:
-                continue
-            # Extract frames and call VLM for dense captioning
+                return
             _emit("dense_caption", "progress", f"{_cf}: {_clip_start}-{_clip_end}")
-            _segments = _dense_caption_clip(abs_path, _start_sec, _end_sec, _reader, _video_fps, config)
+            _segments = _dense_caption_clip(abs_path, _start_sec, _end_sec, _reader,
+                                            _video_fps, config, reader_lock=_rd_lock)
             if _segments:
                 _cd["dense_segments"] = _segments
                 with open(_cp, "w", encoding="utf-8") as _f2:
                     json.dump(_cd, _f2, ensure_ascii=False, indent=2)
+
+        if _workers > 1:
+            with _TPE(max_workers=_workers) as _ex:
+                list(_ex.map(_dense_one, _need_dense))
+        else:
+            for _cf in _need_dense:
+                _dense_one(_cf)
         _emit("dense_caption", "done", f"{len(_need_dense)} clips · {time.time() - _dense_t0:.1f}s")
 
     # Step 3: Scene merge

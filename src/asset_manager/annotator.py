@@ -1,11 +1,14 @@
 """AI annotation orchestrator — calls VLMs and audio analysis per asset.
 
 Key design decisions:
-- Video annotation is *lightweight*: 4-6 key frames → one VLM call.
-  It does NOT run the full process_video() pipeline (which is for editing).
+- Video annotation runs the FULL analyze_video() pipeline (shot detection →
+  clip captions → dense captions → scene merge → scene analysis), cached by
+  content hash — so the editing stage never needs fresh VLM calls; the
+  annotation is then distilled into a compact catalog entry with one LLM call.
 - Image annotation: single VLM call per image.
-- Audio annotation: delegates to the existing madmom pipeline with coarse
-  parameters (only Level 1 structure, skip Level 2 per-segment captions).
+- Audio annotation: delegates to the madmom pipeline with coarse parameters
+  (Level 1 structure + measured facts; Level 2 per-segment captions skipped).
+  Measured values (BPM etc.) always come from signal analysis, never the LLM.
 """
 
 from __future__ import annotations
