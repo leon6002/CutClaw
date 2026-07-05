@@ -752,9 +752,18 @@ export default function AssetsView({
   };
 
   // reattach to jobs still running server-side after a page refresh
+  const [interrupted, setInterrupted] = useState<{ unfinished: number } | null>(null);
   useEffect(() => {
     api<any>("/api/jobs/current/annotate")
-      .then((r) => { if (r.job) setAnnJobId(r.job.id); }).catch(() => {});
+      .then((r) => {
+        if (r.job) { setAnnJobId(r.job.id); return; }
+        // no running job — was the last batch killed by a backend restart?
+        api<any>("/api/jobs/latest/annotate").then((l) => {
+          if (l.job && l.job.status === "error" && (l.job.unfinished ?? 0) > 0) {
+            setInterrupted({ unfinished: l.job.unfinished });
+          }
+        }).catch(() => {});
+      }).catch(() => {});
     api<any>("/api/jobs/current/select")
       .then((r) => { if (r.job) setSelJobId(r.job.id); }).catch(() => {});
   }, []);
@@ -901,6 +910,18 @@ export default function AssetsView({
 
           {error && (
             <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">{error}</div>
+          )}
+
+          {/* a previous batch was killed (e.g. backend restart) — say so, loudly */}
+          {interrupted && !busy && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-300">
+              <span>
+                ⚠ 上次标注批次被中断（服务重启），{interrupted.unfinished} 个文件未完成 —
+                点「扫描」后再点「标注新素材」继续，已完成的部分会自动跳过。
+              </span>
+              <button className="ml-auto text-xs text-slate-400 hover:text-slate-200"
+                onClick={() => setInterrupted(null)}>知道了</button>
+            </div>
           )}
 
           {/* annotation batch panel: file dots + stage stepper + per-file grids */}

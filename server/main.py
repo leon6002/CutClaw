@@ -280,6 +280,23 @@ def current_job_of_kind(kind: str):
     return {"job": None}
 
 
+@app.get("/api/jobs/latest/{kind}")
+def latest_job_of_kind(kind: str):
+    """Most recent job of a kind regardless of status — surfaces batches that
+    were killed by a backend restart (their assets silently stay 未标注
+    otherwise). For annotate jobs, include how many files never finished."""
+    for job in reversed(list(JOBS.values())):
+        if job.kind != kind:
+            continue
+        info: dict = {"id": job.id, "kind": job.kind, "status": job.status}
+        files = (job.meta or {}).get("files") or {}
+        if files:
+            info["unfinished"] = sum(1 for v in files.values() if v in ("p", "r"))
+            info["total"] = len(files)
+        return {"job": info}
+    return {"job": None}
+
+
 @app.get("/api/jobs/{job_id}/traces")
 def get_job_traces(job_id: str):
     """ALL unit traces, slimmed for the canvas (one poll instead of N).
