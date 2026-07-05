@@ -219,6 +219,20 @@ def _iter_clip_frames(
         if not valid_indices:
             continue
 
+        # Cap frames per VLM call: sending the full 2fps sample (60 frames for
+        # a 30s clip) cost ~57k input tokens PER CALL (~1.1k tok/frame
+        # measured). 16 evenly-spaced frames describe a ≤30s clip just as
+        # well at ~30% of the cost.
+        _max_f = 16
+        try:
+            from src import config as _cfg
+            _max_f = max(4, int(getattr(_cfg, "VIDEO_CAPTION_MAX_FRAMES", 16) or 16))
+        except Exception:
+            pass
+        if len(valid_indices) > _max_f:
+            _step = len(valid_indices) / _max_f
+            valid_indices = [valid_indices[int(i * _step)] for i in range(_max_f)]
+
         orig_indices = [frame_indices[idx] for idx in valid_indices]
         chunk_frames = video_reader.get_batch(orig_indices).asnumpy()
         arrays = list(chunk_frames)
