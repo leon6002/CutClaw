@@ -20,6 +20,7 @@ import { api, useJob, type JobState } from "./api";
 import { ModelConfigProvider } from "./components/ModelConfig";
 import AgentFlow from "./components/AgentFlow";
 import FloatingTerminal from "./components/FloatingTerminal";
+import JobDock from "./components/JobDock";
 import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
 import RenderView from "./views/RenderView";
@@ -356,6 +357,8 @@ export default function App() {
         running={pipelineStatus === "running"}
         visible={!!pipelineJobId || pipelineJob.lines.length > 0}
       />
+      {/* global job dock — bottom-left, above all overlays */}
+      <JobDock />
 
         <Dialog open={newModal} onOpenChange={(o) => !o && setNewModal(false)}>
           <DialogContent className="border-white/10 bg-slate-900/90 backdrop-blur-xl sm:max-w-md">

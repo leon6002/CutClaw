@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import {
   AudioLines, BookOpen, Bot, Camera, ClipboardList, Code2, Database, Drama,
   Eye, FileText, Film, FolderOpen, Images, Layers, Lightbulb, Loader2,
-  Music2, Pin, Play, RefreshCw, ScanSearch, Search, SearchCode, Sparkles, Tags,
+  Music2, Pin, Play, RefreshCw, ScanSearch, Search, SearchCode, Settings2, Sparkles, Tags,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -215,8 +215,11 @@ function ClipPanel({ clip, onSeek }: { clip: any; onSeek: (s: number) => void })
 // ── detail sheet ────────────────────────────────────────────────────────────
 
 function DetailSheet({
-  asset, onClose, onReannotate, busy,
-}: { asset: Asset | null; onClose: () => void; onReannotate: (a: Asset) => void; busy: boolean }) {
+  asset, onClose, onReannotate, busy, annMeta,
+}: {
+  asset: Asset | null; onClose: () => void; onReannotate: (a: Asset) => void;
+  busy: boolean; annMeta?: Record<string, any>;
+}) {
   const [details, setDetails] = useState<{ clips: any[]; scenes: any[] } | null>(null);
   const [loading, setLoading] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -256,6 +259,19 @@ function DetailSheet({
             </Button>
           </SheetTitle>
         </SheetHeader>
+
+        {/* in-sheet progress: annotation triggered from here must be visible HERE */}
+        {busy && (
+          <div className="mb-3 flex items-center gap-2.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-300">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            <span className="min-w-0 flex-1 truncate">
+              正在标注 {annMeta?.filename || "…"}
+              {typeof annMeta?.total === "number" && annMeta.total > 0
+                ? ` · ${annMeta.current ?? 0}/${annMeta.total}` : ""}
+              — 完成后此面板自动刷新
+            </span>
+          </div>
+        )}
 
         <div className="drawer-player">
           {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[340px] w-full rounded-lg bg-black" />}
@@ -391,16 +407,20 @@ function DetailSheet({
 
 // ── asset card ──────────────────────────────────────────────────────────────
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
+  /** this exact file is currently being annotated (live from the job meta) */
+  annotating?: boolean;
 }) {
   const ann = a.annotation ?? {};
   const src = mediaUrl(a.absolute_path || a.file_path);
+  const [thumbFailed, setThumbFailed] = useState(false);
   const tags: string[] = [
     ...(Array.isArray(ann.tags) ? ann.tags : []),
     ...(Array.isArray(ann.visual_tags) ? ann.visual_tags : []),
   ].slice(0, 4);
+  const dur = a.duration_sec ? `${Math.round(a.duration_sec)}s` : "";
 
   return (
     <motion.div
@@ -410,17 +430,25 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick }: {
     >
       <Card
         className={cn(
-          "relative cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]",
+          "group relative cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]",
           picked && "border-cyan-400/60 shadow-[0_0_16px_rgba(34,211,238,0.18)]",
         )}
         style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}
         onClick={onOpen}
+        title="点击查看完整标注"
       >
+        {/* status stripe: annotation state at a glance across the whole wall */}
+        <div className={cn(
+          "absolute inset-x-0 top-0 z-10 h-0.5",
+          annotating ? "animate-pulse bg-cyan-400"
+            : a.annotated ? "bg-emerald-500/60"
+              : "bg-amber-500/60",
+        )} />
         {onTogglePick && (
           <button
             title={picked ? "取消选择" : a.asset_type === "audio" ? "选为项目音乐" : "加入项目素材"}
             className={cn(
-              "absolute top-2 left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold transition-all",
+              "absolute top-2.5 left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold transition-all",
               picked
                 ? "border-cyan-300 bg-cyan-400 text-slate-950 shadow-[0_0_10px_rgba(34,211,238,0.6)]"
                 : "border-white/30 bg-black/50 text-transparent hover:border-cyan-300 hover:text-cyan-300",
@@ -430,25 +458,47 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick }: {
             ✓
           </button>
         )}
-        <div
-          className="flex aspect-video items-center justify-center overflow-hidden bg-black"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {a.asset_type === "video" && <video src={src} controls preload="metadata" className="h-full w-full object-contain" />}
-          {a.asset_type === "image" && <img src={src} loading="lazy" className="h-full w-full object-contain" />}
-          {a.asset_type === "audio" && (
-            <div className="flex w-full flex-col items-center gap-2 px-3">
-              <AudioLines className="h-8 w-8 text-sky-400" />
-              <audio src={src} controls preload="none" className="w-11/12" />
-            </div>
+
+        {/* poster area — no native players in the grid; the detail sheet plays */}
+        <div className="relative flex aspect-video items-center justify-center overflow-hidden bg-gradient-to-br from-slate-900 to-slate-950">
+          {a.asset_type === "image" && (
+            <img src={src} loading="lazy" className="h-full w-full object-cover" />
+          )}
+          {a.asset_type === "video" && (!thumbFailed ? (
+            <img
+              src={`/api/assets/thumb?hash=${a.content_hash}&path=${encodeURIComponent(a.absolute_path || a.file_path)}`}
+              loading="lazy" className="h-full w-full object-cover"
+              onError={() => setThumbFailed(true)}
+            />
+          ) : (
+            <Film className="h-10 w-10 text-slate-700" />
+          ))}
+          {a.asset_type === "audio" && <Waveform seed={a.content_hash} />}
+
+          {a.asset_type !== "image" && (
+            <span className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
+              <span className="flex h-11 w-11 items-center justify-center rounded-full border border-white/20 bg-black/60 backdrop-blur-sm">
+                <Play className="ml-0.5 h-4.5 w-4.5 text-white" />
+              </span>
+            </span>
+          )}
+          {dur && (
+            <span className="absolute right-1.5 bottom-1.5 rounded bg-black/65 px-1.5 py-0.5 font-mono text-[10.5px] text-slate-200">
+              {dur}
+            </span>
+          )}
+          {annotating && (
+            <span className="absolute top-2 right-1.5 flex items-center gap-1 rounded-full border border-cyan-400/50 bg-black/70 px-2 py-0.5 text-[10.5px] text-cyan-300">
+              <Loader2 className="h-3 w-3 animate-spin" /> 标注中
+            </span>
           )}
         </div>
+
         <CardContent className="p-3">
           <div className="truncate text-[13px] font-semibold text-slate-200" title={a.absolute_path || a.file_path}>
             {a.file_name || a.file_path}
           </div>
           <div className="mt-0.5 text-[11.5px] text-slate-500">
-            {a.duration_sec ? `${Math.round(a.duration_sec)}s · ` : ""}
             {a.width ? `${a.width}×${a.height} · ` : ""}
             {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
           </div>
@@ -463,14 +513,24 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick }: {
           {ann.summary && (
             <p className="mt-1.5 line-clamp-2 text-xs text-slate-400">{ann.summary}</p>
           )}
-          <Button variant="outline" size="sm"
-            className="mt-3 h-7 w-full gap-1.5 border-cyan-500/25 bg-cyan-500/[0.06] text-xs text-cyan-300 hover:bg-cyan-500/15"
-            onClick={onOpen}>
-            <Eye className="h-3.5 w-3.5" /> 查看完整标注
-          </Button>
         </CardContent>
       </Card>
     </motion.div>
+  );
+}
+
+/** Decorative deterministic waveform for audio posters (seeded by hash). */
+function Waveform({ seed }: { seed: string }) {
+  const bars = Array.from({ length: 44 }, (_, i) => {
+    const c = seed.charCodeAt((i * 7) % Math.max(1, seed.length)) || 60;
+    return 18 + ((c * 31 + i * 17) % 62);
+  });
+  return (
+    <div className="flex h-full w-full items-center justify-center gap-[2.5px] px-6">
+      {bars.map((h, i) => (
+        <span key={i} className="w-[3px] rounded-full bg-cyan-500/45" style={{ height: `${h}%` }} />
+      ))}
+    </div>
   );
 }
 
@@ -503,6 +563,10 @@ export default function AssetsView({
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [pickedAudio, setPickedAudio] = useState("");
   const [pickApplied, setPickApplied] = useState(false);
+  // command-bar popovers + collapsible annotation detail
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [showAnnDetail, setShowAnnDetail] = useState(false);
 
   const busy = annJob.status === "running";
 
@@ -625,16 +689,13 @@ export default function AssetsView({
 
   return (
     <div>
+      {/* ── ① command bar: scan → annotate. Low-frequency stuff lives in popovers ── */}
       <Card className={cn(glass, (busy || selecting) && "border-beam")}>
-        <CardHeader className="pb-3">
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <FolderOpen className="h-4 w-4 text-cyan-400" /> 素材库
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
+        <CardContent className="px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
+            <FolderOpen className="h-4 w-4 shrink-0 text-cyan-400" />
             <Input
-              className="h-9 w-[340px] border-white/10 bg-black/25 text-xs"
+              className="h-9 w-[290px] border-white/10 bg-black/25 text-xs"
               placeholder="素材文件夹（默认 resource/imports/）"
               value={root} onChange={(e) => setRoot(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && scan()}
@@ -644,62 +705,93 @@ export default function AssetsView({
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               扫描
             </Button>
-            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04]"
-              onClick={() => annotate()} disabled={!scanned || newCount === 0 || busy}>
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Tags className="h-4 w-4" />}
-              全部标注{newCount > 0 ? ` (${newCount})` : ""}
-            </Button>
-            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04]"
-              title="强制重新分析所有素材（会重跑视觉/音频分析）"
-              onClick={() => {
-                const hs = assets.map((a) => a.content_hash).filter(Boolean);
-                if (hs.length && window.confirm(`重新标注全部 ${hs.length} 个素材？将重跑视觉/音频分析（消耗 API）。`))
-                  annotate(hs, true);
-              }}
-              disabled={!scanned || assets.length === 0 || busy}>
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              重新标注全部
-            </Button>
-            <Button
-              className="h-9 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_16px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
-              onClick={autoSelect} disabled={selecting || assets.every((a) => !a.annotated)}>
-              {selecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-              智能选材
-            </Button>
-          </div>
+            {/* primary CTA follows the workflow state */}
+            {scanned && newCount > 0 && (
+              <Button
+                className="h-9 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_16px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
+                onClick={() => annotate()} disabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Tags className="h-4 w-4" />}
+                标注新素材 ({newCount})
+              </Button>
+            )}
+            {scanned && newCount === 0 && assets.length > 0 && !busy && (
+              <span className="text-xs text-emerald-400">✓ 全部已标注</span>
+            )}
 
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-            <span className="text-xs text-slate-500">使用模型：</span>
-            <RoleModelSelect role="vision" disabled={busy} />
-            <RoleModelSelect role="audio" disabled={busy} />
-            <RoleModelSelect role="agent" disabled={selecting} />
-            <span className="text-[11px] text-slate-600">视觉/音频用于标注 · Agent 用于智能选材</span>
+            <div className="relative ml-auto flex items-center gap-2">
+              <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+                onClick={() => { setModelsOpen((o) => !o); setMoreOpen(false); }}>
+                <Settings2 className="h-3.5 w-3.5" /> 模型
+              </Button>
+              <Button variant="outline" className="h-9 border-white/10 bg-white/[0.04] px-2.5 text-xs"
+                onClick={() => { setMoreOpen((o) => !o); setModelsOpen(false); }}>
+                ⋯
+              </Button>
+              {modelsOpen && (
+                <div className="absolute top-10 right-0 z-50 w-[320px] rounded-xl border border-white/10 bg-slate-950/95 p-3 shadow-[0_12px_40px_rgba(0,0,0,0.6)] backdrop-blur-xl">
+                  <div className="mb-2 text-xs font-semibold text-slate-300">本页使用的模型</div>
+                  <div className="flex flex-col gap-2">
+                    <RoleModelSelect role="vision" disabled={busy} className="justify-between" />
+                    <RoleModelSelect role="audio" disabled={busy} className="justify-between" />
+                    <RoleModelSelect role="agent" disabled={selecting} className="justify-between" />
+                  </div>
+                  <div className="mt-2 text-[11px] text-slate-600">视觉/音频用于标注 · Agent 用于智能选材</div>
+                </div>
+              )}
+              {moreOpen && (
+                <div className="absolute top-10 right-0 z-50 w-[240px] rounded-xl border border-white/10 bg-slate-950/95 p-1.5 shadow-[0_12px_40px_rgba(0,0,0,0.6)] backdrop-blur-xl">
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06] disabled:opacity-40"
+                    disabled={!scanned || assets.length === 0 || busy}
+                    onClick={() => {
+                      setMoreOpen(false);
+                      const hs = assets.map((a) => a.content_hash).filter(Boolean);
+                      if (hs.length && window.confirm(`重新标注全部 ${hs.length} 个素材？将重跑视觉/音频分析（消耗 API）。`))
+                        annotate(hs, true);
+                    }}>
+                    <RefreshCw className="h-3.5 w-3.5 text-slate-500" />
+                    强制重新标注全部…
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           {error && (
             <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">{error}</div>
           )}
 
+          {/* slim progress strip — details on demand; the JobDock mirrors this globally */}
           {busy && (
             <div className="mt-3">
-              <Progress
-                value={Math.round(((annJob.meta.current ?? 0) / Math.max(annJob.meta.total ?? 1, 1)) * 100)}
-                className="h-2 bg-white/[0.06]"
-              />
-              <div className="mt-1 text-xs text-slate-400">
-                {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
-              </div>
-              <TaskGrids
-                tasks={annJob.meta.tasks ?? {}} jobId={annJobId}
-                onOpenWorkbench={(task, idx) => setAnnWb({ task, idx })}
-              />
-              {annWb && annJobId && (annJob.meta.tasks ?? {})[annWb.task] && (
-                <AgentWorkbench
-                  name={annWb.task} t={annJob.meta.tasks[annWb.task]} jobId={annJobId}
-                  initialIdx={annWb.idx} onClose={() => setAnnWb(null)}
+              <div className="flex items-center gap-3">
+                <Progress
+                  value={Math.round(((annJob.meta.current ?? 0) / Math.max(annJob.meta.total ?? 1, 1)) * 100)}
+                  className="h-2 flex-1 bg-white/[0.06]"
                 />
+                <span className="shrink-0 text-xs text-slate-400">
+                  {annJob.meta.current ?? 0}/{annJob.meta.total ?? "?"} · {annJob.meta.filename || "…"}
+                </span>
+                <button
+                  className="shrink-0 text-xs text-cyan-400 hover:text-cyan-300"
+                  onClick={() => setShowAnnDetail((v) => !v)}>
+                  {showAnnDetail ? "收起详情" : "分段详情"}
+                </button>
+              </div>
+              {showAnnDetail && (
+                <>
+                  <TaskGrids
+                    tasks={annJob.meta.tasks ?? {}} jobId={annJobId}
+                    onOpenWorkbench={(task, idx) => setAnnWb({ task, idx })}
+                  />
+                  {annWb && annJobId && (annJob.meta.tasks ?? {})[annWb.task] && (
+                    <AgentWorkbench
+                      name={annWb.task} t={annJob.meta.tasks[annWb.task]} jobId={annJobId}
+                      initialIdx={annWb.idx} onClose={() => setAnnWb(null)}
+                    />
+                  )}
+                </>
               )}
-              <JobLog lines={annJob.lines.slice(-80)} height={180} />
             </div>
           )}
           {annJob.status === "error" && (
@@ -708,19 +800,22 @@ export default function AssetsView({
               <JobLog lines={annJob.lines.slice(-40)} height={180} />
             </div>
           )}
+        </CardContent>
+      </Card>
 
-          {selJobId && (
-            <div className="mt-2">
-              <AgentFlow steps={SELECT_STEPS} stages={selJob.meta.stages ?? {}} />
-              {selJob.status === "error" && (
-                <>
-                  <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">选材失败 — 查看日志</div>
-                  <JobLog lines={selJob.lines.slice(-30)} height={140} />
-                </>
-              )}
-            </div>
+      {/* ── selection flow (runs from the grid toolbar's 智能选材 button) ── */}
+      {selJobId && (
+        <div className="mt-3">
+          <AgentFlow steps={SELECT_STEPS} stages={selJob.meta.stages ?? {}} />
+          {selJob.status === "error" && (
+            <>
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">选材失败 — 查看日志</div>
+              <JobLog lines={selJob.lines.slice(-30)} height={140} />
+            </>
           )}
-          {selJob.status === "done" && selSel && (
+        </div>
+      )}
+      {selJob.status === "done" && selSel && (
             <motion.div
               initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
               className="mt-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-4 py-3"
@@ -766,8 +861,6 @@ export default function AssetsView({
               </p>
             </div>
           )}
-        </CardContent>
-      </Card>
 
       {scanned ? (
         <>
@@ -800,6 +893,15 @@ export default function AssetsView({
             <span className="text-xs text-slate-500">
               共 {assets.length} 个素材 · {assets.length - newCount} 已标注 · {newCount} 新
             </span>
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-[11px] text-slate-600">勾选卡片=手动选材</span>
+              <Button
+                className="h-8 gap-1.5 bg-cyan-500 text-xs font-semibold text-slate-950 shadow-[0_0_14px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
+                onClick={autoSelect} disabled={selecting || assets.every((a) => !a.annotated)}>
+                {selecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                智能选材
+              </Button>
+            </div>
           </div>
 
           {shown.length === 0 ? (
@@ -811,6 +913,7 @@ export default function AssetsView({
                   key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
                   picked={a.asset_type === "audio" ? a.content_hash === pickedAudio : picked.has(a.content_hash)}
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
+                  annotating={busy && !!annJob.meta.filename && annJob.meta.filename === (a.file_name || a.file_path)}
                 />
               ))}
             </div>
@@ -857,7 +960,7 @@ export default function AssetsView({
       )}
 
       <DetailSheet
-        asset={detail} busy={busy}
+        asset={detail} busy={busy} annMeta={annJob.meta}
         onClose={() => setDetail(null)}
         onReannotate={(a) => annotate([a.content_hash], a.annotated)}
       />

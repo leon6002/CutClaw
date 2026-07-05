@@ -508,6 +508,37 @@ def media(path: str):
     return FileResponse(abs_path, filename=os.path.basename(abs_path))
 
 
+@app.get("/api/assets/thumb")
+def asset_thumb(hash: str, path: str = ""):
+    """Poster thumbnail for a video asset — extracted once with ffmpeg and
+    cached on disk, so the grid never embeds heavyweight <video> elements."""
+    if not hash or any(c in hash for c in "\\/.:"):
+        raise HTTPException(400, "bad hash")
+    tdir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "thumbs")
+    os.makedirs(tdir, exist_ok=True)
+    tp = os.path.join(tdir, f"{hash}.jpg")
+    if not os.path.exists(tp):
+        src = _resolve(path)
+        if not (src and os.path.isfile(src)):
+            raise HTTPException(404, "source not found")
+        import subprocess
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", "1", "-i", src, "-frames:v", "1",
+             "-vf", "scale=480:-2", "-q:v", "4", tp],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0 or not os.path.exists(tp):
+            # very short clips: retry from 0s
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src, "-frames:v", "1",
+                 "-vf", "scale=480:-2", "-q:v", "4", tp],
+                capture_output=True, timeout=30,
+            )
+        if not os.path.exists(tp):
+            raise HTTPException(500, "thumbnail extraction failed")
+    return FileResponse(tp, media_type="image/jpeg")
+
+
 # ── Assets ──────────────────────────────────────────────────────────────────
 
 def _dump(model) -> dict:
