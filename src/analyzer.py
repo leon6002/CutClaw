@@ -600,6 +600,18 @@ def analyze_video(
             json.dump(fallback, f, ensure_ascii=False, indent=2)
         print(f"🔧 [Analyze] No scenes detected — created fallback scene_0.json")
 
+    # Sound highlights (voices/laughter in the ORIGINAL audio) — the emotional
+    # core of travel-memory montages. Signal-only, seconds of work, cached.
+    # Failure must not fail the analysis: many sources (drones) have no audio.
+    try:
+        from src.audio.sound_highlights import detect_sound_highlights
+        _shl = detect_sound_highlights(
+            abs_path, cache_path=os.path.join(cache_dir, "sound_highlights.json"))
+        if _shl:
+            print(f"🎙️ [Analyze] {len(_shl)} sound highlight(s) (voice/laughter) detected")
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️ [Analyze] sound-highlight detection skipped: {_e}")
+
     # Update metadata with completion marker — only NOW does the cache count
     # as "already analyzed" (see the resume check above)
     metadata["analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")

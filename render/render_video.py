@@ -625,8 +625,123 @@ TRANSITION_PALETTE = {
 }
 
 
+_HAS_AUDIO_CACHE: dict = {}
+
+
+def _source_has_audio(path: str) -> bool:
+    """Whether a media file has an audio stream (drone footage often doesn't)."""
+    if path in _HAS_AUDIO_CACHE:
+        return _HAS_AUDIO_CACHE[path]
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20)
+        ok = "audio" in (r.stdout or "")
+    except Exception:  # noqa: BLE001
+        ok = False
+    _HAS_AUDIO_CACHE[path] = ok
+    return ok
+
+
+def _load_sound_highlights_for_source(video_path: str) -> list:
+    """Voice/laughter segments for a source video, from its analysis cache.
+
+    Located by file name (same mapping the web clip-map uses). If the analysis
+    dir exists but has no highlights yet (older annotation), they are computed
+    once here and cached there."""
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        analyzed = os.path.join(_root, "Output", "analyzed")
+        base = os.path.basename(video_path or "")
+        if not base or not os.path.isdir(analyzed) or not os.path.exists(video_path):
+            return []
+        import glob as _g
+        for md in _g.glob(os.path.join(analyzed, "*", "metadata.json")):
+            try:
+                with open(md, "r", encoding="utf-8") as f:
+                    if json.load(f).get("file_name") != base:
+                        continue
+            except Exception:  # noqa: BLE001
+                continue
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from src.audio.sound_highlights import detect_sound_highlights
+            return detect_sound_highlights(
+                video_path,
+                cache_path=os.path.join(os.path.dirname(md), "sound_highlights.json"))
+    except Exception as e:  # noqa: BLE001
+        print(f"(sound-highlight lookup failed for {os.path.basename(video_path or '')}: {e})")
+    return []
+
+
+def _boundary_durations(clips, transitions, transition_duration) -> list:
+    """Per-boundary visual overlap seconds (0 for hard cuts), len = n-1.
+    Must mirror _build_video_join_cmd's interpretation exactly."""
+    n = len(clips)
+    T = float(transition_duration or 0.0)
+    out = []
+    for k in range(n - 1):
+        d = 0.0
+        if transitions:
+            item = transitions[k] if k < len(transitions) else "cut"
+            if isinstance(item, dict):
+                name = str(item.get("transition", "cut")).strip() or "cut"
+                d = float(item.get("duration", 0.4) or 0.4) if name != "cut" else 0.0
+            else:
+                s = str(item).strip()
+                name, _, dd = s.partition(":")
+                if name and name != "cut":
+                    try:
+                        d = float(dd) if dd else 0.4
+                    except ValueError:
+                        d = 0.4
+        elif T > 0:
+            d = T
+        out.append(d)
+    return out
+
+
+def _compute_duck_windows(clips, transitions, transition_duration) -> list:
+    """Output-timeline windows where a clip's ORIGINAL audio carries voices —
+    the BGM ducks there and the real sound plays through. Mirrors the xfade
+    timeline math so windows stay aligned when transitions shorten the video."""
+    bdur = _boundary_durations(clips, transitions, transition_duration)
+    pos = []
+    S = 0.0
+    for k, c in enumerate(clips):
+        pos.append(S)
+        S += float(c.get("duration", 0.0)) - (bdur[k] if k < len(bdur) else 0.0)
+
+    windows = []
+    hl_cache: dict = {}
+    for k, c in enumerate(clips):
+        if c.get("is_ending") or c.get("is_intro"):
+            continue
+        src = c.get("video_path") or ""
+        if src not in hl_cache:
+            hl_cache[src] = _load_sound_highlights_for_source(src)
+        if not hl_cache[src]:
+            continue
+        s0, e0 = float(c.get("start_sec", 0.0)), float(c.get("end_sec", 0.0))
+        for h in hl_cache[src]:
+            ov_s = max(s0, float(h.get("start", 0)))
+            ov_e = min(e0, float(h.get("end", 0)))
+            if ov_e - ov_s >= 0.5:
+                windows.append([round(pos[k] + (ov_s - s0), 2),
+                                round(pos[k] + (ov_e - s0), 2)])
+    windows.sort()
+    merged: list = []
+    for a, b in windows:
+        if merged and a - merged[-1][1] < 0.4:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
 def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, transition_duration,
-                          transitions=None):
+                          transitions=None, with_audio=False):
     """ffmpeg command to join the per-clip files into one video.
 
     Default: hard-cut concat demuxer (stream copy) — unchanged behavior.
@@ -687,11 +802,29 @@ def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, t
                 parts.append(f"{prev}[v{k}]xfade=transition={name}:duration={dur}:offset={offset:.4f}{out}")
                 S += dk - dur
             prev = out
+        maps = ['-map', '[vout]']
+        acodec = []
+        if with_audio:
+            # audio timeline must match the xfade-shortened video: trim each
+            # clip's audio tail by its boundary's overlap, then hard-concat.
+            # Clips are extracted with a guaranteed audio stream (silent
+            # sources get anullsrc), so [k:a] always exists.
+            for k in range(n):
+                d_next = 0.0
+                if k < n - 1:
+                    b_name, b_dur = boundary[k]
+                    d_next = b_dur if b_name != "cut" else 0.0
+                adur = max(0.1, float(clips[k].get('duration', 0) or 0) - d_next)
+                parts.append(f"[{k}:a]atrim=duration={adur:.4f},asetpts=PTS-STARTPTS[ax{k}]")
+            parts.append("".join(f"[ax{k}]" for k in range(n)) + f"concat=n={n}:v=0:a=1[aout_src]")
+            maps += ['-map', '[aout_src]']
+            acodec = ['-c:a', 'aac', '-ar', '48000']
         return [
             'ffmpeg', '-y', *inputs,
             '-filter_complex', ";".join(parts),
-            '-map', '[vout]',
+            *maps,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
+            *acodec,
             '-r', str(video_fps), out_path,
         ]
     # default: fast hard-cut concat
@@ -731,6 +864,7 @@ def render_video_ffmpeg(
     target_tp: float = -1.5,
     transition_duration: float = 0.0,
     transitions: list = None,
+    duck_windows: list = None,
 ) -> bool:
     """
     Render video clips using ffmpeg concat demuxer.
@@ -1147,6 +1281,15 @@ def render_video_ffmpeg(
                         clip_file
                     ]
 
+            if duck_windows and not _source_has_audio(source_video):
+                # silent source (drone footage) — give the clip a REAL silent
+                # track so the audio concat/xfade chains stay homogeneous
+                j = cmd.index(source_video) + 1
+                cmd = (cmd[:j]
+                       + ['-f', 'lavfi', '-t', str(duration), '-i',
+                          f'anullsrc=channel_layout=stereo:sample_rate={audio_ar}']
+                       + cmd[j:-1] + ['-map', '0:v', '-map', '1:a'] + [clip_file])
+
             if verbose:
                 label_info = f" [S{section_idx + 1}-Shot{shot_idx + 1}]" if show_labels_for_clip else ""
                 print(f"  [{i+1}/{len(clips)}] {clip['start_str']} - {clip['end_str']} ({duration:.2f}s){label_info}")
@@ -1188,7 +1331,9 @@ def render_video_ffmpeg(
         if audio_path and os.path.exists(audio_path):
             # First join video clips (hard cut, or crossfade if transition_duration>0)
             temp_video = os.path.join(temp_dir, 'temp_video.mp4')
-            cmd = _build_video_join_cmd(concat_file, clip_files, clips, temp_video, video_fps, transition_duration, transitions)
+            cmd = _build_video_join_cmd(concat_file, clip_files, clips, temp_video, video_fps,
+                                        transition_duration, transitions,
+                                        with_audio=bool(duck_windows))
 
             result = subprocess.run(
                 cmd,
@@ -1218,7 +1363,13 @@ def render_video_ffmpeg(
             # Then mix with audio (with optional cropping)
             print(f"Mixing with audio: {audio_path}")
 
-            include_original_audio = (original_audio_volume > 0) or (hook_dialogue_duration > 0)
+            # duck windows need the temp video's own audio track; the hook-
+            # dialogue flow prepends a clip (shifting the timeline), so the
+            # two are mutually exclusive — dialogue mode wins.
+            if hook_dialogue_duration > 0:
+                duck_windows = []
+            include_original_audio = (original_audio_volume > 0) or (hook_dialogue_duration > 0) \
+                or bool(duck_windows)
             total_duration = temp_video_actual_duration if temp_video_actual_duration else sum(c['duration'] for c in clips)
             actual_outro_duration = sum(c['duration'] for c in clips if c.get('is_ending'))
             outro_duration = max(0.0, actual_outro_duration if actual_outro_duration > 0 else ending_duration)
@@ -1254,7 +1405,23 @@ def render_video_ffmpeg(
                 )
             else:
                 bgm_outro_fade_expr = "1.0"
+            # voice-highlight ducking: inside each window the BGM drops to 25%
+            # and the ORIGINAL audio fades in, with 0.3s ramps on both sides —
+            # real voices/laughter play over quiet music, then music returns
+            _DUCK_R = 0.3
+            duck_env = None
+            if duck_windows:
+                _terms = [
+                    f"max(0,min(1,min((t-{a - _DUCK_R:.2f})/{_DUCK_R},({b + _DUCK_R:.2f}-t)/{_DUCK_R})))"
+                    for a, b in duck_windows
+                ]
+                duck_env = "min(1,(" + "+".join(_terms) + "))"
+                print("Voice-highlight ducking at: "
+                      + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in duck_windows))
+
             bgm_volume_expr = f"({bgm_base_volume_expr})*({bgm_outro_fade_expr})"
+            if duck_env:
+                bgm_volume_expr = f"({bgm_volume_expr})*(1-0.75*{duck_env})"
 
             if audio_start_time is not None and audio_duration is not None:
                 print(f"Audio crop: {audio_start_time:.2f}s - {audio_start_time + audio_duration:.2f}s (duration: {audio_duration:.2f}s)")
@@ -1283,6 +1450,9 @@ def render_video_ffmpeg(
                     )
 
                 orig_volume_expr = f"if(lt(t,{hook_dialogue_duration}),1.0,{original_audio_volume})"
+                if duck_env:
+                    # original audio rises to full inside duck windows
+                    orig_volume_expr = f"min(1,({orig_volume_expr})+{duck_env})"
                 filter_parts = []
 
                 orig_input_label = "0:a"
@@ -1905,6 +2075,16 @@ def main():
         if transitions is None:
             print("AI transition selection unavailable — rendering with hard cuts")
 
+    # Voice highlights → BGM ducking windows (real voices/laughter play through)
+    duck_windows = []
+    try:
+        duck_windows = _compute_duck_windows(clips, transitions, args.transition)
+        if duck_windows:
+            print(f"🎙️  {len(duck_windows)} voice-highlight window(s) — BGM will duck there: "
+                  + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in duck_windows))
+    except Exception as _e:  # noqa: BLE001
+        print(f"(voice-highlight ducking skipped: {_e})")
+
     success = render_video_ffmpeg(
         video_path=args.video,
         clips=clips,
@@ -1938,6 +2118,7 @@ def main():
         target_tp=args.target_tp,
         transition_duration=args.transition,
         transitions=transitions,
+        duck_windows=duck_windows,
     )
 
     if success:
@@ -1957,6 +2138,7 @@ def main():
                     "start": round(float(audio_start_time or 0.0), 2),
                     "duration": round(float(audio_duration or 0.0), 2),
                 },
+                "duck_windows": [[round(a, 2), round(b, 2)] for a, b in (duck_windows or [])],
                 "clips": len(clips),
             }
             with open(os.path.splitext(args.output)[0] + ".render.json", "w", encoding="utf-8") as _mf:

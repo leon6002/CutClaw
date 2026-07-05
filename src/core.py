@@ -513,6 +513,11 @@ def fine_grained_shot_trimming(
         violent camera motion that still-frame descriptions cannot see). Prefer ranges scoring >=5;
         NEVER commit a range whose measured_quality is below 4 — such commits are auto-rejected.
 
+        Scenes may include "sound_highlight": the ORIGINAL audio there contains real voices /
+        laughter (measured, not guessed). For memory/travel montages these carry the emotion —
+        when content quality is comparable, PREFER a range with a sound_highlight; the renderer
+        will duck the music and let the real sound through.
+
     
     Args:
         time_range: String in format 'HH:MM:SS to HH:MM:SS' - the range to analyze
@@ -636,12 +641,23 @@ def fine_grained_shot_trimming(
         if _requested > 0 and _covered / _requested >= 0.8:
             internal = []
             from src.utils.stability import measure_stability, stability_verdict
+            from src.audio.sound_highlights import highlights_in_range
+            _shl = []
+            if frame_path:
+                _shl_path = os.path.join(os.path.dirname(frame_path), "sound_highlights.json")
+                if os.path.exists(_shl_path):
+                    try:
+                        with open(_shl_path, "r", encoding="utf-8") as _sf:
+                            _shl = json.load(_sf).get("segments", [])
+                    except Exception:  # noqa: BLE001
+                        pass
             for s_abs, e_abs, seg in _hits:
                 cs, ce = max(s_abs, start_sec), min(e_abs, end_sec)
                 # measured blur/violent-motion score — the VLM's still-frame
                 # quality guess cannot see this; the agent needs it to avoid
                 # picking degraded footage in the first place
                 _st = measure_stability(frame_path, cs, ce, samples=3) if frame_path else {"score": -1}
+                _voice = highlights_in_range(_shl, cs, ce)
                 parts = []
                 if seg.get("cut_type"):
                     parts.append(f"[{str(seg['cut_type']).upper()}]")
@@ -654,6 +670,11 @@ def fine_grained_shot_trimming(
                         "score": _st.get("score", -1),
                         "verdict": stability_verdict(_st.get("score", -1)),
                     },
+                    **({"sound_highlight": {
+                        "voice_segments": len(_voice),
+                        "note": "REAL voices/laughter in the original audio here — prime "
+                                "emotional material for a memory montage, PREFER this range",
+                    }} if _voice else {}),
                     "scene_time": f"{convert_seconds_to_hhmmss(cs)} to {convert_seconds_to_hhmmss(ce)}",
                     "description": " ".join(parts),
                     "cut_type": seg.get("cut_type", ""),
