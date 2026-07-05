@@ -30,8 +30,8 @@ interface Output {
 }
 
 const RATIOS = ["9:16", "16:9", "1:1"];
-// max preview width per ratio (height capped at 480 so player + chart fit side by side)
-const PREVIEW_W: Record<string, number> = { "9:16": 280, "16:9": 620, "1:1": 460 };
+// max preview width per ratio (script panel sits beside the player now)
+const PREVIEW_W: Record<string, number> = { "9:16": 330, "16:9": 820, "1:1": 540 };
 
 export default function RenderView({
   project, setProject, pipelineStatus, onOutputsCount,
@@ -289,65 +289,72 @@ export default function RenderView({
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {/* top: player (centered) */}
-            <div className="flex flex-col items-center">
-              {outputs.length > 1 && (
-                <div className="mb-2 flex gap-1.5 self-start">
-                  {outputs.map((o) => (
-                    <button
-                      key={o.ratio}
-                      className={cn(
-                        "rounded-md border px-2.5 py-1 text-xs transition-colors",
-                        o.ratio === activeOutput?.ratio
-                          ? "border-cyan-400/60 bg-cyan-400/15 font-semibold text-cyan-300"
-                          : "border-white/10 bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]",
-                      )}
-                      onClick={() => { setActiveRatio(o.ratio); setPlayhead(0); }}
-                    >
-                      {o.ratio}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {activeOutput ? (
-                <>
-                  <video
-                    ref={videoRef}
-                    key={activeOutput.ratio}
-                    src={mediaUrl(activeOutput.path) + `&t=${activeOutput.mtime}`} controls playsInline
-                    className="rounded-lg bg-black"
-                    style={{ maxHeight: 520, maxWidth: PREVIEW_W[activeOutput.ratio] ?? 720 }}
-                    onTimeUpdate={(e) => setPlayhead((e.target as HTMLVideoElement).currentTime)}
-                  />
-                  <div className="w-full" style={{ maxWidth: 720 }}>
-                    <ClipCaption clip={activeClip} />
+            {/* one-screen layout: player + timeline LEFT, script RIGHT */}
+            <div className="flex flex-wrap items-start gap-4">
+              <div className="min-w-[420px] flex-[3] basis-[620px]">
+                {outputs.length > 1 && (
+                  <div className="mb-2 flex gap-1.5">
+                    {outputs.map((o) => (
+                      <button
+                        key={o.ratio}
+                        className={cn(
+                          "rounded-md border px-2.5 py-1 text-xs transition-colors",
+                          o.ratio === activeOutput?.ratio
+                            ? "border-cyan-400/60 bg-cyan-400/15 font-semibold text-cyan-300"
+                            : "border-white/10 bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]",
+                        )}
+                        onClick={() => { setActiveRatio(o.ratio); setPlayhead(0); }}
+                      >
+                        {o.ratio}
+                      </button>
+                    ))}
                   </div>
-                  <div className="mt-2 flex items-center gap-2 text-xs text-slate-400">
-                    {activeOutput.ratio} · {activeOutput.size_mb}MB · {new Date(activeOutput.mtime * 1000).toLocaleString()}
-                    <Button asChild variant="outline" size="sm" className="h-6 gap-1 border-white/10 bg-white/[0.04] px-2 text-[11px]">
-                      <a href={mediaUrl(activeOutput.path)} download>
-                        <Download className="h-3 w-3" /> 下载
-                      </a>
-                    </Button>
+                )}
+                {activeOutput ? (
+                  <div className="flex flex-col items-center">
+                    <video
+                      ref={videoRef}
+                      key={activeOutput.ratio}
+                      src={mediaUrl(activeOutput.path) + `&t=${activeOutput.mtime}`} controls playsInline
+                      className="w-full rounded-lg bg-black"
+                      style={{ maxHeight: 560, maxWidth: PREVIEW_W[activeOutput.ratio] ?? 820 }}
+                      onTimeUpdate={(e) => setPlayhead((e.target as HTMLVideoElement).currentTime)}
+                    />
+                    <div className="w-full" style={{ maxWidth: PREVIEW_W[activeOutput.ratio] ?? 820 }}>
+                      <ClipCaption clip={activeClip} playhead={playhead} />
+                    </div>
+                    <div className="mt-2 flex items-center gap-2 text-xs text-slate-400">
+                      {activeOutput.ratio} · {activeOutput.size_mb}MB · {new Date(activeOutput.mtime * 1000).toLocaleString()}
+                      <Button asChild variant="outline" size="sm" className="h-6 gap-1 border-white/10 bg-white/[0.04] px-2 text-[11px]">
+                        <a href={mediaUrl(activeOutput.path)} download>
+                          <Download className="h-3 w-3" /> 下载
+                        </a>
+                      </Button>
+                    </div>
                   </div>
-                </>
-              ) : (
-                <div className="flex h-[180px] w-full items-center justify-center rounded-lg border border-dashed border-white/10 text-xs text-slate-500">
-                  还没有渲染结果 — 点击上方「渲染」
-                </div>
-              )}
-            </div>
+                ) : (
+                  <div className="flex h-[180px] w-full items-center justify-center rounded-lg border border-dashed border-white/10 text-xs text-slate-500">
+                    还没有渲染结果 — 点击上方「渲染」
+                  </div>
+                )}
 
-            {/* below: timeline chart (progress bar) + per-shot inspector, synced to playhead */}
-            <div className="mt-4">
-              <ShotTimeline
-                shotPoint={shotPoint} playhead={playhead}
-                transitions={activeOutput?.render_meta?.transitions ?? null}
-                audio={activeOutput?.render_meta?.audio ?? null}
-              />
-            </div>
-            <div className="mt-3">
-              <ClipInspector clips={clipMap} currentTime={playhead} error={clipMapError} onRetry={reloadClipMap} onSeek={seekTo} />
+                <div className="mt-4">
+                  <ShotTimeline
+                    shotPoint={shotPoint} playhead={playhead}
+                    transitions={activeOutput?.render_meta?.transitions ?? null}
+                    audio={activeOutput?.render_meta?.audio ?? null}
+                  />
+                </div>
+              </div>
+
+              {/* right: script list, own scroll, follows the playhead */}
+              <div className="min-w-[360px] flex-[2] basis-[400px]">
+                <ClipInspector
+                  clips={clipMap} currentTime={playhead} error={clipMapError}
+                  onRetry={reloadClipMap} onSeek={seekTo}
+                  maxHeight="calc(100vh - 240px)"
+                />
+              </div>
             </div>
           </CardContent>
         </Card>

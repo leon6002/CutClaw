@@ -72,18 +72,39 @@ export interface ClipMapEntry {
   analysis: string;  // what the VLM actually saw at this source range
 }
 
-// crude lexical overlap → flags picks that likely don't match their slot
+// crude lexical overlap → flags picks that likely don't match their slot.
+// NOTE: the Screenwriter writes imaginative prose while the VLM reports
+// literally, so overlap is naturally low — this can only catch EGREGIOUS
+// mismatches. Compare against every intent field and stem lightly to keep
+// false alarms down.
+const stem = (w: string) => w.replace(/(ing|ed|es|s)$/, "");
 function matchScore(intent: string, seen: string): number {
   const norm = (s: string) =>
     new Set(
       s.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/)
-        .filter((w) => w.length > 3),
+        .filter((w) => w.length > 3).map(stem),
     );
   const a = norm(intent), b = norm(seen);
-  if (a.size === 0 || b.size === 0) return -1;
+  if (a.size < 6 || b.size < 6) return -1;   // too little text to judge
   let hit = 0;
   a.forEach((w) => { if (b.has(w)) hit++; });
   return hit / a.size;
+}
+
+/** Split a dense VLM caption like "[312-313.5s] …. [313.5-315.5s] …" into
+ * timestamped segments; returns null when the text has no such markers. */
+export function parseDenseSegments(text: string): { a: number; b: number; t: string }[] | null {
+  const re = /\[(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*s?\]/g;
+  const marks: { a: number; b: number; idx: number; len: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    marks.push({ a: parseFloat(m[1]), b: parseFloat(m[2]), idx: m.index, len: m[0].length });
+  }
+  if (marks.length === 0) return null;
+  return marks.map((mk, i) => ({
+    a: mk.a, b: mk.b,
+    t: text.slice(mk.idx + mk.len, i + 1 < marks.length ? marks[i + 1].idx : undefined).trim(),
+  }));
 }
 
 export function useClipMap(shotPoint: string) {
@@ -106,21 +127,34 @@ export function activeClipAt(clips: ClipMapEntry[] | null, t: number): number {
   return clips.findIndex((c) => t >= c.out_start && t < c.out_end);
 }
 
-/** Live caption strip shown right under the playing video (never covers controls). */
-export function ClipCaption({ clip }: { clip: ClipMapEntry | null }) {
+/** Live caption strip shown right under the playing video (never covers controls).
+ * Dense VLM captions hold several timestamped segments — show ONLY the one
+ * covering the current source-time instead of cramming them all together. */
+export function ClipCaption({ clip, playhead = -1 }: { clip: ClipMapEntry | null; playhead?: number }) {
   const [zh] = useZhFlag();
   const zhMap = useZh([clip?.analysis, clip?.content], zh);
   const raw = clip?.analysis || clip?.content || "";
   const text = (zh && zhMap[raw]) || raw;
+
+  let shown = text;
+  let segTag = "";
+  const segs = text ? parseDenseSegments(text) : null;
+  if (segs && clip && playhead >= 0 && clip.src_start !== null) {
+    const srcT = clip.src_start + Math.max(0, playhead - clip.out_start);
+    const seg = segs.find((s) => srcT >= s.a && srcT < s.b) ?? segs[0];
+    shown = seg.t;
+    segTag = `${seg.a}–${seg.b}s`;
+  }
   return (
     <div className="mt-1.5 min-h-[46px] w-full rounded-lg border border-white/[0.06] bg-black/30 px-3 py-1.5">
       {clip ? (
         <>
           <div className="text-[10px] font-medium tracking-wide text-cyan-300">
             {clip.video} · 源 {clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s
+            {segTag && <span className="ml-1.5 text-slate-500">当前 [{segTag}]</span>}
           </div>
           <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-slate-300">
-            {text || "（无描述）"}
+            {shown || "（无描述）"}
           </div>
         </>
       ) : (
@@ -132,11 +166,13 @@ export function ClipCaption({ clip }: { clip: ClipMapEntry | null }) {
 
 /** Full inspector list synced to playhead. */
 export function ClipInspector({
-  clips, currentTime, error, onRetry, onSeek,
+  clips, currentTime, error, onRetry, onSeek, maxHeight = "440px",
 }: {
   clips: ClipMapEntry[] | null; currentTime: number;
   error?: string; onRetry?: () => void;
   onSeek?: (t: number) => void;
+  /** CSS max-height of the scrolling list (e.g. "calc(100vh - 260px)") */
+  maxHeight?: string;
 }) {
   const activeIdx = useMemo(() => activeClipAt(clips, currentTime), [clips, currentTime]);
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -196,11 +232,13 @@ export function ClipInspector({
           >原文</button>
         </div>
       </div>
-    <div ref={listRef} className="max-h-[440px] space-y-1.5 overflow-y-auto pr-1">
+    <div ref={listRef} className="space-y-1.5 overflow-y-auto pr-1" style={{ maxHeight }}>
       {clips.map((c, i) => {
         const active = i === activeIdx;
-        const score = matchScore(c.content, c.analysis);
-        const mismatch = score >= 0 && score < 0.12 && !!c.analysis;
+        // judge against EVERYTHING the Screenwriter specified, not just content
+        const intent = [c.content, c.visuals, c.visual_beat, c.emotion].filter(Boolean).join(" ");
+        const score = matchScore(intent, c.analysis);
+        const mismatch = score >= 0 && score < 0.06 && !!c.analysis;
         return (
           <div
             key={i}
@@ -228,12 +266,15 @@ export function ClipInspector({
                 </span>
               </div>
               {mismatch && (
-                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                <span
+                  className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+                  title="启发式提示：剧本描述与 VLM 画面描述几乎没有词汇重叠。编剧文案偏创意、VLM 偏字面，轻度不重叠是正常的——只有这种极端情况才标记，建议点击跳转人工确认。"
+                >
                   ⚠ 素材可能不符
                 </span>
               )}
             </div>
-            <div className="mt-1.5 grid grid-cols-1 gap-1 sm:grid-cols-2">
+            <div className="mt-1.5 grid grid-cols-1 gap-1">
               <div className="rounded bg-black/20 px-2 py-1">
                 <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
                 <div className="text-[11px] leading-snug text-slate-300">{disp(c.content) || "—"}</div>
