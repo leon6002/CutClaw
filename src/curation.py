@@ -20,7 +20,7 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 3   # v3: stability score gained an apparent-speed penalty — re-score
+_POOL_VERSION = 4   # v4: per-second scan trims camera-adjustment wobble off moments
 
 
 def _source_pool(content_hash: str) -> list:
@@ -111,7 +111,24 @@ def _source_pool(content_hash: str) -> list:
             continue          # VLM already flagged it weak — not pool material
         stab = -1.0
         stab_detail = {}
+        trimmed = False
         if can_measure:
+            # per-second scan: a segment often contains a 1-2s framing
+            # adjustment (violent wobble) that a whole-range median hides.
+            # TRIM the moment to its longest clean run instead of averaging
+            # the wobble away — this is the user's core ask: keep only the
+            # genuinely good part of each take.
+            from src.utils.stability import quality_per_second, longest_clean_run
+            _ps = quality_per_second(src_path, s, e)
+            _i0, _i1 = longest_clean_run(_ps, floor=3.5)
+            if _i1 - _i0 <= 0:
+                continue      # no clean second at all — pure adjustment take
+            _ns, _ne = _ps[_i0]["t"], min(e, _ps[_i1 - 1]["t"] + 1.0)
+            if (_ns, _ne) != (s, e):
+                trimmed = True
+                s, e = _ns, _ne
+            if e - s < 1.6:
+                continue      # clean core too short to be a usable moment
             _st = measure_stability(src_path, s, e, samples=3)
             stab = float(_st.get("score", -1))
             stab_detail = {"rel_sharp": _st.get("rel_sharp"),
@@ -142,6 +159,7 @@ def _source_pool(content_hash: str) -> list:
             "sound": bool(voice),
             "people": people,
             "score": round(score, 3),
+            "trimmed": trimmed,   # wobbly edges were cut off this moment
             "capture_time": _ct.strftime("%Y-%m-%dT%H:%M:%S") if _ct else None,
         })
 

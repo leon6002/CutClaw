@@ -125,6 +125,39 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
     }
 
 
+def quality_per_second(video_path: str, start_sec: float, end_sec: float) -> list:
+    """Per-second quality scores across a range — the 'camera adjusting'
+    detector. Segment-level medians hide a 1-2s framing wobble inside an
+    otherwise fine segment; scanning second by second exposes it so the
+    moment can be TRIMMED to its clean core. Windows are range-cached, so
+    overlapping moments share the work."""
+    out = []
+    t = float(start_sec)
+    while t < end_sec - 0.4:
+        w_end = min(t + 1.0, end_sec)
+        st = measure_stability(video_path, t, w_end, samples=1)
+        out.append({"t": round(t, 1), "score": st.get("score", -1)})
+        t += 1.0
+    return out
+
+
+def longest_clean_run(per_sec: list, floor: float = 3.5) -> tuple:
+    """(start_idx, end_idx_exclusive) of the longest contiguous run of seconds
+    scoring >= floor (unmeasured seconds count as clean)."""
+    best = (0, 0)
+    run_start = None
+    for i, p in enumerate(per_sec + [{"score": -999}]):
+        ok = p["score"] < 0 or p["score"] >= floor
+        if i < len(per_sec) and ok:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start > best[1] - best[0]:
+                best = (run_start, i)
+            run_start = None
+    return best
+
+
 def stability_verdict(score: float) -> str:
     """Self-explanatory label the agent can act on without extra prompt text."""
     if score < 0:
