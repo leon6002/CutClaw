@@ -1,6 +1,61 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 
+// ── auto-translation (EN → 中文, server-cached, billed once per string) ─────
+const zhMem = new Map<string, string>();   // in-tab memo on top of the disk cache
+const ZH_KEY = "cutclaw_zh";
+const ZH_EVT = "cutclaw-zh-changed";
+
+export const zhEnabled = () => localStorage.getItem(ZH_KEY) !== "0";
+export const setZhEnabled = (on: boolean) => {
+  localStorage.setItem(ZH_KEY, on ? "1" : "0");
+  window.dispatchEvent(new Event(ZH_EVT));
+};
+
+/** true for text worth translating: has real English words, not already Chinese */
+const translatable = (t?: string): t is string =>
+  !!t && /[a-zA-Z]{4}/.test(t) && !/[一-鿿]/.test(t.slice(0, 120));
+
+/** Subscribe to the global 中/EN toggle. */
+export function useZhFlag(): [boolean, (on: boolean) => void] {
+  const [on, setOn] = useState(zhEnabled());
+  useEffect(() => {
+    const h = () => setOn(zhEnabled());
+    window.addEventListener(ZH_EVT, h);
+    return () => window.removeEventListener(ZH_EVT, h);
+  }, []);
+  return [on, setZhEnabled];
+}
+
+/** Batch-translate the given texts; returns original→中文 map (grows as results land). */
+export function useZh(texts: (string | undefined)[], enabled: boolean): Record<string, string> {
+  const [map, setMap] = useState<Record<string, string>>({});
+  const sig = texts.filter(translatable).join("");
+  useEffect(() => {
+    if (!enabled) return;
+    const wanted = [...new Set(texts.filter(translatable))];
+    if (wanted.length === 0) return;
+    const fromMem: Record<string, string> = {};
+    wanted.forEach((t) => { const z = zhMem.get(t); if (z) fromMem[t] = z; });
+    const todo = wanted.filter((t) => !zhMem.has(t));
+    if (Object.keys(fromMem).length) setMap((m) => ({ ...m, ...fromMem }));
+    if (todo.length === 0) return;
+    let dead = false;
+    api<{ translations: string[] }>("/api/translate", {
+      method: "POST", body: JSON.stringify({ texts: todo }),
+    }).then((r) => {
+      const add: Record<string, string> = {};
+      todo.forEach((t, i) => {
+        const z = r.translations[i];
+        if (z) { zhMem.set(t, z); add[t] = z; }
+      });
+      if (!dead && Object.keys(add).length) setMap((m) => ({ ...m, ...add }));
+    }).catch(() => {});
+    return () => { dead = true; };
+  }, [sig, enabled]);
+  return map;
+}
+
 export interface ClipMapEntry {
   out_start: number;
   out_end: number;
@@ -53,6 +108,10 @@ export function activeClipAt(clips: ClipMapEntry[] | null, t: number): number {
 
 /** Live caption strip shown right under the playing video (never covers controls). */
 export function ClipCaption({ clip }: { clip: ClipMapEntry | null }) {
+  const [zh] = useZhFlag();
+  const zhMap = useZh([clip?.analysis, clip?.content], zh);
+  const raw = clip?.analysis || clip?.content || "";
+  const text = (zh && zhMap[raw]) || raw;
   return (
     <div className="mt-1.5 min-h-[46px] w-full rounded-lg border border-white/[0.06] bg-black/30 px-3 py-1.5">
       {clip ? (
@@ -61,7 +120,7 @@ export function ClipCaption({ clip }: { clip: ClipMapEntry | null }) {
             {clip.video} · 源 {clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s
           </div>
           <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-slate-300">
-            {clip.analysis || clip.content || "（无描述）"}
+            {text || "（无描述）"}
           </div>
         </>
       ) : (
@@ -81,6 +140,12 @@ export function ClipInspector({
 }) {
   const activeIdx = useMemo(() => activeClipAt(clips, currentTime), [clips, currentTime]);
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const [zh, setZh] = useZhFlag();
+  const zhMap = useZh(
+    (clips ?? []).flatMap((c) => [c.content, c.analysis]),
+    zh && !!clips?.length,
+  );
+  const disp = (t?: string) => (zh && t && zhMap[t]) || t;
 
   useEffect(() => {
     if (activeIdx >= 0) {
@@ -106,6 +171,20 @@ export function ClipInspector({
   }
 
   return (
+    <div>
+      <div className="mb-1.5 flex items-center justify-end gap-1">
+        <span className="text-[10px] text-slate-600">AI 描述</span>
+        <div className="flex overflow-hidden rounded-md border border-white/10">
+          <button
+            className={"px-2 py-0.5 text-[10.5px] " + (zh ? "bg-cyan-500/15 text-cyan-300" : "text-slate-500 hover:text-slate-300")}
+            onClick={() => setZh(true)} title="自动翻译为中文（翻译一次后永久缓存）"
+          >中文</button>
+          <button
+            className={"px-2 py-0.5 text-[10.5px] " + (!zh ? "bg-cyan-500/15 text-cyan-300" : "text-slate-500 hover:text-slate-300")}
+            onClick={() => setZh(false)} title="显示模型原始英文输出"
+          >原文</button>
+        </div>
+      </div>
     <div className="max-h-[440px] space-y-1.5 overflow-y-auto pr-1">
       {clips.map((c, i) => {
         const active = i === activeIdx;
@@ -146,18 +225,19 @@ export function ClipInspector({
             <div className="mt-1.5 grid grid-cols-1 gap-1 sm:grid-cols-2">
               <div className="rounded bg-black/20 px-2 py-1">
                 <div className="text-[9px] uppercase tracking-wider text-fuchsia-400/70">编剧想要</div>
-                <div className="text-[11px] leading-snug text-slate-300">{c.content || "—"}</div>
+                <div className="text-[11px] leading-snug text-slate-300">{disp(c.content) || "—"}</div>
               </div>
               <div className="rounded bg-black/20 px-2 py-1">
                 <div className="text-[9px] uppercase tracking-wider text-emerald-400/70">VLM 实际看到</div>
                 <div className="text-[11px] leading-snug text-slate-300">
-                  {c.analysis || <span className="text-slate-500">（该源时间段无缓存 → 编辑时现调 VLM）</span>}
+                  {disp(c.analysis) || <span className="text-slate-500">（该源时间段无缓存 → 编辑时现调 VLM）</span>}
                 </div>
               </div>
             </div>
           </div>
         );
       })}
+    </div>
     </div>
   );
 }

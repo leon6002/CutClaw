@@ -2296,6 +2296,88 @@ def _ts_to_sec(v) -> float:
         return float("nan")
 
 
+# ── UI translation (English analysis text → Chinese), disk-cached ──────────
+# Each unique string is billed exactly once (cheap flash model), then served
+# from Output/cache/translations_zh.json forever.
+_TRANSLATE_PATH = os.path.join(PROJECT_ROOT, "Output", "cache", "translations_zh.json")
+_TRANSLATE_LOCK = threading.Lock()
+
+
+class TranslateRequest(BaseModel):
+    texts: list[str] = []
+
+
+def _tr_load() -> dict:
+    try:
+        with open(_TRANSLATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _tr_key(t: str) -> str:
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:16]
+
+
+@app.post("/api/translate")
+def translate_texts(body: TranslateRequest):
+    texts = [t for t in (body.texts or []) if isinstance(t, str) and t.strip()]
+    if not texts:
+        return {"translations": []}
+    from src import config as _cfg
+    with _TRANSLATE_LOCK:
+        cache = _tr_load()
+    out: dict[str, str] = {}
+    todo: list[str] = []
+    for t in texts:
+        k = _tr_key(t)
+        if k in cache:
+            out[t] = cache[k]
+        elif t not in out and t not in todo:
+            todo.append(t)
+
+    if todo:
+        import litellm
+        new_entries: dict[str, str] = {}
+        CHUNK = 25
+        for i in range(0, len(todo), CHUNK):
+            chunk = todo[i:i + CHUNK]
+            prompt = (
+                "把下面 JSON 数组中的每段英文视频/音频描述翻译成简洁自然的中文。"
+                "保留时间戳标记（如 [47-51s]、00:01:20）原样不动。"
+                "只输出一个 JSON 数组，元素与输入一一对应，不要输出任何其他内容。\n\n"
+                + json.dumps(chunk, ensure_ascii=False)
+            )
+            try:
+                r = litellm.completion(
+                    model=getattr(_cfg, "TRANSLATE_MODEL", "deepseek/deepseek-v4-flash"),
+                    api_base=getattr(_cfg, "TRANSLATE_ENDPOINT", "https://api.deepseek.com/v1"),
+                    api_key=getattr(_cfg, "TRANSLATE_API_KEY", ""),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2, max_tokens=4000, timeout=90,
+                )
+                raw = (r.choices[0].message.content or "").strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw)
+                arr = json.loads(raw)
+                if isinstance(arr, list) and len(arr) == len(chunk):
+                    for src, zh in zip(chunk, arr):
+                        if isinstance(zh, str) and zh.strip():
+                            out[src] = zh.strip()
+                            new_entries[_tr_key(src)] = zh.strip()
+            except Exception as e:  # noqa: BLE001
+                print(f"[translate] chunk failed: {str(e)[:200]}")
+        if new_entries:
+            with _TRANSLATE_LOCK:
+                cache = _tr_load()
+                cache.update(new_entries)
+                os.makedirs(os.path.dirname(_TRANSLATE_PATH), exist_ok=True)
+                with open(_TRANSLATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False)
+
+    return {"translations": [out.get(t, "") for t in texts]}
+
+
 @app.get("/api/render/clip_map")
 def render_clip_map(shot_point: str):
     """Map the finished-video timeline → each source clip + the AI description

@@ -408,6 +408,12 @@ AGENT_LITELLM_API_KEY = "sk-11bedec4d36c44e6b374baa3c55a83dc"
 AGENT_LITELLM_MODEL = "deepseek/deepseek-v4-pro"
 # Primary model for the agent.
 
+TRANSLATE_MODEL = "deepseek/deepseek-v4-flash"
+# Cheap model for UI translation of English analysis text → Chinese.
+
+TRANSLATE_ENDPOINT = "https://api.deepseek.com/v1"
+TRANSLATE_API_KEY = AGENT_LITELLM_API_KEY
+
 PARALLEL_SHOT_ENABLED = True
 # Whether to enable parallel shot selection (ParallelShotOrchestrator) in film mode.
 
