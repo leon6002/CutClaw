@@ -41,31 +41,44 @@ _CACHE_VERSION = 2   # v1 = pyin-only detector (missed outdoor voices) — stale
 _SILERO = None       # lazy singleton
 
 
-def detect_sound_highlights(media_path: str, cache_path: str | None = None) -> list:
+def _default_threshold() -> float:
+    try:
+        from src import config
+        return float(getattr(config, "SOUND_HIGHLIGHT_THRESHOLD", 0.5))
+    except Exception:  # noqa: BLE001
+        return 0.5
+
+
+def detect_sound_highlights(media_path: str, cache_path: str | None = None,
+                            threshold: float | None = None) -> list:
     """Detect voice/laughter segments in a media file's audio track.
 
-    Returns a list of segments; [] when the file has no usable audio.
-    When cache_path is given, results are read from / written to it.
+    threshold: Silero VAD sensitivity (default config.SOUND_HIGHLIGHT_THRESHOLD).
+    LOWER = more sensitive AND wider segment boundaries (quiet speech tails
+    stay in). Cached results remember the threshold they were computed with —
+    a different threshold re-detects instead of returning stale ranges.
 
     The actual detection ALWAYS runs in a child process: loading torch
     (Silero) into a host that already holds another OpenMP runtime (numpy/
     MKL in the API server, decord in renders) can hard-abort the whole
     process on Windows with no traceback. Callers only ever parse JSON.
     """
+    thr = float(threshold) if threshold is not None else _default_threshold()
     if cache_path and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if int(d.get("version", 1)) >= _CACHE_VERSION:
+            if (int(d.get("version", 1)) >= _CACHE_VERSION
+                    and abs(float(d.get("threshold", 0.5)) - thr) < 1e-6):
                 return d.get("segments", [])
-            # older detector version → fall through and re-detect
+            # older detector version or different threshold → re-detect
         except Exception:  # noqa: BLE001
             pass
     try:
         if os.environ.get("CUTCLAW_SHL_WORKER"):
-            segs = _detect(media_path)          # we ARE the isolated worker
+            segs = _detect(media_path, thr)     # we ARE the isolated worker
         else:
-            segs = _detect_via_subprocess(media_path)
+            segs = _detect_via_subprocess(media_path, thr)
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ [SoundHL] detection failed for {os.path.basename(media_path)}: {str(e)[:150]}")
         return []
@@ -73,20 +86,20 @@ def detect_sound_highlights(media_path: str, cache_path: str | None = None) -> l
         try:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"version": _CACHE_VERSION, "segments": segs}, f,
-                          ensure_ascii=False, indent=1)
+                json.dump({"version": _CACHE_VERSION, "threshold": thr,
+                           "segments": segs}, f, ensure_ascii=False, indent=1)
         except Exception:  # noqa: BLE001
             pass
     return segs
 
 
-def _detect_via_subprocess(media_path: str) -> list:
+def _detect_via_subprocess(media_path: str, threshold: float) -> list:
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     code = (
         "import json, sys\n"
         f"sys.path.insert(0, {root!r})\n"
         "from src.audio.sound_highlights import _detect\n"
-        f"print('SHL_JSON:' + json.dumps(_detect({media_path!r})))\n"
+        f"print('SHL_JSON:' + json.dumps(_detect({media_path!r}, {threshold!r})))\n"
     )
     env = os.environ.copy()
     env["CUTCLAW_SHL_WORKER"] = "1"
@@ -121,7 +134,7 @@ def _extract_wav(media_path: str) -> str:
     return wav
 
 
-def _detect(media_path: str) -> list:
+def _detect(media_path: str, threshold: float = 0.5) -> list:
     import librosa
 
     # drones (DJI aerials) usually record NO audio at all — that's normal,
@@ -140,13 +153,13 @@ def _detect(media_path: str) -> list:
     if y.size < sr:          # under a second of audio
         return []
 
-    segs = _detect_silero(y, sr)
+    segs = _detect_silero(y, sr, threshold)
     if segs is not None:
         return segs
     return _detect_heuristic(y, sr)
 
 
-def _detect_silero(y, sr) -> list | None:
+def _detect_silero(y, sr, threshold: float = 0.5) -> list | None:
     """Silero VAD path. Returns None when silero is unavailable (→ fallback)."""
     global _SILERO
     try:
@@ -156,9 +169,11 @@ def _detect_silero(y, sr) -> list | None:
             _SILERO = load_silero_vad()
         ts = get_speech_timestamps(
             torch.from_numpy(y.astype(np.float32)), _SILERO, sampling_rate=sr,
-            return_seconds=True, threshold=0.5,
-            # laughter bursts are short — don't gate them out
-            min_speech_duration_ms=300, min_silence_duration_ms=600)
+            return_seconds=True, threshold=float(threshold),
+            # laughter bursts are short — don't gate them out; pad widens
+            # boundaries so quiet speech tails survive into the duck window
+            min_speech_duration_ms=300, min_silence_duration_ms=600,
+            speech_pad_ms=200)
     except ImportError:
         return None
     except Exception as e:  # noqa: BLE001

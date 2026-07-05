@@ -1,5 +1,14 @@
 import os
 
+# ------------------ Secrets (.env) ------------------ #
+# API keys must NOT be written as literals in this file — it is tracked by git
+# and keys have leaked through it before. Real values live in the gitignored
+# project-root .env (copy .env.example to get started). The UI config writers
+# detect the os.getenv(...) form below and redirect edits into .env
+# (see src/utils/env_keys.py).
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 # ==============================================================================
 # CutClaw global configuration (beginner-friendly version)
 # ------------------------------------------------------------------------------
@@ -176,14 +185,14 @@ SCENE_PROMPT_TYPE = VIDEO_TYPE
 VIDEO_ANALYSIS_MODEL_MAX_TOKEN = 16384 
 # Max output token count for the video analysis model.
 
-VIDEO_ANALYSIS_MODEL = "openai/[L]gemini-3-flash-preview"
+VIDEO_ANALYSIS_MODEL = "gemini/gemini-flash-latest"
 # Video semantic analysis model name (called via OpenAI-compatible endpoint).
 
-VIDEO_ANALYSIS_ENDPOINT = "https://bboluo.com/v1"
+VIDEO_ANALYSIS_ENDPOINT = ""
 # API base URL for the video analysis model.
 
-VIDEO_ANALYSIS_API_KEY = "sk-y0kMdDUN7Ns13P8KDBMGB42hO7bjAb8LtlrVXAThHGGwFapL"
-# API key for the video analysis model.
+VIDEO_ANALYSIS_API_KEY = os.getenv("VIDEO_ANALYSIS_API_KEY", "")
+# API key for the video analysis model. Value lives in .env — never inline here.
 
 CAPTION_BATCH_SIZE = 64
 # Batch size for parallel clip captioning/analysis.
@@ -191,8 +200,8 @@ CAPTION_BATCH_SIZE = 64
 # ── Immich integration ──────────────────────────────────────────────────────
 IMMICH_URL = "http://127.0.0.1:2284"
 # Immich server base URL (no trailing /api).
-IMMICH_API_KEY = "W5pz9hmfuosYcXdNUmRmLM6nGAb2tfYMWSR3wmBMVmo"
-# API key — needs asset.read/view/download + search permissions only.
+IMMICH_API_KEY = os.getenv("IMMICH_API_KEY", "")
+# API key — needs asset.read/view/download + search permissions only. Lives in .env.
 IMMICH_PATH_MAP = ""
 # Optional "container_prefix::host_prefix" mapping (e.g. "/data/upload::D:/immich/upload")
 # to read ORIGINALS directly from the Immich volume at render time (zero-copy).
@@ -204,7 +213,7 @@ VIDEO_CAPTION_MAX_FRAMES = 24
 # sample measured ~57k input tokens per call (~1.1k/frame); 24 smart frames
 # ≈ 27k with near-lossless content coverage. Set 0 to disable the cap.
 
-ANNOTATE_VIDEO_WORKERS = 2
+ANNOTATE_VIDEO_WORKERS = 3
 # Videos annotated in parallel during batch annotation (separate PROCESSES —
 # decord isn't thread-safe and the GIL blocks CPU-bound threads). Each worker
 # owns one video end-to-end. Cap is effectively the VLM provider's rate limit;
@@ -218,13 +227,13 @@ SCENE_ANALYSIS_MIN_FRAMES = 6
 # ------------------ Audio Model ------------------ #
 # Analyzes musical beat/energy/structure and outputs editing keypoints.
 
-AUDIO_LITELLM_MODEL = "deepseek/deepseek-v4-pro"
+AUDIO_LITELLM_MODEL = "gemini/gemini-flash-latest"
 # Cloud model used for audio captioning and structure analysis.
 
-AUDIO_LITELLM_API_KEY = "sk-11bedec4d36c44e6b374baa3c55a83dc"
-# API key for the audio model.
+AUDIO_LITELLM_API_KEY = os.getenv("AUDIO_LITELLM_API_KEY", "")
+# API key for the audio model. Value lives in .env — never inline here.
 
-AUDIO_LITELLM_BASE_URL = "https://api.deepseek.com/v1"
+AUDIO_LITELLM_BASE_URL = ""
 # API base URL for the audio model.
 
 AUDIO_DETECTION_METHODS = ["downbeat", "pitch", "mel_energy"]
@@ -402,8 +411,8 @@ CORE_MAX_FRAMES = 60
 AGENT_LITELLM_URL = "https://api.deepseek.com/v1"
 # API base URL for the agent LLM.
 
-AGENT_LITELLM_API_KEY = "sk-11bedec4d36c44e6b374baa3c55a83dc"
-# API key for the agent LLM.
+AGENT_LITELLM_API_KEY = os.getenv("AGENT_LITELLM_API_KEY", "")
+# API key for the agent LLM. Value lives in .env — never inline here.
 
 AGENT_LITELLM_MODEL = "deepseek/deepseek-v4-pro"
 # Primary model for the agent.
@@ -413,6 +422,10 @@ TRANSLATE_MODEL = "deepseek/deepseek-v4-flash"
 
 TRANSLATE_ENDPOINT = "https://api.deepseek.com/v1"
 TRANSLATE_API_KEY = AGENT_LITELLM_API_KEY
+
+SOUND_HIGHLIGHT_THRESHOLD = 0.5
+# Silero VAD sensitivity for voice/laughter detection (0-1). LOWER = more
+# sensitive and WIDER segments (0.35 灵敏 / 0.5 标准 / 0.65 严格).
 
 STABILITY_CHECK_ENABLED = True
 # Measured footage-quality gate (motion blur / violent camera motion),
@@ -508,4 +521,6 @@ ASSET_MAX_IMAGES_TO_SELECT = 10
 ASSET_IMAGE_DURATION_SEC = 3.0
 # Duration per still image when converting to slideshow video.
 
+AUDIO_POOL_REF = "gemini(google)"
 
+VISION_POOL_REF = "gemini(google)"

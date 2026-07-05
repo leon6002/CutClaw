@@ -230,15 +230,21 @@ function DetailView({
   // annotation track: cloud (API) vs local VLM — two parallel, persisted results
   const [track, setTrack] = useState<"cloud" | "local">("cloud");
   const [shlBusy, setShlBusy] = useState(false);
+  // VAD sensitivity: lower = more sensitive + wider segments
+  const [shlThr, setShlThr] = useState(() => Number(localStorage.getItem("cutclaw_shl_thr") || 0.5));
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  const detectHighlights = async () => {
+  const detectHighlights = async (thr = shlThr) => {
     if (!asset) return;
     setShlBusy(true);
     try {
       const r = await api<{ segments: any[] }>("/api/assets/sound_highlights", {
         method: "POST",
-        body: JSON.stringify({ content_hash: asset.content_hash, path: asset.absolute_path || asset.file_path }),
+        body: JSON.stringify({
+          content_hash: asset.content_hash,
+          path: asset.absolute_path || asset.file_path,
+          threshold: thr,
+        }),
       });
       setDetails((d) => ({ ...(d ?? { clips: [], scenes: [] }), sound_highlights: r.segments }));
     } catch { /* surfaced by the empty state */ }
@@ -355,17 +361,34 @@ function DetailView({
           {asset.asset_type === "video" && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <span className="text-[11px] font-semibold text-violet-300">🎙 声音高光</span>
-              {details?.sound_highlights === undefined ? (
-                <Button
-                  variant="outline" size="sm"
-                  className="h-6 gap-1 border-violet-500/30 bg-violet-500/[0.06] px-2 text-[11px] text-violet-300"
-                  disabled={shlBusy} onClick={detectHighlights}
-                  title="信号分析检测原声里的人声/笑声段（一次检测永久缓存）"
-                >
-                  {shlBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-                  {shlBusy ? "检测中…" : "检测"}
-                </Button>
-              ) : (details.sound_highlights.length === 0 ? (
+              {/* sensitivity: lower threshold = catches quieter voices + wider ranges */}
+              <div className="flex overflow-hidden rounded-md border border-white/10">
+                {([[0.3, "灵敏"], [0.4, "较灵敏"], [0.5, "标准"], [0.65, "严格"]] as const).map(([v, label]) => (
+                  <button
+                    key={v}
+                    className={"px-1.5 py-0.5 text-[10px] " + (Math.abs(shlThr - v) < 0.01
+                      ? "bg-violet-500/20 text-violet-200"
+                      : "text-slate-500 hover:text-slate-300")}
+                    title={`VAD 阈值 ${v} — 越低越灵敏、段落范围越宽`}
+                    onClick={() => {
+                      setShlThr(v); localStorage.setItem("cutclaw_shl_thr", String(v));
+                      detectHighlights(v);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <Button
+                variant="outline" size="sm"
+                className="h-6 gap-1 border-violet-500/30 bg-violet-500/[0.06] px-2 text-[11px] text-violet-300"
+                disabled={shlBusy} onClick={() => detectHighlights()}
+                title="用当前灵敏度检测原声里的人声/笑声（同灵敏度的结果有缓存）"
+              >
+                {shlBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                {shlBusy ? "检测中…" : details?.sound_highlights === undefined ? "检测" : "重新检测"}
+              </Button>
+              {details?.sound_highlights !== undefined && (details.sound_highlights.length === 0 ? (
                 <span className="text-[11px] text-slate-600">未检测到人声/笑声（无人机素材通常没有音轨）</span>
               ) : (
                 details.sound_highlights.map((h: any, i: number) => (

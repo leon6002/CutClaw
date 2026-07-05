@@ -1151,6 +1151,7 @@ def asset_details(content_hash: str, variant: str = ""):
 class SoundHighlightRequest(BaseModel):
     content_hash: str
     path: str          # media path the player already uses
+    threshold: float | None = None   # VAD sensitivity; lower = wider segments
 
 
 @app.post("/api/assets/sound_highlights")
@@ -1170,7 +1171,8 @@ def asset_sound_highlights(body: SoundHighlightRequest):
         raise HTTPException(400, "该素材还没有分析缓存 — 先标注一次")
     from src.audio.sound_highlights import detect_sound_highlights
     segs = detect_sound_highlights(
-        abs_path, cache_path=os.path.join(cache_dir, "sound_highlights.json"))
+        abs_path, cache_path=os.path.join(cache_dir, "sound_highlights.json"),
+        threshold=body.threshold)
     return {"segments": segs}
 
 
