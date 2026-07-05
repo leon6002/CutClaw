@@ -145,6 +145,19 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
     for _attempt in range(1, _max_retries + 1):
         try:
             resp = litellm.completion(**kwargs)
+            # DETERMINISTIC failure — don't blind-retry, retry CHANGED:
+            # finish_reason=length means the reply was cut off by max_tokens
+            # (reasoning models spend thinking tokens from the same budget).
+            # Re-sending the identical request loses identically; feedback
+            # loops even make it worse (longer prompt → more thinking →
+            # less output). Double the budget and go again instead.
+            _fr = getattr(resp.choices[0], "finish_reason", "") or ""
+            if _fr == "length" and kwargs.get("max_tokens", 0) < 65536:
+                kwargs["max_tokens"] = min(int(kwargs["max_tokens"] * 2), 65536)
+                print(f"⚠️ [Screenwriter] reply truncated at max_tokens "
+                      f"(finish_reason=length) — retrying with {kwargs['max_tokens']} tokens",
+                      flush=True)
+                continue
             break
         except Exception as _e:
             _msg = str(_e)[:300]
