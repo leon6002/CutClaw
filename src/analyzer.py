@@ -125,11 +125,15 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         prompt = _dense_tmpl.replace(
             "MAIN_CHARACTER_NAME_PLACEHOLDER", "the subject"
         ).replace("MIN_SEGMENT_DURATION_PLACEHOLDER", str(max(2.0, req_dur / 10)))
+        # tiny clips invited degeneration loops: asked for 3-8 segments over a
+        # 2s clip, gemini once looped to 16k tokens of micro-segments until the
+        # cap cut it mid-JSON. Scale the segment budget with the duration.
+        _max_segs = 2 if req_dur <= 4 else (4 if req_dur <= 10 else 8)
         prompt += (
             f"\n\n[Clip Timing Constraints]\n"
             f"- Requested clip duration: {req_dur:.2f}s\n"
             f"- Relative timeline MUST start at 00:00:00 and end at {seconds_to_hhmmss(req_dur)}\n"
-            f"- Produce 3-8 segments covering the full duration\n"
+            f"- Produce AT MOST {_max_segs} segments covering the full duration — never more\n"
         )
         user_content = [{"type": "text", "text": prompt}]
         for b64 in b64_frames:
@@ -150,7 +154,29 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
         m = _re3.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, _re3.DOTALL)
         if m:
             content = m.group(1).strip()
-        result = json.loads(content)
+        else:
+            # a truncated reply has an OPENING fence but no closing one — the
+            # closed-fence regex misses it and json.loads then sees ``` garbage
+            content = _re3.sub(r'^```(?:json)?\s*\n?', '', content).strip()
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            # reply cut off at max_tokens (degeneration loops hit the cap):
+            # SALVAGE the complete leading segments instead of failing the
+            # clip — they are real model output, only the tail is lost
+            result = None
+            _cut = content.rfind('},')
+            while _cut > 0 and result is None:
+                _cand = content[:_cut + 1].rstrip().rstrip(',') + ']}'
+                try:
+                    result = json.loads(_cand)
+                except json.JSONDecodeError:
+                    _cut = content.rfind('},', 0, _cut)
+            if result is None:
+                raise
+            _fr = getattr(raw.choices[0], "finish_reason", "")
+            print(f"  ♻️ [DenseCaption] truncated reply (finish_reason={_fr}) — "
+                  f"salvaged {len(result.get('segments', []))} complete segment(s)")
         raw_segments = result.get("segments", []) if isinstance(result, dict) else []
         # Convert relative timestamps to absolute, with a scale-correction. The VLM
         # sometimes writes seconds in MM:SS form ("12 seconds" -> "00:12:00" =
@@ -469,6 +495,7 @@ def analyze_video(
     force: bool = False,
     progress_callback=None,
     variant: str = "",
+    content_hash: str | None = None,
 ) -> str:
     """Analyze a single video: shot detection → captions → scenes → scene summaries.
 
@@ -489,7 +516,10 @@ def analyze_video(
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Video not found: {abs_path}")
 
-    content_hash = compute_content_hash(abs_path)
+    # `content_hash` override lets the caller pin a STABLE identity independent
+    # of the file bytes — used for Immich proxies, keyed by the original's
+    # checksum so a re-downloaded (re-transcoded) proxy reuses the same cache.
+    content_hash = content_hash or compute_content_hash(abs_path)
     if not content_hash:
         raise RuntimeError(f"Could not compute hash for: {abs_path}")
 
