@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 from typing import Any, Optional
@@ -707,47 +708,82 @@ def analyze_audio(
 
     from src import config
 
-    # Cache is param-aware: fine-grained captions depend on segment bounds
-    # (derived from the project's shot length). Same file + different params
-    # → re-analyze instead of silently reusing the old granularity.
+    # Cache is param-aware: fine-grained captions depend on segment bounds.
+    # Results are stored PER params-signature (captions@{sig}.json) so tuning
+    # the pacing bounds back and forth never discards earlier work — the full
+    # madmom+LLM run only happens once per granularity, not on every flip.
     seg_min = float(getattr(config, "AUDIO_MIN_SEGMENT_DURATION", 3.0))
     seg_max = float(getattr(config, "AUDIO_MAX_SEGMENT_DURATION", 30.0))
     params_sig = f"seg{seg_min:g}-{seg_max:g}"
+    variant_path = os.path.join(cache_dir, f"captions@{params_sig}.json")
 
-    if os.path.exists(caption_path) and not force:
-        old_sig = None
-        has_facts = False
-        poisoned = []
+    def _caption_health(path: str):
+        """Reuse requires measured facts + no baked-in failure placeholders."""
         try:
             from src.audio.caption_quality import find_poisoned_subsegments
-            with open(caption_path, "r", encoding="utf-8") as f:
-                caption_data = json.load(f)
-            has_facts = bool(caption_data.get("facts"))
-            poisoned = find_poisoned_subsegments(caption_data)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("facts")), find_poisoned_subsegments(data)
+        except Exception:
+            return False, []
+
+    def _set_active_sig(sig: str):
+        meta_path = os.path.join(cache_dir, "metadata.json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                md = json.load(f)
+            md["caption_params"] = sig
+            _save_metadata(cache_dir, md)
         except Exception:
             pass
+
+    if not force:
+        old_sig = None
         try:
             with open(os.path.join(cache_dir, "metadata.json"), "r", encoding="utf-8") as f:
                 old_sig = json.load(f).get("caption_params")
         except Exception:
             pass
-        if not has_facts:
-            # pre-facts-layer cache: sections/energy were LLM guesses with no
-            # measured tempo — pacing built on that produced frantic cuts on
-            # mellow tracks (poisoned format, never reuse)
-            print(f"🔁 [Analyze] Audio cache is pre-facts-layer (no measured tempo) — "
-                  f"re-analyzing {os.path.basename(audio_path)}...")
-        elif poisoned:
-            # baked-in failure placeholders (empty / "no audio" refusals) came
-            # from runs before captioning failures raised — never reuse them
-            print(f"🔁 [Analyze] Audio cache has {len(poisoned)} placeholder sub-segment caption(s) "
-                  f"(e.g. {poisoned[0]}) — re-analyzing {os.path.basename(audio_path)}...")
-        elif old_sig is None or old_sig == params_sig:
-            # old_sig is None for legacy caches (params unknown) — grandfather them
-            print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
-            return content_hash
-        else:
-            print(f"🔁 [Analyze] Segment params changed ({old_sig} → {params_sig}), re-analyzing audio captions...")
+
+        # 1) exact-granularity variant from any earlier run
+        if os.path.exists(variant_path):
+            has_facts, poisoned = _caption_health(variant_path)
+            if has_facts and not poisoned:
+                if old_sig != params_sig or not os.path.exists(caption_path):
+                    shutil.copyfile(variant_path, caption_path)
+                    _set_active_sig(params_sig)
+                    print(f"♻️  [Analyze] Audio cached variant restored ({params_sig}): "
+                          f"{os.path.basename(audio_path)} (hash={content_hash[:12]})")
+                else:
+                    print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
+                return content_hash
+
+        # 2) legacy single-slot cache (pre-variant layout)
+        if os.path.exists(caption_path):
+            has_facts, poisoned = _caption_health(caption_path)
+            if not has_facts:
+                # pre-facts-layer cache: sections/energy were LLM guesses with no
+                # measured tempo — pacing built on that produced frantic cuts on
+                # mellow tracks (poisoned format, never reuse)
+                print(f"🔁 [Analyze] Audio cache is pre-facts-layer (no measured tempo) — "
+                      f"re-analyzing {os.path.basename(audio_path)}...")
+            elif poisoned:
+                # baked-in failure placeholders (empty / "no audio" refusals) came
+                # from runs before captioning failures raised — never reuse them
+                print(f"🔁 [Analyze] Audio cache has {len(poisoned)} placeholder sub-segment caption(s) "
+                      f"(e.g. {poisoned[0]}) — re-analyzing {os.path.basename(audio_path)}...")
+            elif old_sig is None or old_sig == params_sig:
+                # old_sig is None for legacy caches (params unknown) — grandfather
+                # them, and promote to a params-keyed variant for future flips
+                try:
+                    shutil.copyfile(caption_path, variant_path)
+                except Exception:
+                    pass
+                print(f"♻️  [Analyze] Audio already analyzed: {os.path.basename(audio_path)} (hash={content_hash[:12]})")
+                return content_hash
+            else:
+                print(f"🔁 [Analyze] Segment params changed ({old_sig} → {params_sig}) and no cached "
+                      f"variant for {params_sig} — analyzing this granularity once...")
 
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -810,6 +846,12 @@ def analyze_audio(
 
     metadata["analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     _save_metadata(cache_dir, metadata)
+
+    # keep a params-keyed copy so later granularity flips restore it for free
+    try:
+        shutil.copyfile(caption_path, variant_path)
+    except Exception:
+        pass
 
     print(f"✅ [Analyze] Audio done in {time.time() - t0:.1f}s → {cache_dir}")
     return content_hash
