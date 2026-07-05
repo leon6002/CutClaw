@@ -151,11 +151,15 @@ def _run_scenedetect(
     frame_skip: int = 0,
     start_frame: int = 0,
     warmup_start_frame: int = 0,
+    progress_cb=None,
 ) -> List:
     """Run scenedetect on [warmup_start_frame, end_frame), but only return scenes >= start_frame."""
     from scenedetect.frame_timecode import FrameTimecode
 
-    video = VideoStreamAv(video_path)
+    # threading_mode="AUTO" turns on FFmpeg multi-threaded decode. The default
+    # is SINGLE-threaded, which made scanning a 4K HEVC clip take 5+ minutes
+    # (the step is decode-bound; the detector itself is cheap).
+    video = VideoStreamAv(video_path, threading_mode="AUTO")
     manager = SceneManager()
     # ContentDetector works with frame_skip and with handheld/vlog footage where
     # AdaptiveDetector (ratio-based) can return 0 cuts. The `threshold` from config
@@ -178,7 +182,31 @@ def _run_scenedetect(
     if end_frame is not None:
         detect_kwargs["end_time"] = FrameTimecode(end_frame, fps=video.frame_rate)
 
-    manager.detect_scenes(video, **detect_kwargs)
+    # Heartbeat: detection is otherwise a silent multi-minute step — poll the
+    # stream position so the UI can show percent progress.
+    _hb_stop = None
+    if progress_cb is not None:
+        import threading as _th
+        _hb_stop = _th.Event()
+        try:
+            _total_pct = int(end_frame or video.duration.get_frames()) or 1
+        except Exception:
+            _total_pct = 1
+
+        def _heartbeat():
+            while not _hb_stop.wait(5.0):
+                try:
+                    pos = int(video.position.get_frames())
+                    progress_cb(min(99, int(pos * 100 / _total_pct)))
+                except Exception:
+                    pass
+        _th.Thread(target=_heartbeat, daemon=True).start()
+
+    try:
+        manager.detect_scenes(video, **detect_kwargs)
+    finally:
+        if _hb_stop is not None:
+            _hb_stop.set()
 
     scene_list = manager.get_scene_list()
 
@@ -247,6 +275,7 @@ def scenedetect_extract_and_detect(
     jpeg_quality: int = 95,
     max_minutes: Optional[float] = None,
     num_workers: int = 1,
+    progress_cb=None,
 ) -> dict:
     _ensure_dir(frames_dir)
 
@@ -297,6 +326,7 @@ def scenedetect_extract_and_detect(
                 min_scene_len,
                 end_frame if max_minutes is not None else None,
                 frame_skip=frame_skip,
+                progress_cb=progress_cb,
             )
     sample_fps = float(target_fps)
 
@@ -375,6 +405,7 @@ def decode_video_to_frames(
     image_format: str = "jpg",
     jpeg_quality: int = 80,
     num_workers: int = 1,
+    progress_cb=None,
 ) -> Dict[str, Any]:
     fps = float(target_fps) if target_fps is not None else 2.0
     if fps <= 0:
@@ -387,6 +418,7 @@ def decode_video_to_frames(
         resolution = int(resolution[0])
 
     return scenedetect_extract_and_detect(
+        progress_cb=progress_cb,
         video_path=video_path,
         frames_dir=frames_dir,
         target_fps=fps,

@@ -267,6 +267,8 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
         shot_detection_min_scene_len=config.SHOT_DETECTION_MIN_SCENE_LEN,
         save_frames_to_disk=getattr(config, "VIDEO_SAVE_DEBUG_FRAMES", False),
         image_format="jpg", jpeg_quality=80,
+        # percent heartbeat — detection is a multi-minute decode-bound step
+        progress_cb=lambda pct: _emit("shot_detection", "progress", f"{pct}%"),
     )
     num_scenes = len(vr.get("scenes", [])) if isinstance(vr, dict) else 0
 

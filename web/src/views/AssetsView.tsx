@@ -412,7 +412,7 @@ const STAGE_LABELS: Record<string, string> = {
   scene_merge: "场景合并", scene_analysis: "场景分析",
 };
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, annStage, onAnnotate, annBusy }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, annStage, annStageDetail, onAnnotate, annBusy }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
   /** this exact asset is currently being annotated (hash-keyed job state) */
@@ -421,6 +421,8 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
   queued?: boolean;
   /** current pipeline stage of THIS asset's annotation */
   annStage?: string;
+  /** stage detail, e.g. "42%" during shot detection */
+  annStageDetail?: string;
   /** start (re-)annotation of this asset */
   onAnnotate?: () => void;
   /** any annotation job is running (disables the button) */
@@ -510,12 +512,13 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
               排队中
             </span>
           )}
-          {/* live stage strip on the running card: 镜头检测 → 片段理解 → … */}
+          {/* live stage strip on the running card: 镜头检测 42% → 片段理解 → … */}
           {annotating && (
             <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 bg-gradient-to-t from-black/85 to-transparent px-2.5 pt-5 pb-1.5">
               <Loader2 className="h-3 w-3 shrink-0 animate-spin text-cyan-400" />
               <span className="truncate text-[10.5px] text-cyan-200">
-                {STAGE_LABELS[annStage ?? ""] ?? annStage ?? "分析中"}…
+                {(STAGE_LABELS[annStage ?? ""] ?? annStage ?? "分析中")}
+                {annStageDetail && /^\d+%$/.test(annStageDetail) ? ` ${annStageDetail}` : "…"}
               </span>
             </div>
           )}
@@ -961,6 +964,7 @@ export default function AssetsView({
                   annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
                   queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
                   annStage={annJob.meta.stage}
+                  annStageDetail={annJob.meta.stage_detail}
                   annBusy={busy}
                   onAnnotate={() => {
                     if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;

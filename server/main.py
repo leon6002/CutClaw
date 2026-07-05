@@ -653,12 +653,13 @@ def annotate(body: AnnotateRequest):
             from src.analyzer import analyze_video, analyze_audio
 
             def _stage_cb(stage, status, detail):
-                # per-card stage line ("镜头检测/片段理解/…") — surfaced live on
-                # the running asset's card in the grid
+                # per-card stage line ("镜头检测 42% / 片段理解 …") — surfaced live
+                # on the running asset's card in the grid
                 if status in ("start", "progress"):
-                    job.meta.update({"stage": stage})
+                    job.meta.update({"stage": stage,
+                                     "stage_detail": str(detail or "")[:60]})
                 elif status in ("done", "skip"):
-                    job.meta.update({"stage": ""})
+                    job.meta.update({"stage": "", "stage_detail": ""})
                 job.add(f"[stage] {stage} {status} {detail or ''}".rstrip())
 
             if body.force:
