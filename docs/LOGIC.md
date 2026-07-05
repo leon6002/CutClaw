@@ -154,6 +154,14 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
   → Reviewer（审查）→ shot_point.json（每 clip 带源视频路径 + 局部起止）
 ```
 
+### 选材优先制（curation-first，架构反转）
+- **动机**：旧流程是"编剧虚构理想镜头 → 30 个 agent 找素材匹配虚构"——素材不符警告、agent 失败、兜底全是这个倒置的代价。回忆类视频里**素材本身就是故事**。
+- **高光池**（`src/curation.py`）：枚举所有源的 dense_segments，逐段打分 `0.40·VLM内容分 + 0.40·实测画质 + 0.15·声音高光 + 0.05·有人`；VLM<3 分或实测<3.5 分直接出局；带拍摄时刻。按源缓存 `{analysis_dir}/highlight_pool.json`（含实测分，重跑秒回）；项目级合并+映射到 merged scene 索引，写 `Output/Output/{project}/highlight_pool.json`。
+- **编剧降级为编排**：`generate_shot_plan` 检测到池文件（按 scene_folder_path 的父目录约定，零签名改动）就注入"真实瞬间清单"（每段 id/时间/时长/实测分/REAL VOICES/拍摄时刻/描述，上限 25 条），要求每个镜头尽量选定一个 `anchor_id`（同一瞬间不得复用）；解析后 `_attach_anchors` 把 id 解析成 `{video_path,start,end}` 挂到 shot 上（未知/重复 id 剥掉走 agent 路径）。
+- **锚定镜头零 LLM**：编排器 `_anchored_pick` 在瞬间内滑动目标时长窗口（瞬间不够长则围绕中心对称扩展），避开已用区间+间距，多候选时选实测最清晰的切片；结果标 `"anchored": true`。全部滑动位置都冲突 → 回落到正常 agent 路径。冲突重试轮（guidance_map 非空）不走锚定。
+- **效果**：大多数镜头确定性完成（快、零失败、零 token），agent 只处理无锚镜头和冲突重试；"素材可能不符"应大幅消失（content 描述的就是真实画面）。
+- 开关 `CURATION_FIRST`（默认 True，False = 旧流程）。
+
 ### 时序叙事（旅程时间脊柱）
 - **动机**：跑马灯式回忆应当按旅程时间推进（Day 1 → Day N、早 → 晚），此前镜头顺序完全由编剧虚构。
 - **拍摄时间提取**（`src/utils/capture_time.py`，零网络）：①文件名模式（DJI_YYYYMMDDHHMMSS / VID_ / PXL_ / 通用 8+6 位）②ffprobe 容器 creation_time（iPhone .MOV）③拿不到 = None（编剧可自由摆放）。文件名时间是当地时间、容器时间常是 UTC——**不做时区换算**，同一旅程内排序一致性才是关键。

@@ -2051,6 +2051,75 @@ class ParallelShotOrchestrator:
                 ))
         return ranges
 
+    def _anchored_pick(self, shot, sec_idx, shot_idx, forbidden_ranges):
+        """Deterministic trim inside a CURATED moment (curation-first flow).
+
+        The Screenwriter anchored this shot on a real, measured highlight —
+        no agent needed: slide a target-length window inside the moment,
+        avoid committed ranges + spacing, prefer the sharpest slice. Returns
+        None when every slide conflicts (→ normal agent path takes over)."""
+        anchor = shot.get('anchor') or {}
+        src = anchor.get('video_path') or self._shot_source(shot)
+        try:
+            a, b = float(anchor.get('start', 0.0)), float(anchor.get('end', 0.0))
+        except (TypeError, ValueError):
+            return None
+        need = float(shot.get('time_duration') or 0.0) or 2.0
+        if b <= a or not src:
+            return None
+        gap = float(getattr(config, 'SHOT_MIN_GAP_SEC', 0.0) or 0.0)
+
+        if b - a <= need:
+            # moment shorter than the slot → widen symmetrically around it
+            c = (a + b) / 2.0
+            cands = [(max(0.0, c - need / 2.0), max(0.0, c - need / 2.0) + need)]
+        else:
+            step = max(0.5, (b - a - need) / 4.0)
+            cands, s = [], a
+            while s + need <= b + 1e-6:
+                cands.append((s, s + need))
+                s += step
+
+        free = []
+        for (s, e) in cands:
+            ok = True
+            for fr in forbidden_ranges:
+                r_src, r_s, r_e = _norm_range(fr)
+                if _same_source(r_src or (self.video_path or ""), src) \
+                        and s < (r_e or 0.0) + gap and e > (r_s or 0.0) - gap:
+                    ok = False
+                    break
+            if ok:
+                free.append((s, e))
+        if not free:
+            return None
+
+        best = free[0]
+        if len(free) > 1:
+            try:
+                from src.utils.stability import measure_stability
+                best = max(free, key=lambda w: measure_stability(
+                    src, w[0], w[1], samples=2).get("score", 5.0))
+            except Exception:  # noqa: BLE001
+                pass
+        s, e = best
+        s_h, e_h = convert_seconds_to_hhmmss(round(s, 2)), convert_seconds_to_hhmmss(round(e, 2))
+        print(f"✨ [Anchored] S{sec_idx + 1}-Shot{shot_idx + 1}: curated moment "
+              f"{s_h}→{e_h} on {os.path.basename(src)} (no agent call)", flush=True)
+        return {
+            "status": "success",
+            "section_idx": sec_idx,
+            "shot_idx": shot_idx,
+            "total_duration": round(e - s, 2),
+            "target_duration": need,
+            "num_clips": 1,
+            "is_stitched": False,
+            "clips": [{"shot": 1, "start": s_h, "end": e_h,
+                       "duration": round(e - s, 2), "video_path": src}],
+            "video_path": src,
+            "anchored": True,
+        }
+
     def _fallback_pick(self, shot, sec_idx, shot_idx, forbidden_ranges):
         """Deterministic no-LLM rescue. When the agent could not commit a shot
         (model errors, review rejections, budget exhausted), pick a free window
@@ -2374,15 +2443,28 @@ class ParallelShotOrchestrator:
             for (s_idx, shot_idx), shot in group_shots:
                 k = (s_idx, shot_idx)
                 _emit(k, "start")
-                try:
-                    res = self._run_worker(
-                        shot, s_idx, shot_idx,
-                        guidance_text=guidance_map.get(k),
-                        forbidden_time_ranges=base_forbidden + local_ranges,
-                    )
-                except Exception as e:
-                    print(f"Worker failed for shot {k}: {e}")
-                    res = None
+                res = None
+                # curation-first: anchored shots trim deterministically inside
+                # their curated moment — zero model calls, zero failure modes
+                if isinstance(shot, dict) and shot.get('anchor') and not guidance_map.get(k):
+                    try:
+                        res = self._anchored_pick(shot, s_idx, shot_idx,
+                                                  base_forbidden + local_ranges)
+                        if res:
+                            self._append_result_to_output(k, res)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"Anchored pick failed for shot {k}: {e}")
+                        res = None
+                if res is None:
+                    try:
+                        res = self._run_worker(
+                            shot, s_idx, shot_idx,
+                            guidance_text=guidance_map.get(k),
+                            forbidden_time_ranges=base_forbidden + local_ranges,
+                        )
+                    except Exception as e:
+                        print(f"Worker failed for shot {k}: {e}")
+                        res = None
                 if not res:
                     # 100%-success guarantee: an agent failure must not leave a
                     # hole — take a free window on the assigned footage instead

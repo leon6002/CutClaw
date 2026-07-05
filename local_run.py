@@ -238,6 +238,21 @@ def main():
         scene_index += 1
     print(f"🧩 [Project] Merged {scene_index} scenes from {len(video_hashes)} videos → {merged_scenes_dir}")
 
+    # Curation-first: build the measured highlight pool so the Screenwriter
+    # anchors shots on REAL moments (and anchored shots skip the agent).
+    if getattr(config, "CURATION_FIRST", True):
+        try:
+            from src.curation import build_highlight_pool
+            _pool = build_highlight_pool(video_hashes, merged_scenes_dir)
+            _pool_path = os.path.join(os.path.dirname(merged_scenes_dir), "highlight_pool.json")
+            with open(_pool_path, "w", encoding="utf-8") as _pf:
+                json.dump({"version": 1, "moments": _pool}, _pf, ensure_ascii=False, indent=1)
+            _n_voice = sum(1 for m in _pool if m.get("sound"))
+            print(f"✨ [Curation] Highlight pool: {len(_pool)} measured moments "
+                  f"({_n_voice} with real voices) → {_pool_path}")
+        except Exception as _e:
+            print(f"⚠️ [Curation] highlight pool skipped: {_e}")
+
     # Output paths
     shot_plan_output_path = os.path.join(
         config.VIDEO_DATABASE_FOLDER,

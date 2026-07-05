@@ -425,6 +425,11 @@ TRANSLATE_MODEL = "deepseek/deepseek-v4-flash"
 TRANSLATE_ENDPOINT = "https://api.deepseek.com/v1"
 TRANSLATE_API_KEY = AGENT_LITELLM_API_KEY
 
+CURATION_FIRST = True
+# Curation-first flow: build a measured highlight pool from the real footage,
+# the Screenwriter anchors shots on real moments, anchored shots skip the
+# per-shot agent (deterministic trim). False = legacy script-first flow.
+
 SOUND_HIGHLIGHT_THRESHOLD = 0.5
 # Silero VAD sensitivity for voice/laughter detection (0-1). LOWER = more
 # sensitive and WIDER segments (0.35 灵敏 / 0.5 标准 / 0.65 严格).

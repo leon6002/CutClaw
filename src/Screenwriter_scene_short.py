@@ -627,6 +627,50 @@ def generate_shot_plan(
 
     prompt = prompt.replace("RELATED_VIDEO_PLACEHOLDER", related_video_context)
 
+    # ── Curation-first: anchor shots on REAL measured moments ──────────────
+    # The pool file sits next to the merged_scenes dir (project convention).
+    anchors_block = ""
+    if scene_folder_path and getattr(config, "CURATION_FIRST", True):
+        pool_path = os.path.join(os.path.dirname(scene_folder_path), "highlight_pool.json")
+        if os.path.exists(pool_path):
+            try:
+                with open(pool_path, "r", encoding="utf-8") as f:
+                    _pool = json.load(f).get("moments", [])
+            except Exception:  # noqa: BLE001
+                _pool = []
+            _rel = set()
+            for _x in related_scenes or []:
+                try:
+                    _rel.add(int(_x))
+                except (TypeError, ValueError):
+                    pass
+            _cands = [m for m in _pool if not _rel or m.get("scene") in _rel]
+            if not _cands:
+                _cands = _pool
+            _cands = sorted(_cands, key=lambda m: -m.get("score", 0))[:25]
+            if _cands:
+                _lines = []
+                for m in _cands:
+                    _v = " | REAL VOICES" if m.get("sound") else ""
+                    _t = (f" | shot at {m['capture_time'][5:16].replace('T', ' ')}"
+                          if m.get("capture_time") else "")
+                    _lines.append(
+                        f"- {m['id']} | scene {m.get('scene', '?')} | "
+                        f"{m['start']:.1f}-{m['end']:.1f}s ({m['duration']:.1f}s) | "
+                        f"quality {m.get('score', 0) * 10:.1f}/10{_v}{_t} | {m.get('desc', '')[:160]}")
+                anchors_block = (
+                    "\n\n[CURATED REAL MOMENTS — measured from the actual footage]\n"
+                    "Build every shot on ONE of these real moments whenever possible: describe THAT "
+                    "moment's visible imagery in \"content\", set \"related_scene\" to the moment's "
+                    "scene, and ADD a field \"anchor_id\" (the moment's id) to that shot's JSON object. "
+                    "quality is MEASURED (blur/shake + content), REAL VOICES means the original audio "
+                    "there carries voices/laughter — the renderer lets them play through, so strongly "
+                    "prefer such moments. Capture times give the journey order. Never assign the same "
+                    "moment to two shots. Set \"anchor_id\": null ONLY when no listed moment fits the "
+                    "music segment at all.\n" + "\n".join(_lines)
+                )
+    prompt = prompt + anchors_block
+
     return _call_agent_litellm([{"role": "user", "content": prompt}], max_tokens=config.AGENT_MODEL_MAX_TOKEN)
 
 
@@ -709,6 +753,40 @@ def _check_scene_load(shot_plan: dict, scene_folder_path: str | None) -> tuple[b
     return True, "ok"
 
 
+def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
+    """Resolve each shot's anchor_id into the real moment's time range.
+
+    Anchored shots skip the per-shot agent entirely — the orchestrator trims
+    deterministically inside the curated moment."""
+    if not scene_folder_path or not isinstance(shot_plan, dict):
+        return
+    pool_path = os.path.join(os.path.dirname(scene_folder_path), "highlight_pool.json")
+    if not os.path.exists(pool_path):
+        return
+    try:
+        with open(pool_path, "r", encoding="utf-8") as f:
+            by_id = {m.get("id"): m for m in json.load(f).get("moments", [])}
+    except Exception:  # noqa: BLE001
+        return
+    used = set()
+    n = 0
+    for shot in shot_plan.get("shots", []) or []:
+        aid = shot.get("anchor_id")
+        m = by_id.get(str(aid)) if aid else None
+        if not m or aid in used:      # unknown or duplicated anchor → agent path
+            shot.pop("anchor_id", None)
+            continue
+        used.add(aid)
+        shot["anchor"] = {
+            "video_path": m.get("video_path", ""),
+            "start": float(m.get("start", 0.0)),
+            "end": float(m.get("end", 0.0)),
+        }
+        n += 1
+    if n:
+        print(f"✨ [Curation] {n}/{len(shot_plan.get('shots', []) or [])} shots anchored on real moments")
+
+
 def generate_shot_plan_with_retry(
     music_detailed_structure: list | dict | str,
     video_section_proposal: dict,
@@ -743,6 +821,7 @@ def generate_shot_plan_with_retry(
                 expect_non_empty=expected_non_empty,
             )
             if is_valid:
+                _attach_anchors(parsed_shot_plan, scene_folder_path)
                 load_ok, load_reason = _check_scene_load(parsed_shot_plan, scene_folder_path)
                 if load_ok:
                     return parsed_shot_plan
