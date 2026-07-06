@@ -1249,6 +1249,12 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
             {mode === "ai" ? "AI 编排并拼接" : "生成拼接 BGM"}
           </Button>
         </div>
+        {running && (
+          <div className="mt-2 text-[10.5px] text-slate-500">
+            生成中(AI 编排约半分钟)——可以关闭此窗口去做别的,回来重新打开就能看到结果;
+            文件完成后也会出现在素材库(重新扫描可见)。
+          </div>
+        )}
         {err && <div className="mt-2 text-[11px] text-red-400">{err}</div>}
         {result && (
           <div className="mt-3 rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] p-3">
@@ -1315,6 +1321,9 @@ export default function AssetsView({
   // asset-level ❤️ (global taste, by content hash) + BGM stitch panel
   const [hearts, setHearts] = useState<Set<string>>(new Set());
   const [stitchOpen, setStitchOpen] = useState(false);
+  // once opened, the panel stays MOUNTED (hidden on close) — closing during a
+  // generation must not lose the in-flight request or the result view
+  const [stitchMounted, setStitchMounted] = useState(false);
   useEffect(() => {
     api<{ hearts: string[] }>("/api/assets/hearts")
       .then((r) => setHearts(new Set(r.hearts ?? []))).catch(() => {});
@@ -1581,12 +1590,14 @@ export default function AssetsView({
 
   return (
     <div>
-      {stitchOpen && (
-        <BgmStitchPanel
-          tracks={assets.filter((a) => a.asset_type === "audio")}
-          hearts={hearts}
-          onClose={() => setStitchOpen(false)}
-        />
+      {stitchMounted && (
+        <div className={stitchOpen ? "" : "hidden"}>
+          <BgmStitchPanel
+            tracks={assets.filter((a) => a.asset_type === "audio")}
+            hearts={hearts}
+            onClose={() => setStitchOpen(false)}
+          />
+        </div>
       )}
       {/* ── ① command bar: scan → annotate. Low-frequency stuff lives in popovers ── */}
       <Card className={cn(glass, (busy || selecting) && "border-beam")}>
@@ -1939,7 +1950,7 @@ export default function AssetsView({
               <Button
                 variant="outline"
                 className="h-8 gap-1.5 border-violet-500/40 bg-violet-500/10 text-xs text-violet-300 hover:bg-violet-500/20"
-                onClick={() => setStitchOpen(true)}
+                onClick={() => { setStitchMounted(true); setStitchOpen(true); }}
                 disabled={assets.filter((a) => a.asset_type === "audio").length < 2}
                 title="把几首喜欢的音乐无缝拼成一条 BGM(不用跑流水线)"
               >
