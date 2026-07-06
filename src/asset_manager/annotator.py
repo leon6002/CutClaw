@@ -593,31 +593,55 @@ def _annotate_video_in_process(meta, model, endpoint, api_key, q=None):
         return None
 
 
-def _annotate_audio_in_process(meta, model, endpoint, api_key, q=None):
-    """Child-process entry point: annotate ONE audio track end-to-end.
+def _annotate_audio_subprocess(meta, stage_cb=None):
+    """Annotate ONE audio track in a PLAIN python subprocess.
 
-    A separate process because madmom + numpy/LAPACK loaded after torch in
-    the SERVER process aborts natively (0xc06d007f) and takes the whole
-    backend down — a child gets a clean DLL slate (铁律10). Stage events
-    stream back through the queue for the live per-card UI."""
-    try:
-        if q is not None:
-            try:
-                q.put({"type": "begin", "file": meta.file_name, "hash": meta.content_hash})
-            except Exception:
-                pass
+    multiprocessing children re-import the parent's __main__ on Windows —
+    for the web backend that's server/main.py with its whole heavy import
+    graph, and madmom + numpy/LAPACK on top of it aborts natively
+    (0xc06d007f). A `python -m` subprocess starts clean, same as the
+    pipeline subprocess where this exact code is proven stable (铁律10).
 
-        def _cb(stage, status, detail):
-            if q is not None:
+    Returns the AssetAnnotation, or None on failure (resumable)."""
+    import pickle
+    import subprocess
+    import sys as _sys
+    import tempfile
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    with tempfile.TemporaryDirectory(prefix="aud_ann_") as td:
+        meta_p = os.path.join(td, "meta.pkl")
+        res_p = os.path.join(td, "result.pkl")
+        with open(meta_p, "wb") as f:
+            pickle.dump(meta, f)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        # 0xC06D007F at compute_audio_facts = two OpenMP runtimes loaded
+        # (madmom's numpy/MKL + librosa's numba both pull one in). The
+        # classic Windows escape hatch — scoped to THIS worker only:
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        proc = subprocess.Popen(
+            [_sys.executable, "-m", "src.asset_manager.audio_annotate_worker", meta_p, res_p],
+            cwd=root, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("@@ASTAGE "):
                 try:
-                    q.put({"type": "stage", "file": meta.file_name, "hash": meta.content_hash,
-                           "stage": stage, "status": status, "detail": str(detail or "")[:80]})
-                except Exception:
+                    ev = json.loads(line[len("@@ASTAGE "):])
+                    if stage_cb:
+                        stage_cb(ev.get("stage", ""), ev.get("status", ""), ev.get("detail", ""))
+                except Exception:  # noqa: BLE001
                     pass
-        return annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key,
-                              progress_callback=_cb)
-    except Exception:
-        traceback.print_exc()
+            elif line:
+                print(f"  [audio-worker] {line}")
+        rc = proc.wait()
+        if rc == 0 and os.path.exists(res_p):
+            with open(res_p, "rb") as f:
+                return pickle.load(f)
+        print(f"[AssetAnnotator] audio worker exited rc={rc} for {meta.file_name}")
         return None
 
 
@@ -759,65 +783,36 @@ def batch_annotate(
                     print(f"[AssetAnnotator] Failed to annotate image {meta.file_name}: {e}")
                 _report(meta.file_name)
 
-    # Audio: sequential, each track in its OWN subprocess. madmom +
-    # numpy/LAPACK after torch inside the server process hard-crashes
-    # (0xc06d007f, no traceback) and killed the backend mid-batch — a fresh
-    # child per track gets a clean DLL slate, and a native crash only loses
-    # that one track (resumable) instead of the whole server.
-    if audios:
-        import multiprocessing as _mp2
-        import threading as _threading2
-        from concurrent.futures import ProcessPoolExecutor as _PPE2
+    # Audio: sequential, each track in its OWN plain `python -m` subprocess.
+    # NOT multiprocessing: on Windows its children re-import the parent's
+    # __main__ (server/main.py + the whole heavy import graph), and madmom +
+    # numpy/LAPACK on top of that aborts natively — verified: the identical
+    # code completes fine in a clean plain process (铁律10).
+    for meta in audios:
+        _starting(meta.file_name)
+        _failed = False
 
-        _mgr2 = _mp2.Manager()
-        _q2 = _mgr2.Queue()
-        _stop2 = _threading2.Event()
-
-        def _drain2():
-            while not (_stop2.is_set() and _q2.empty()):
+        def _scb(stage, status, detail, _fn=meta.file_name):
+            if stage_callback:
                 try:
-                    ev = _q2.get(timeout=0.5)
-                except Exception:
-                    continue
-                try:
-                    if ev.get("type") == "begin":
-                        _starting(ev.get("file", ""))
-                    elif ev.get("type") == "stage" and stage_callback:
-                        try:
-                            stage_callback(ev["stage"], ev["status"], ev["detail"],
-                                           filename=ev.get("file"))
-                        except TypeError:
-                            stage_callback(ev["stage"], ev["status"], ev["detail"])
-                except Exception:
-                    pass
+                    stage_callback(stage, status, detail, filename=_fn)
+                except TypeError:
+                    stage_callback(stage, status, detail)
 
-        _dt2 = _threading2.Thread(target=_drain2, daemon=True)
-        _dt2.start()
         try:
-            for meta in audios:
-                _starting(meta.file_name)
-                _failed = False
-                try:
-                    # a NEW single-worker pool per track: a native crash breaks
-                    # the pool, so sharing one would poison the rest of the batch
-                    with _PPE2(max_workers=1) as _ex2:
-                        _r = _ex2.submit(_annotate_audio_in_process, meta,
-                                         model, endpoint, api_key, _q2).result()
-                    if _r is not None:
-                        results.append(_r)
-                    else:
-                        _failed = True
-                except Exception as e:
-                    print(f"[AssetAnnotator] audio worker failed for {meta.file_name}: {e}")
-                    _failed = True
-                if _failed and stage_callback:
-                    try:
-                        stage_callback("annotate", "fail", "analysis failed — resumable", filename=meta.file_name)
-                    except TypeError:
-                        pass
-                _report(meta.file_name)
-        finally:
-            _stop2.set()
-            _dt2.join(timeout=3)
+            _r = _annotate_audio_subprocess(meta, stage_cb=_scb)
+            if _r is not None:
+                results.append(_r)
+            else:
+                _failed = True
+        except Exception as e:
+            print(f"[AssetAnnotator] audio worker failed for {meta.file_name}: {e}")
+            _failed = True
+        if _failed and stage_callback:
+            try:
+                stage_callback("annotate", "fail", "analysis failed — resumable", filename=meta.file_name)
+            except TypeError:
+                pass
+        _report(meta.file_name)
 
     return results
