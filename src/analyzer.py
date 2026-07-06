@@ -672,6 +672,20 @@ def analyze_video(
     except Exception as _e:  # noqa: BLE001
         print(f"⚠️ [Analyze] sound-highlight detection skipped: {_e}")
 
+    # Highlight scoring (curation pool) — pure local compute (per-second
+    # quality scan + camera motion + dHash), no API. Building it here means
+    # the 高光评分 tab and auto-select have measured scores the moment
+    # annotation finishes, instead of waiting for a pipeline run or a manual
+    # build. Cached (v-checked) — re-annotations are instant.
+    _emit("highlight_pool", "start", "逐秒画质 + 运动 + 视觉指纹(本地计算)")
+    try:
+        _hp_t0 = time.time()
+        from src.curation import _source_pool
+        _pool = _source_pool(content_hash)
+        _emit("highlight_pool", "done", f"{len(_pool)} moments · {time.time() - _hp_t0:.0f}s")
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️ [Analyze] highlight pool build skipped: {_e}")
+
     # Update metadata with completion marker — only NOW does the cache count
     # as "already analyzed" (see the resume check above)
     metadata["analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")

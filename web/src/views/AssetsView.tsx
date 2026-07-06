@@ -780,6 +780,7 @@ const STAGE_LABELS: Record<string, string> = {
   scene_merge: "场景合并", scene_analysis: "场景分析",
   // audio annotation stages (madmom pipeline)
   beat_detect: "节奏检测", audio_facts: "节奏事实", sectioning: "段落划分", seg_caption: "分段描述",
+  highlight_pool: "高光评分",
 };
 
 function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, onAnnotateLocal, annBusy, hearted, onToggleHeart }: {
@@ -1034,6 +1035,7 @@ function ConcurrencyField({ k, label, hint }: { k: string; label: string; hint: 
 const ANN_STAGES: Array<[string, string]> = [
   ["shot_detection", "镜头检测"], ["captioning", "片段理解"],
   ["dense_caption", "密集描述"], ["scene_merge", "场景合并"], ["scene_analysis", "场景分析"],
+  ["highlight_pool", "高光评分"],
 ];
 
 function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
