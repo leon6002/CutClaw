@@ -1,9 +1,10 @@
 /** Custom React Flow nodes for the agent workflow canvas. */
-import { memo, useState } from "react";
+import { memo, useState, type ReactNode } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
-  Check, Film, GitMerge, Loader2, MessageSquareText, Music2, PenLine,
-  Play, RotateCcw, Scissors, TriangleAlert, X,
+  AudioWaveform, Check, FileVideo, Film, GitMerge, Layers, Loader2,
+  MessageSquareText, Music2, PenLine, Play, RotateCcw, ScanText, Scissors,
+  TriangleAlert, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { VERDICT_META, entryWorstVerdict, splitReasoning, tryPretty, type IterEntry } from "../trace";
@@ -498,6 +499,93 @@ export const OrchestratorNode = memo(({ data }: NodeProps) => {
   );
 });
 
+// ── E. Stage Node (batch analysis phases as first-class canvas citizens) ────
+// The per-file/per-segment grids (视频片段理解 / 密集片段描述 / …) used to live
+// under the canvas; each is now ONE node in an analysis chain between the
+// assets and the screenwriter. Click opens the workbench with full traces.
+
+const STAGE_META: Record<string, { title: string; icon: ReactNode; text: string; chip: string }> = {
+  video_analysis:       { title: "逐文件分析调度", icon: <FileVideo className="h-3.5 w-3.5" />,    text: "text-slate-300",   chip: "bg-slate-500/15 text-slate-300" },
+  video_clips:          { title: "视频片段理解",   icon: <Film className="h-3.5 w-3.5" />,         text: "text-sky-300",     chip: "bg-sky-500/15 text-sky-300" },
+  video_dense:          { title: "密集片段描述",   icon: <ScanText className="h-3.5 w-3.5" />,     text: "text-fuchsia-300", chip: "bg-fuchsia-500/15 text-fuchsia-300" },
+  video_scenes:         { title: "场景分析",       icon: <Layers className="h-3.5 w-3.5" />,       text: "text-emerald-300", chip: "bg-emerald-500/15 text-emerald-300" },
+  audio_analysis_asset: { title: "音频分析",       icon: <AudioWaveform className="h-3.5 w-3.5" />, text: "text-violet-300",  chip: "bg-violet-500/15 text-violet-300" },
+  audio_segments:       { title: "音频片段描述",   icon: <AudioWaveform className="h-3.5 w-3.5" />, text: "text-violet-300",  chip: "bg-violet-500/15 text-violet-300" },
+};
+
+export interface StageNodeData {
+  task: string;
+  info: { total: number; states: Record<string, string>; done?: number; fail?: number; avg?: number; eta?: number };
+  onOpen?: () => void;
+  [key: string]: unknown;
+}
+
+const STAGE_BLOCK_CLS: Record<string, string> = {
+  d: "bg-emerald-400/80", r: "bg-cyan-400 animate-pulse", f: "bg-red-400", p: "bg-white/10",
+};
+
+export const StageNode = memo(({ data }: NodeProps) => {
+  const d = data as StageNodeData;
+  const meta = STAGE_META[d.task] ?? { title: d.task, icon: <Layers className="h-3.5 w-3.5" />, text: "text-slate-300", chip: "bg-slate-500/15 text-slate-300" };
+  const states = d.info?.states ?? {};
+  const keys = Object.keys(states).sort((a, b) => Number(a) - Number(b));
+  const vals = keys.map((k) => states[k]);
+  const total = d.info?.total ?? vals.length;
+  const runN = vals.filter((v) => v === "r").length;
+  const failN = d.info?.fail ?? vals.filter((v) => v === "f").length;
+  const doneN = d.info?.done ?? vals.filter((v) => v === "d").length;
+  const pct = total ? Math.round((doneN / total) * 100) : 0;
+  const allDone = total > 0 && doneN >= total;
+  return (
+    <div
+      className={cn(
+        "w-[212px] cursor-pointer rounded-xl border bg-slate-900/90 px-3 py-2 shadow-lg transition-colors hover:border-white/30",
+        runN > 0 ? "border-cyan-400/70 node-breathe"
+          : failN > 0 ? "border-red-500/50"
+            : allDone ? "border-emerald-500/40" : "border-white/10",
+      )}
+      onClick={(ev) => { ev.stopPropagation(); d.onOpen?.(); }}
+      title="点击在工作台查看每个单元的调用详情"
+    >
+      <div className="flex items-center gap-1.5">
+        <span className={cn("flex h-5 w-5 items-center justify-center rounded", meta.chip)}>{meta.icon}</span>
+        <span className={cn("truncate text-[11.5px] font-semibold", meta.text)}>{meta.title}</span>
+        {runN > 0 && <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-cyan-400" />}
+        {runN === 0 && allDone && !failN && <Check className="ml-auto h-3 w-3 shrink-0 text-emerald-400" />}
+        {runN === 0 && failN > 0 && <TriangleAlert className="ml-auto h-3 w-3 shrink-0 text-red-400" />}
+      </div>
+      <div className="mt-1 flex items-baseline gap-1.5 font-mono text-[10px] text-slate-400">
+        <span>{doneN}/{total || "?"}</span>
+        <span className="text-slate-600">({pct}%)</span>
+        {runN > 0 && <span className="text-cyan-300">⚡ {runN} 并行</span>}
+        {failN > 0 && <span className="text-red-400">✕ {failN}</span>}
+      </div>
+      {/* unit blocks (mirrors the old grid) — beyond 96 units a slim bar */}
+      {total > 0 && total <= 96 ? (
+        <div className="mt-1.5 flex flex-wrap gap-[3px]">
+          {Array.from({ length: total }, (_, i) => (
+            <span key={i} className={cn("h-[7px] w-[7px] rounded-[2px]", STAGE_BLOCK_CLS[states[String(i)] ?? "p"] ?? STAGE_BLOCK_CLS.p)} />
+          ))}
+        </div>
+      ) : total > 96 ? (
+        <div className="mt-1.5 h-1.5 overflow-hidden rounded bg-white/10">
+          <div className="h-full rounded bg-emerald-400/80" style={{ width: `${pct}%` }} />
+        </div>
+      ) : null}
+      {runN > 0 && (d.info?.avg || d.info?.eta) ? (
+        <div className="mt-1 text-[9.5px] text-slate-500">
+          {d.info.avg ? `平均 ${d.info.avg}s/个` : ""}{d.info.avg && d.info.eta ? " · " : ""}
+          {d.info.eta ? `还需约 ${Math.max(1, Math.round(d.info.eta / 60))} 分钟` : ""}
+        </div>
+      ) : null}
+      <Handle id="in" type="target" position={H.l} className={handleCls()} />
+      <Handle id="chain-in" type="target" position={H.t} className={handleCls()} />
+      <Handle id="out" type="source" position={H.r} className={handleCls()} />
+      <Handle id="chain-out" type="source" position={H.b} className={handleCls()} />
+    </div>
+  );
+});
+
 export const nodeTypes = {
   shotRoot: ShotRootNode,
   shotLane: ShotLaneNode,
@@ -505,4 +593,5 @@ export const nodeTypes = {
   clip: ClipNode,
   screenwriter: ScreenwriterNode,
   orchestrator: OrchestratorNode,
+  stage: StageNode,
 };

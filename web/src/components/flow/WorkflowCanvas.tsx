@@ -102,15 +102,21 @@ function useJobTraces(jobId: string | null) {
 const COL_W = 265;
 const LANE_H = 125;
 const LANE_TOP = 130;
-const X_ROOT = 1000;         // shot-root column — pushed right to make room for the
-                             // asset column + screenwriter + editor hub on the left
+const X_ROOT = 1220;         // shot-root column — pushed right to make room for the
+                             // asset column + analysis chains + screenwriter + editor
 
-// ── pipeline columns (left → right): audio sources → assets/mix → screenwriter
-//    → editor → shots. Gaps widened per user feedback (nodes felt glued).
+// ── pipeline columns (left → right): audio sources → assets/mix → analysis
+//    stages → screenwriter → editor → shots.
 const AUDIO_SRC_X = -290;              // original music tracks (feed the BGM mix)
 const ASSET_X = 10, ASSET_ROW = 196;   // input asset column (poster + name per row)
-const SW_X = 380, SW_Y = 6;            // "AI 编剧" timeline node
-const EDITOR_X = 740;                  // editor hub, between screenwriter and shots
+const STAGE_X = 306, STAGE_ROW = 122;  // batch analysis stage chain (视频理解/音频分析)
+const SW_X = 600, SW_Y = 6;            // "AI 编剧" timeline node
+const EDITOR_X = 960;                  // editor hub, between screenwriter and shots
+
+// batch tasks that render as canvas stage nodes, in dataflow order
+export const VIDEO_STAGE_CHAIN = ["video_analysis", "video_clips", "video_dense", "video_scenes"];
+export const AUDIO_STAGE_CHAIN = ["audio_analysis_asset", "audio_segments"];
+export const CANVAS_STAGE_KEYS = [...VIDEO_STAGE_CHAIN, ...AUDIO_STAGE_CHAIN];
 
 interface RoundInfo {
   seq: number; section: number; round: number;
@@ -194,8 +200,10 @@ function buildGraph(opts: {
   onOpenClip?: (s: ShotInfo) => void;
   assetLive?: Record<string, string>;   // basename → live analysis state (r/d)
   bgmUsedPaths?: string[];              // source tracks actually used in the BGM mix
+  batchTasks?: Record<string, TaskInfo>; // analysis-phase tasks → stage nodes
+  onOpenTask?: (task: string) => void;   // open the workbench for a stage
 }): { nodes: Node[]; edges: Edge[]; latestActiveId: string | null } {
-  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive, bgmUsedPaths } = opts;
+  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask } = opts;
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   let latestActiveId: string | null = null;
@@ -260,12 +268,58 @@ function buildGraph(opts: {
     if (swActive) latestActiveId = "sw";
   }
 
-  // Input assets. Videos form the main column feeding the screenwriter. Music
+  // Batch analysis phases as stage-node chains: videos → 逐文件调度 → 片段理解
+  // → 密集描述 → 场景分析 → 编剧; audio → 音频分析 → 分段描述 → 编剧. The old
+  // grids under the canvas are gone in canvas view — clicking a stage opens
+  // the workbench. Chains only appear once the job reports those tasks.
+  const vChain = VIDEO_STAGE_CHAIN.filter((k) => batchTasks?.[k]);
+  const aChain = AUDIO_STAGE_CHAIN.filter((k) => batchTasks?.[k]);
+  const stageKind = (t?: TaskInfo): "active" | "done" | "fail" | "pending" => {
+    if (!t) return "pending";
+    const vals = Object.values(t.states ?? {});
+    if (vals.includes("r")) return "active";
+    const dn = t.done ?? vals.filter((v) => v === "d").length;
+    if (t.total > 0 && dn >= t.total) return "done";
+    if (vals.includes("f")) return "fail";
+    return dn > 0 ? "done" : "pending";
+  };
+  const pushChain = (chain: string[], startY: number) => {
+    chain.forEach((key, i) => {
+      nodes.push({
+        id: `stage-${key}`, type: "stage",
+        position: { x: STAGE_X, y: startY + i * STAGE_ROW },
+        data: { task: key, info: batchTasks![key], onOpen: () => onOpenTask?.(key) },
+      });
+      if (i > 0) {
+        edges.push({
+          id: `e-stage-${chain[i - 1]}-${key}`,
+          source: `stage-${chain[i - 1]}`, sourceHandle: "chain-out",
+          target: `stage-${key}`, targetHandle: "chain-in",
+          ...edgeStyle(stageKind(batchTasks![key])),
+        });
+      }
+    });
+    // chain tail → screenwriter
+    edges.push({
+      id: `e-stage-${chain[chain.length - 1]}-sw`,
+      source: `stage-${chain[chain.length - 1]}`, sourceHandle: "out", target: "sw",
+      ...edgeStyle(stageKind(batchTasks![chain[chain.length - 1]])),
+    });
+  };
+  // video chain centered on the screenwriter, audio chain right below it
+  const vChainY = SW_Y + 150 - (vChain.length * STAGE_ROW) / 2;
+  if (vChain.length) pushChain(vChain, vChainY);
+  if (aChain.length) pushChain(aChain, vChain.length ? vChainY + vChain.length * STAGE_ROW + 44 : SW_Y + 150 - (aChain.length * STAGE_ROW) / 2);
+  // entry node of each chain — assets plug in here instead of the screenwriter
+  const videoEntry = vChain.length ? `stage-${vChain[0]}` : "sw";
+  const audioEntry = aChain.length ? `stage-${aChain[0]}` : "sw";
+
+  // Input assets. Videos form the main column feeding the analysis chain. Music
   // gets FUSION semantics: when the project audio is an AI mix, the original
   // tracks sit in their own column further left, and ONLY the tracks that
   // actually made it into the mix get a violet edge into the mix node —
   // unused tracks are dimmed and unconnected, so "谁进了最终 BGM" reads at
-  // a glance. The mix node alone feeds the screenwriter.
+  // a glance. The mix node alone feeds the audio analysis chain.
   const assetList = assets ?? [];
   if (assetList.length > 0) {
     const _normP = (s: string) => (s || "").replace(/\//g, "\\").toLowerCase();
@@ -295,8 +349,10 @@ function buildGraph(opts: {
       const id = `asset-${gi}`;
       pushAsset(a, id, ASSET_X, startY + i * ASSET_ROW);
       const live = assetLive?.[(a.file_name || "").toLowerCase()];
+      const entry = a.asset_type === "audio" ? audioEntry : videoEntry;
       edges.push({
-        id: `e-${id}-sw`, source: id, target: "sw",
+        id: `e-${id}-${entry}`, source: id, target: entry,
+        ...(entry !== "sw" ? { targetHandle: "in" } : {}),
         ...edgeStyle(live === "r" ? "active" : (a.annotated || live === "d") ? "done" : "pending"),
       });
     });
@@ -530,7 +586,7 @@ function buildGraph(opts: {
 
 function CanvasInner({
   jobId, tasks, onOpenScreenwriter, fullscreen, onToggleFullscreen, jobRunning, onRetryShot,
-  assets, onOpenAsset, shots, onOpenClip, bgmUsedPaths,
+  assets, onOpenAsset, shots, onOpenClip, bgmUsedPaths, onOpenTask,
 }: {
   jobId: string;
   tasks: Record<string, TaskInfo>;
@@ -544,6 +600,7 @@ function CanvasInner({
   shots?: ShotInfo[];
   onOpenClip?: (s: ShotInfo) => void;
   bgmUsedPaths?: string[];
+  onOpenTask?: (task: string) => void;
 }) {
   const traces = useJobTraces(jobId);
   const [expanded, setExpanded] = useState<{ unit: number; ord: number } | null>(null);
@@ -595,6 +652,11 @@ function CanvasInner({
     return "";
   }, [analyzeJson]);
 
+  // analysis-phase tasks → stage nodes (JSON-stabilized against poll churn)
+  const batchJson = JSON.stringify(Object.fromEntries(
+    CANVAS_STAGE_KEYS.filter((k) => tasks[k]).map((k) => [k, tasks[k]])));
+  const batchTasks = useMemo(() => JSON.parse(batchJson) as Record<string, TaskInfo>, [batchJson]);
+
   // stabilize the assets/shots identity so polling doesn't rebuild every tick
   const assetsJson = JSON.stringify(assets ?? null);
   const assetsStable = useMemo(() => JSON.parse(assetsJson) as AssetInfo[] | null, [assetsJson]);
@@ -605,9 +667,9 @@ function CanvasInner({
     () => buildGraph({
       shotTask: shotTask ?? undefined, traces, expanded, fullEntries, onToggle, onOpenScreenwriter,
       jobRunning, onRetryShot, swStage, assets: assetsStable ?? undefined, onOpenAsset,
-      shots: shotsStable ?? undefined, onOpenClip, assetLive, bgmUsedPaths,
+      shots: shotsStable ?? undefined, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask,
     }),
-    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive, bgmUsedPaths],
+    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask],
   );
 
   // React Flow v12 controlled mode REQUIRES onNodesChange: node dimension
@@ -770,6 +832,7 @@ export default function WorkflowCanvas(props: {
   shots?: ShotInfo[];
   onOpenClip?: (s: ShotInfo) => void;
   bgmUsedPaths?: string[];
+  onOpenTask?: (task: string) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);

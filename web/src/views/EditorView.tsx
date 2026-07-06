@@ -21,7 +21,7 @@ import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
-import WorkflowCanvas, { type AssetInfo, type ShotInfo } from "../components/flow/WorkflowCanvas";
+import WorkflowCanvas, { CANVAS_STAGE_KEYS, type AssetInfo, type ShotInfo } from "../components/flow/WorkflowCanvas";
 import AssetPanel from "../components/flow/AssetPanel";
 import ClipPlayer from "../components/flow/ClipPlayer";
 import type { PipelineStatus, ProjectState } from "../App";
@@ -625,6 +625,7 @@ export default function EditorView({
                   onOpenAsset={(a) => { setAssetView(a); setWb(null); setClipView(null); }}
                   shots={shots}
                   bgmUsedPaths={bgmUsedPaths}
+                  onOpenTask={(task) => { setWb({ task }); setAssetView(null); setClipView(null); }}
                   onOpenClip={(s) => { setClipView(s); setAssetView(null); setWb(null); }}
                   onOpenScreenwriter={() => { setWb({ task: "screenwriter_llm" }); setAssetView(null); setClipView(null); }}
                   onRetryShot={retryShot}
@@ -642,10 +643,11 @@ export default function EditorView({
                     />
                   ) : undefined}
                 />
-                {/* batch tasks (audio/clip captioning) stay as grids under the canvas */}
+                {/* analysis phases live IN the canvas as stage nodes now — grids
+                    below only for task types the canvas doesn't map (if any) */}
                 <TaskGrids
                   tasks={Object.fromEntries(Object.entries(job.meta.tasks ?? {})
-                    .filter(([k]) => !["editor_shots", "editor_rounds", "screenwriter_llm"].includes(k))) as Record<string, import("../components/trace").TaskInfo>}
+                    .filter(([k]) => !["editor_shots", "editor_rounds", "screenwriter_llm", ...CANVAS_STAGE_KEYS].includes(k))) as Record<string, import("../components/trace").TaskInfo>}
                   jobId={pipelineJobId} jobRunning={running}
                   onOpenWorkbench={(task, idx) => setWb({ task, idx })}
                 />
