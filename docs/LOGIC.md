@@ -19,6 +19,9 @@
 9. [任务系统与进程健壮性](#9-任务系统与进程健壮性)
 10. [缓存路径全景](#10-缓存路径全景)
 11. [关键配置项速查](#11-关键配置项速查)
+12. [口味记忆（全局拒绝名单）](#12-口味记忆)
+13. [换镜头闭环 UI](#13-换镜头闭环-ui)
+14. [视觉去重与前置品控（锚点预算器）](#14-视觉去重与前置品控锚点预算器)
 
 ---
 
@@ -92,11 +95,12 @@
 素材真身在 Immich（端口 2284），分析不应重复拷贝原片。
 
 ### 实现要点
-- **身份绑定**：`Output/asset_index/immich_map.json` 记 `{content_hash → immich_id + checksum}`。checksum（Immich 的 SHA-1）是内容身份，id 是 API 句柄。
-- **代理导入**：分析用 Immich 的 1080p 转码代理（`/assets/{id}/video/playback`，3-10MB）落到 `resource/imports/`，不拉原片。
+- **身份绑定**：`Output/asset_index/immich_map.json` 记 `{代理文件名 → immich_id + checksum + original_path…}`（键是本地代理文件名，不是 content_hash）。checksum（Immich 的 base64 SHA-1）是原片内容身份，id 是 API 句柄。
+- **代理导入**：分析用 Immich 的 1080p 转码代理（`/assets/{id}/video/playback`，3-10MB）落到 `resource/imports/immich/`，不拉原片。内容级去重按 checksum，但**只有绑定的代理文件仍在盘上才 skip**——用户删代理省空间后再点导入会重新下载（`immich_import`）。
+- **代理无关的分析身份（关键）**：代理是转码产物，重下/重转码后**字节 hash 会变**——若按代理 hash 缓存分析，删了重下就白标。所以 Immich 素材的分析键**重写为原片 checksum**：扫描后 `_apply_immich_identity` 把 `content_hash` 覆盖成 `im-<checksum>`（base64→base64url，路径安全无碰撞），贯穿 `analyze_video(content_hash=…)` 到分析目录、annotations、details。**删代理 → 分析全在**（无任何自动清理）；**重下代理 → hash 不变 → 秒复用**，哪怕 Immich 重新转码也认得。首次切换到该逻辑时 `_migrate_analysis_identity` 一次性把旧的按代理 hash 缓存的分析/注释迁移到 checksum 键（`os.replace` 目录 + 挪 index/local 条目），旧数据不丢；迁移后 isdir 短路，稳态零开销。
 - **原片渲染（可选项）**：渲染时 `source_quality="original"` → `_materialize_immich_originals()` 生成替换过路径的 shot_point 副本（抖音 1080p 够用，默认 proxy）。
 - **描述回写**：标注完成自动 `PUT /assets/{id}` 把摘要写进 Immich 描述（在 Immich 里可搜索）；也有手动"同步标注到 Immich 描述"入口。
-- **CLIP 搜索**：素材库「🖼 Immich 库」标签页走 `/search/smart`。
+- **CLIP 搜索**：素材库「🖼 Immich 库」标签页走 `/search/smart`。搜索结果按 immich_map 的 id + checksum 标「已导入」（绿徽章 + 禁止再勾选），避免重复导入——iPhone 常把不同视频都叫 IMG_xxxx，光看缩略图/文件名分不清，得靠身份判定。
 - 认证：`x-api-key` 头，配置 `IMMICH_URL` / `IMMICH_API_KEY` / `IMMICH_PATH_MAP`（宿主挂载路径映射，零拷贝直读原片用，待配置）。
 
 ---
@@ -169,6 +173,14 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
 - **旅行聚类**：拍摄日期间隔 >14 天 = 新旅程（`build_trip_labeler`），混合素材库标 "Trip 2 · Day 1 · 12-13 15:07" 而不是荒谬的 "Day 411"。
 - **进 prompt**：`load_scene_summaries` 给每个场景加 "Shot at:" 行 + JOURNEY CHRONOLOGY 规则（默认时序前进，指令明确要求时可打破）；`generate_shot_plan` 的分段场景描述同样带拍摄时刻。
 
+### 编剧提速 + 稀疏场景 id（2026-07-05，血泪教训）
+- **症状**：AI 编剧一跑 6 轮 LLM 调用（选音乐段 + 结构提案×2 + 分镜脚本×3），慢（分镜每次 80-97s）、烧 token、效果还差，模型推理里反复纠结「late section (scenes 2-3) 缺失」和「重复的 Scene 0」。
+- **根因一：可用场景 id 是稀疏的，但计数用了文件总数**。合并场景夹 `merged_scenes/` 有 scene_0..3，但 `load_scene_summaries` 会跳过 `importance<3`/不可用/空摘要的场景——实际可用可能是 `{1,2}`。旧代码返回**文件总数 4**，prompt 说「场景 0-3 共 4 个」、`check_scene_distribution` 按稠密 0..3 要求三段覆盖，于是逼模型选它**从没见过**的 scene 0/3 → 永远不可能满足 → 每次重试都空转。
+- **根因二：merge 不给场景重编号**，每个 `merged_scenes/scene_N.json` 里 `scene_id` 都是 0，`[Scene {scene_id}]` 展示成一堆「Scene 0」，模型分不清也没法引用（`related_scenes` 其实要的是**文件号**，见 `generate_shot_plan` 读 `scene_{idx}.json`）。
+- **修法**：`load_scene_summaries` 改为返回**可用场景的文件 id 列表**（稀疏，如 `[1,2]`），展示用文件号而非 `scene_id`；prompt 用 `AVAILABLE_SCENE_IDS_PLACEHOLDER` 明确列出「只能从这些 id 选」；`check_scene_distribution(proposal, available_ids)` 只针对真实可用 id 校验——≥3 个场景按**位置**分三段各要一个，<3 个只要求「每个都用到」（一定可满足）。
+- **顺带修**：`_check_scene_load` 识别「重分配也救不了」（总请求秒数 > 引用场景总预算，或无空闲场景）时直接放行、不再空转重试；spare/budget 只算**被引用的**场景，不会建议模型去用跳过的场景。
+- **效果**：少素材项目从 ~6 轮压到 ~3 轮；更关键的是校验从「不可能满足」变「可满足」，反馈不再自相矛盾，输出质量也提升。**规则：任何按「场景数」推导的逻辑，都必须用「可用场景 id 集合」，绝不用文件总数或假设稠密 0..N-1。**
+
 ### 编排器（`ParallelShotOrchestrator.run_parallel`，src/core.py）
 - **按源分组**：同源镜头串行（前面的选择进后面的禁选区 → 结构上杜绝同源重叠），不同源并行（`PARALLEL_SHOT_MAX_WORKERS`）。
 - **容量守卫**：派发前按"每源需求 vs 供给"重平衡，把超订源上最小的镜头挪到最空的源（解决"最后一个镜头只剩边角料"）。大镜头先选（长窗口优先）。
@@ -212,7 +224,26 @@ VLM 的 visual_quality 是**看静帧**打的分，看不见帧间剧烈晃动�
 ### 指标（`src/utils/stability.py`）
 - **相对清晰度** = 区间拉普拉斯方差中位数 ÷ 该源视频自己的 p70 基线（24 帧全片采样，缓存）。**必须按源归一**：雪原天然比秋林纹理少，跨源比绝对值无意义。
 - **光流紊乱度** = 稠密光流幅值的 std（w/s），惩罚乱动；顺滑横移/航拍不受罚。
-- 得分 0-10：`10·min(1, rel/0.75)^0.8 × (1 − 0.5·disorder_penalty)`；按 (视频, 区间±0.1s) 进程内缓存。
+- **视速** / **倾斜**：见下两小节（2026-07 新增维度）。
+- 得分 0-10：`10·min(1, rel/0.75)^0.8 × (1 − 0.5·disorder_pen) × (1 − 0.6·speed_pen) × (1 − 0.7·tilt_pen)`；按 (视频, 区间±0.1s) 进程内缓存。
+
+### 视速惩罚（apparent speed，2026-07 新增）
+- **动机**：用户实测反馈——顺滑但极快的无人机横扫，清晰度/紊乱度双满分，放进平静的回忆混剪里却让人头晕。清晰≠适合。
+- **实现**：`speed` = 稠密光流幅值**中位数**换算成"屏宽/秒"（`median(mag)/320·fps`）。温柔滑移实测 0.02–0.29 w/s（不扣分）；超过 **0.30 w/s** 起罚：`speed_pen = min(1, (speed − 0.30)/0.45)`，乘进总分因子 `(1 − 0.6·speed_pen)`。与紊乱度正交——紊乱度用 std 抓"乱动"，视速用中位数抓"整体太快"。
+- **调优入口**：起罚点 `0.30` 与斜率 `0.45`（`stability.py` `_measure` 内）；返回字典带 `speed` 字段可直接观察实测值。
+
+### 倾斜惩罚（camera roll，2026-07 新增）
+- **动机**：用户发现一个云台歪斜的镜头（实测竖直结构偏角 9.1°，正常素材 1.8°），清晰度指标完全看不见"画面是歪的"。
+- **实现**：每采样帧 Canny(60,160) + `HoughLinesP`(threshold=40, minLineLength=40, maxLineGap=6) 找线段，取与竖直方向夹角 ≤25° 的"近竖直结构"（树/杆/建筑棱），偏离竖直的角度取中位数。**可信度门槛**：单帧 ≥6 条合格线才算测到、≥2 帧测到才判倾斜——开阔水面/天空这类无竖直结构的画面测不到 = 不惩罚（`tilt=None, pen=0`），绝不误杀。偏角 >4° 起罚：`tilt_pen = min(1, (tilt − 4.0)/5.0)`，因子 `(1 − 0.7·tilt_pen)`。
+- **调优入口**：起罚角 `4.0°`/斜率 `5.0`、单帧线数门槛 `6`、帧数门槛 `2`；返回字典 `tilt` 字段为实测偏角（None=测不到）。改公式记得**升 `src/curation.py` 的 `_POOL_VERSION`**（v5 就是为倾斜惩罚升的），否则旧高光池缓存里的实测分不会重算。
+
+### 逐秒扫描与干净段裁剪（池构建时，2026-07 新增）
+- **动机**：一个 6s 的 dense 段里常藏着 1-2s 的构图调整（猛甩），整段中位数会把它"平均掉"——用户核心诉求是**只保留每个 take 里真正好的部分**，而不是整段要么全收要么全弃。
+- **实现**（`stability.py` `quality_per_second` / `longest_clean_run` + `curation.py` `_source_pool`）：
+  - `quality_per_second`：区间按 1s 窗逐秒测分（samples=1，窗口走区间缓存——相邻 moment 重叠部分共享计算）。
+  - `longest_clean_run(per_sec, floor=3.5)`：找最长连续"干净秒"（≥3.5 分；测不到的秒算干净）。
+  - 池构建时每个候选 moment 先逐秒扫描，**trim 到最长干净段**：没有任何干净秒 = 纯调整镜头直接丢弃；干净核心 <1.6s 丢弃；有裁剪则标 `"trimmed": true`，之后再对裁剪后的区间做整段实测（samples=3），<3.5 分仍出局。
+- **调优入口**：干净秒门槛 `floor=3.5`（`_source_pool` 调用处）、最短可用时长 `1.6s`。逐秒窗口只采 1 帧对，延迟可控；如嫌慢先怀疑区间缓存是否命中。
 
 ### 校准记录（2026-07-05，滑雪项目实测，10/10 人工判断命中）
 | 片段 | rel_sharp | 得分 | 判定 |
@@ -288,6 +319,17 @@ shot_point.json（多源 clip 各带 video_path）
 - 前端 `useZh()/useZhFlag()`（ClipInspector.tsx）：全局中文/原文开关（localStorage + 自定义事件跨组件同步）；纯中文/无英文单词的文本跳过。匹配度计算永远用英文原文。
 - 扩展方式：任何组件把文本数组传进 `useZh` 即可。
 
+### 项目编辑画布（WorkflowCanvas · 编剧阶段可观测性）
+- **动机**：编剧阶段（AI 编剧）过去是黑盒——画布只在第一次 LLM 调用后画出「AI 编剧」节点、只显示调用次数，调用之间/调用前完全沉默，用户不知道进行到哪一步。
+- **命名子步骤事件**：`Screenwriter_scene_short.py` 的 `_sw_stage(label)` 在每个真实子步骤开头发一个 **`event="stage"`** 进度事件（选择音乐段落→生成结构提案→生成分镜脚本→挑选开场对白→保存分镜脚本；含缓存复用/补全开场白分支）。走 `@@PROGRESS` → `_apply_progress_ev` 存到 `tasks.screenwriter_llm.stage_label`——**独立 event，不进 traces**，所以不污染 LLM 调用 trace / 提示词-回复 workbench。
+- **画布呈现（编剧=单节点时间轴）**：编剧是**一个自绘节点**（`screenwriter`），内部渲染成 station-and-rail 竖向时间轴——每个子步骤一个「站点」，用 CSS rail 串联，当前段有琥珀流光（`.sw-rail-flow`）、当前站点有脉冲光环（`.sw-station-active`）、整节点 `.node-breathe-amber` 呼吸。**故意不用 RF 子节点+边**（那样会暴露丑陋的 handle 圆点）；连接线全内部 CSS 绘制，完全可控。节点在**第一个 stage 事件**就出现。子步骤状态由 `SW_STEPS.indexOf(stage_label)` 推导：之前=done✓、当前=running⟳、之后=pending，`total>0`（编辑阶段已开始）时全部 done。整节点自成左列，与右侧「AI 编辑」用间距 + 虚线连边隔开。
+- **每个子步骤的数据**：`_sw_emit` 给每个 LLM 调用事件盖上当前 `stage` 标签（`_SW_STAGE["cur"]`，`_apply_progress_ev` 存进 trace 的 `stage` 字段）。前端 `groupSteps` 把调用按 `stage` 归组，每个站点显示「N 次调用 · Xs」；点击节点打开 Agent 工作台，工作台里每条调用都带 `stage` 徽章，等于把调用按子步骤组织展示。
+- **上游素材列（视频理解 / 音乐分析）**：画布最左边一列是本项目的**源素材节点**（`asset` 节点：视频=天蓝、音频=紫）。视频显示**缩略图海报**（`/api/assets/thumb` 的 ffmpeg 首帧 JPEG，磁盘缓存 + 浏览器缓存 + 节点 memo，**绝不嵌 `<video>`**——多个视频解码器会卡）+ Q 分角标 + 「视频理解」标签 + hover 播放提示；音频显示装饰波形。缩略图端点在 `hash` 缺省时**从 path 自动算 hash**，未标注素材也能出图。数据来自 `POST /api/assets/by_paths`。
+  - **实时分析状态**：流水线「视频理解」阶段 `local_run.py` 逐个 `analyze_video(vp)` 前后发 `video_analysis` start/done 事件（`label=basename`；音频发 `audio_analysis_asset`）。前端按 basename 匹配到素材节点：**正在分析的那个视频显示「分析中」+ 天蓝呼吸边框 + 脉冲遮罩**，已分析显示「已分析」，其余静态（Q 分/未标注）。画布顶部提示也从「等待编剧阶段」改成「正在分析素材：<文件名>」。缓存命中的视频瞬间 done，只有真正在跑的会停留在「分析中」。**点击素材节点** → overlay 弹出 `AssetPanel`（媒体预览 + 标注表 + 主色调色块点击复制）。布局：assets(x10) → 编剧(x286) → 编辑(x640) → 镜头列(X_ROOT 900)。
+- **每个镜头的最终选片（clip 结果节点 + 预览）**：每个镜头 lane 之后插一个 `clip` 节点，显示 AI 选定的**源素材名 + 时间片**（`00:12–00:18 6.0s`，多片段/兜底都标出），接 lane → clip → merge。数据来自 `GET /api/pipeline/shots?project_id`（读 shot_point.json，运行时轮询 2.5s）。**点击 clip 节点** → overlay 弹出 `ClipPlayer`，用 `<video>` seek 到 start、播到 end 停，可重播。clip 节点还有一条**细淡曲线**连回左侧对应的源素材节点（按 basename 匹配；`clip` 节点专用 `back` 左侧 source handle → asset 右侧 target handle，走 clip 左侧不绕圈）。overlay 优先级：clip 预览 > 素材标注 > Agent 工作台。
+- **布局**：`X_ROOT`（镜头列）与 `EDITOR_X`（编辑 hub）整体右移，给编剧框腾出左列；框高 `SW_HEADER_H + SW_STEPS.length·SW_ROW_H + SW_PAD`。子步骤「运行中」判定用 `total===0`（还没产出镜头 = 编剧阶段），比窥探最后一条 trace 的 phase 更可靠（子步骤间会静默）。
+- 新增子步骤时：`_sw_stage` 的 label 必须与 `nodes.tsx` 的 `SW_STEPS` 数组保持一致（子节点按它生成、状态按它排序）。
+
 ### 素材页（AssetsView）
 - 全页详情视图（弃用抽屉——用户明确否决抽屉交互）；海报卡片墙（缩略图 `/api/assets/thumb`、状态色条、按哈希路由的实时阶段显示）；命令栏 ⚙ 模型/并发设置;JobDock 全局任务坞。
 - 标注状态按 `content_hash` 键控（`meta.files`: p/r/d/f），**绝不用文件名匹配**（曾致"标注一个全部显示标注中"）。
@@ -336,6 +378,7 @@ shot_point.json（多源 clip 各带 video_path）
 | 完成标记 | `Output/analyzed/{hash}/analysis_complete` | — |
 | 扫描元数据缓存 | `Output/asset_index/scan_cache.json` | 文件 (size, mtime) 变化自动重 probe；`_CACHE_VERSION` 升级作废 |
 | 注释索引（云端） | `Output/asset_index/annotations.json` | — |
+| Immich 素材分析键 | `Output/analyzed/im-<原片checksum>/`（非代理 hash） | 键随原片身份，删/重下代理不失效 |
 | 注释（本地轨） | `Output/asset_index/annotations_local.json` | — |
 | Immich 绑定 | `Output/asset_index/immich_map.json` | — |
 | 中文翻译 | `Output/cache/translations_zh.json` | 内容哈希，永久 |
@@ -367,6 +410,104 @@ shot_point.json（多源 clip 各带 video_path）
 | `IMMICH_URL/API_KEY/PATH_MAP` | :2284 | Immich 接入 |
 | `AUDIO_SEGMENT_MIN/MAX_DURATION_SEC` | 目标±5s | 成片时长区间 |
 | `ASR_BACKEND` | litellm / whisper_cpp | 无对白素材用 whisper_cpp |
+
+---
+
+## 12. 口味记忆
+
+### 动机
+用户对某个镜头说"不要"，这个偏好不该只活在一次会话里——同一段素材换个项目又被选中，等于让用户重复教 AI。拒绝要**全局持久**，且区分力度：多数不满是"这段不太行"（降权），少数是"这段永远别用"（硬禁）。
+
+### 实现
+- **存储**：`Output/asset_index/rejections.json`（`src/curation.py` `REJECTIONS_PATH`），**全局跨项目**。每条 `{video_path, start, end, reason, ban, ts}`，由换镜接口追加（见 §13）。
+- **软拒 = 池内降权**（`build_highlight_pool`）：moment 与拒绝区间重叠 >0.3s → 综合分 **−0.15/次，叠加封顶 −0.45**；原因文本记入 `rejected_overlap`（最多 3 条）供 UI 展示。**惩罚施加在项目池合并阶段而非按源缓存**——新拒绝立即生效，不需要重建池。
+- **永久 ban**：措辞含 **不再/别再/拉黑/永久/never** 或以 **`!` 开头**（`server/main.py` `replace_shot` 判定）→ `ban: true`。两处强制执行：
+  1. 池构建时**直接剔除**（不进候选，打印 `🚫 excluded by permanent bans`）。
+  2. `core.py` `run_parallel` 开头把所有 ban 区间注入 `global_keep_ranges`（全局禁选区）——agent commit、锚定选取、确定性兜底**三条选取路径全部避开**，不是只防高光池一条路。
+- **换镜选取时**：所有拒绝区间（不分软硬）+ 其他镜头已用区间一起构成 forbidden 列表，替代镜头按 `SHOT_MIN_GAP_SEC` padding 避让。
+
+### 调优入口
+- 软拒力度：`curation.py` 池合并处的 `0.15`/封顶 `0.45`、重叠判定 `0.3s`。
+- ban 触发词表：`server/main.py` `replace_shot` 内 `_ban` 判定。
+- 手工管理：直接编辑 `rejections.json`（删条目 = 撤销拒绝，改 `ban` 字段 = 升降级），下次构建池/跑流水线即生效。
+
+---
+
+## 13. 换镜头闭环 UI
+
+### 动机
+看成片时发现某个镜头不满意，此前只能改指令重跑整条流水线（慢、贵、其他镜头也会变）。需要**单镜头级**的"换掉这个"闭环：说一句原因 → 立即换上更好的 → 偏好被记住（§12）。
+
+### 链路
+```
+渲染页焦点卡片「换掉」按钮（ClipInspector.tsx，琥珀色）
+  → window.prompt 收原因（提示语教用户措辞语义）
+  → POST /api/shots/replace {shot_point, section_idx, shot_idx, reason}（RenderView.replaceShot）
+  → 后端：写 rejections.json + 从高光池选替代 + 改写 shot_point.json
+  → 前端 reloadClipMap + alert 展示新片段（id/分数/描述）
+  → 用户重新渲染后生效（渲染读的就是 shot_point.json）
+```
+
+### 后端选取逻辑（`server/main.py` `replace_shot`）
+- **前置**：项目必须有 `highlight_pool.json`（旧流水线产物返回 400 提示重跑）。
+- **原因关键词导向**：
+  - 含 **晃/抖/快/晕/歪** → 替代镜头要求实测稳定分 **≥7**（不只是"能用"，要明显更稳）。
+  - 含 **重复/一样/相似/雷同** → 同源避让半径从 20s 扩到 **60s**（避开相似画面）。
+- 候选按池内综合分降序：时长 ≥ 目标−1s；在 moment 中心对称取目标时长窗口；避开 forbidden（全部拒绝区间 + 其他镜头 clips，padding `SHOT_MIN_GAP_SEC`）。全池无解 → 409（提示换措辞或重跑扩充素材）。
+- **写入前备份**：`shot_point.json` → 同名 `.bak`（`shutil.copy2`），改坏可手工回滚。替换后的 shot 标 `replaced: true` + `replace_reason`。
+
+### UI 细节
+- 「换掉」按钮只在传入 `onReplace` 时渲染（焦点卡片场景）；prompt 提示语明确教措辞：晃/歪/晕→更稳、重复→避相似、"不再使用"或 `!` 前缀→永久拉黑、其余原因=负分。取消 prompt = 整个操作取消（不写任何东西）。
+- 成功 alert 明示"重新渲染后生效；被换掉的区间已进入拒绝名单"——换镜只改 shot_point，不自动触发渲染。
+
+### 调优入口
+- 稳定分门槛 `7.0`、相似半径 `60/20s`、时长容差 `1.0s`：都在 `replace_shot` 内。
+- 关键词表与 prompt 提示语（`RenderView.tsx` `replaceShot`）需**同步维护**——提示语教的措辞必须真的被后端识别。
+
+---
+
+## 14. 视觉去重与前置品控（锚点预算器）
+
+### 动机
+用户反馈（2026-07-05 成片）：一支缓慢航拍的雪山视频被穿插了非常多次——不是同一段重复，而是**整支视频视觉同质**，隔 60 秒取的段落在观众眼里仍是"同一张照片"。暴露两个结构性问题：
+1. 既有防重复全是**时间距离**逻辑（相邻同源 20s），而慢航拍上时间距离≠视觉差异——与"平滑快速运镜骗过稳定分"同类的指标盲区。
+2. 品控靠**事后打回**（Reviewer 拒绝、剥锚重选）会给 agent 加压、推高失败率。核心原则（用户定死）：**品控前置，让非法选择在菜单里根本不存在，而不是选了再罚**。
+
+### 架构（三层，全部纯计算、零新增 LLM 调用）
+```
+高光池 v6      每 moment 抽 3 帧算 dHash → 项目池贪心聚类（汉明距 ≤ 阈值 = 同一"视觉场景"）
+               → 每簇只保留 top (簇配额+1) 个候选（留一个替补）
+    ↓
+锚点预算器     build_anchor_budget()：按分数贪心选锚点菜单，硬约束在此一次性消化——
+               同簇 ≤ VISUAL_CLUSTER_MAX_USES(2)、同源 ≤ SOURCE_VIDEO_MAX_USES(4)、人声优先保额。
+               数学性质：配额是上限 ⇒ 菜单的任何子集自动满足配额 ⇒ 编剧怎么选都合法。
+               素材不足时按固定顺序放宽（簇+1 → 源+1 循环）并打日志——唯一合法失败=素材耗尽。
+    ↓
+编剧           anchors_block 只列预算菜单（带 look C{n} 簇标签）；VARIETY 从硬规则降级为
+               摆位建议（同簇两条离远点）——菜单已经干净，规则可以温和，省思考预算。
+    ↓
+装配修复       _attach_anchors：未知/重复/同簇过近 → 先换预算余量里的异簇替补（修复），
+               实在无替补才剥锚回 agent（最后手段）。修复是确定性毫秒级，不弹回 LLM。
+    ↓
+保险丝         装配完成后校验配额，超额只打警告日志（说明前置环节有 bug），不拒绝不重试。
+```
+
+### 实现要点
+- **dHash**（`src/utils/stability.py`）：每 moment 取 3 帧，灰度缩到 9×8，相邻像素比较出 64-bit 指纹。两 moment 距离 = 双方帧指纹的最小汉明距。本地毫秒级，帧读取复用 OpenCV。
+- **池 v5→v6 升级路径**：只补算 dHash，不重跑逐秒扫描/稳定度测量（那部分很贵且结果不变）。
+- **聚类**是项目池级贪心 leader 聚类（按分数降序，距离 ≤ 阈值并入，否则立新簇），跨 clip、跨源都算。
+- **预算菜单大小**随预计镜头数缩放（音乐时长 / 平均段长 × 1.5，下限 25）——菜单太小会逼出 `anchor_id: null` 的 agent 自由行，那正是要消灭的压力源。
+
+### 调优入口（都在 src/config.py，参数面板可调）
+- `VISUAL_CLUSTER_MAX_USES = 2` —— 同一视觉场景全片最多出场次数（用户体感：两三次到顶）。
+- `SOURCE_VIDEO_MAX_USES = 4` —— 同一源视频全片配额（画面多样的源可以多给）。
+- `VISUAL_CLUSTER_HAMMING = 12` —— 判定"同一场景"的汉明距阈值；调大=聚得更狠。
+- `VISUAL_CLUSTER_MIN_GAP_SHOTS = 6` —— 同簇两次出现的最小镜头间距（治 A-B-A-B 穿插感）。
+
+### 踩坑规则
+- 别把配额检查加回编辑器提交路径——那是打回机制回魂。前置环节出 bug 就修前置环节，保险丝日志会指出来。
+- 剥锚（strip → agent 自由选）永远是最后手段：agent 自由行不受簇配额保护，选回同质画面等于白干。
+- 池 v6 的 dHash 字段是"换镜头闭环"（§13）按簇降权的地基——拒绝一个镜头时可顺带压掉同款机位（待接线）。
 
 ---
 
