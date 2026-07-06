@@ -846,6 +846,297 @@ def immich_import(body: ImmichImport):
             "dest": dest_dir}
 
 
+# ── Workspace ops: cleanup / migrate / link local originals ────────────────
+# The imports dir is a WORKSPACE (the active working set), not a library —
+# these keep it small, relocatable and connected back to Immich.
+
+_WS_TASK: dict = {"kind": None, "running": False, "note": "", "done": 0,
+                  "total": 0, "result": None, "error": ""}
+
+
+def _ws_start(kind: str) -> bool:
+    if _WS_TASK["running"]:
+        return False
+    _WS_TASK.update({"kind": kind, "running": True, "note": "", "done": 0,
+                     "total": 0, "result": None, "error": ""})
+    return True
+
+
+@app.get("/api/workspace/task")
+def workspace_task():
+    return dict(_WS_TASK)
+
+
+class CleanupRequest(BaseModel):
+    dry_run: bool = True
+
+
+@app.post("/api/workspace/cleanup")
+def workspace_cleanup(body: CleanupRequest):
+    """Delete UNUSED Immich proxies: not referenced by any project, annotated
+    (analysis cached by hash), and re-downloadable (bound in immich_map).
+    Deleting loses nothing — re-import restores the file, analysis reattaches."""
+    root = _resolve(str(cfg("ASSET_ROOT_DIR", "resource/imports") or "resource/imports"))
+    proxy_dir = os.path.join(root, "immich")
+    if not os.path.isdir(proxy_dir):
+        return {"count": 0, "bytes": 0, "files": [], "dry_run": body.dry_run}
+
+    ref_names: set = set()
+    import glob as _g
+    for pj in _g.glob(os.path.join(PROJECTS_DIR, "*", "project.json")):
+        try:
+            with open(pj, "r", encoding="utf-8") as f:
+                p = json.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        paths = list(p.get("videos") or []) + list(p.get("audios") or [])
+        paths += [p.get("audio") or "", p.get("srt") or ""]
+        for x in paths:
+            if x:
+                ref_names.add(os.path.basename(str(x)).lower())
+
+    from src.asset_manager.index_store import load_index
+    annotated_paths = set()
+    for ann in load_index().values():
+        ap = getattr(ann.metadata, "absolute_path", "") or ""
+        if ap:
+            annotated_paths.add(os.path.normcase(os.path.abspath(ap)))
+
+    imap = _load_immich_map()
+    victims = []
+    for fn in sorted(os.listdir(proxy_dir)):
+        fp = os.path.join(proxy_dir, fn)
+        if not os.path.isfile(fp):
+            continue
+        if fn not in imap:
+            continue                      # not re-downloadable → never touch
+        if fn.lower() in ref_names:
+            continue                      # a project still uses it
+        if os.path.normcase(os.path.abspath(fp)) not in annotated_paths:
+            continue                      # not annotated yet → deleting wastes the download
+        victims.append((fp, os.path.getsize(fp)))
+
+    if not body.dry_run:
+        for fp, _sz in victims:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+    return {"count": len(victims), "bytes": sum(s for _f, s in victims),
+            "files": [os.path.basename(f) for f, _s in victims][:80],
+            "dry_run": body.dry_run}
+
+
+def _norm_prefix(p: str) -> str:
+    return os.path.normcase(p.replace("/", "\\").rstrip("\\/"))
+
+
+def _swap_path(s: str, olds: list, new_root: str):
+    """Rewrite one string if it starts with any old workspace prefix.
+    Handles both absolute paths and repo-relative 'resource/imports/…' forms;
+    result is always absolute under the new root."""
+    if not isinstance(s, str) or len(s) < 4:
+        return s, False
+    cand = s.replace("/", "\\")
+    lc = os.path.normcase(cand)
+    for old in olds:
+        if lc == old or lc.startswith(old + "\\"):
+            return new_root + cand[len(old):], True
+    return s, False
+
+
+def _rewrite_store(path: str, olds: list, new_root: str, dry: bool) -> int:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+
+    def _walk(o):
+        nonlocal n
+        if isinstance(o, dict):
+            return {k: _walk(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_walk(v) for v in o]
+        if isinstance(o, str):
+            new, hit = _swap_path(o, olds, new_root)
+            if hit:
+                n += 1
+            return new
+        return o
+
+    data = _walk(data)
+    if n and not dry:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    return n
+
+
+def _migrate_worker(old_abs: str, new_abs: str):
+    import glob as _g
+    import shutil
+    try:
+        files = []
+        for dp, _dn, fns in os.walk(old_abs):
+            for fn in fns:
+                files.append(os.path.join(dp, fn))
+        _WS_TASK["total"] = len(files) + 1
+        moved = 0
+        for i, fp in enumerate(files):
+            rel = os.path.relpath(fp, old_abs)
+            dst = os.path.join(new_abs, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            _WS_TASK.update({"done": i, "note": f"移动 {rel}"})
+            if not os.path.exists(dst):
+                shutil.move(fp, dst)
+                moved += 1
+        # sweep now-empty dirs (best effort)
+        for dp, _dn, fns in os.walk(old_abs, topdown=False):
+            try:
+                os.rmdir(dp)
+            except OSError:
+                pass
+
+        _WS_TASK["note"] = "改写数据存储中的路径…"
+        olds = [_norm_prefix(old_abs)]
+        rel_root = os.path.relpath(old_abs, PROJECT_ROOT)
+        if not rel_root.startswith(".."):
+            olds.append(_norm_prefix(rel_root))
+        stores = (
+            _g.glob(os.path.join(PROJECT_ROOT, "Output", "asset_index", "*.json"))
+            + _g.glob(os.path.join(PROJECTS_DIR, "*", "project.json"))
+            + _g.glob(os.path.join(PROJECT_ROOT, "Output", "analyzed", "*", "metadata.json"))
+            + _g.glob(os.path.join(PROJECT_ROOT, "Output", "analyzed", "*", "highlight_pool.json"))
+            + _g.glob(os.path.join(PROJECT_ROOT, "Output", "Output", "*", "*.json"))
+        )
+        rewritten = 0
+        for sp in stores:
+            rewritten += _rewrite_store(sp, olds, new_abs, dry=False)
+        save_config("ASSET_ROOT_DIR", new_abs)
+        SCANNED["assets"] = []
+
+        # verify: annotated paths under the new root must exist
+        from src.asset_manager.index_store import load_index
+        missing = 0
+        checked = 0
+        for ann in load_index().values():
+            ap = getattr(ann.metadata, "absolute_path", "") or ""
+            if ap and os.path.normcase(ap).startswith(os.path.normcase(new_abs)):
+                checked += 1
+                if not os.path.exists(ap):
+                    missing += 1
+        _WS_TASK.update({
+            "running": False, "done": _WS_TASK["total"],
+            "result": {"moved": moved, "rewritten": rewritten,
+                       "verified": checked, "missing": missing,
+                       "new_root": new_abs},
+        })
+    except Exception as e:  # noqa: BLE001
+        _WS_TASK.update({"running": False, "error": str(e)[:400]})
+
+
+class MigrateRequest(BaseModel):
+    new_root: str
+    dry_run: bool = True
+
+
+@app.post("/api/workspace/migrate")
+def workspace_migrate(body: MigrateRequest):
+    """One-click workspace relocation: move every file, then rewrite the old
+    root prefix (absolute AND repo-relative forms) across every data store —
+    annotation index, projects, per-source metadata/pools, project outputs."""
+    old_abs = _resolve(str(cfg("ASSET_ROOT_DIR", "resource/imports") or "resource/imports"))
+    new_abs = os.path.abspath(body.new_root.strip().strip('"'))
+    if not new_abs or _norm_prefix(new_abs) == _norm_prefix(old_abs):
+        raise HTTPException(400, "新路径为空或与当前相同")
+    if _norm_prefix(new_abs).startswith(_norm_prefix(old_abs) + "\\"):
+        raise HTTPException(400, "新路径不能在当前工作区内部")
+    if not os.path.isdir(old_abs):
+        raise HTTPException(400, f"当前工作区不存在: {old_abs}")
+
+    if body.dry_run:
+        n_files, n_bytes = 0, 0
+        for dp, _dn, fns in os.walk(old_abs):
+            for fn in fns:
+                n_files += 1
+                try:
+                    n_bytes += os.path.getsize(os.path.join(dp, fn))
+                except OSError:
+                    pass
+        same_drive = os.path.splitdrive(old_abs)[0].lower() == os.path.splitdrive(new_abs)[0].lower()
+        return {"dry_run": True, "files": n_files, "bytes": n_bytes,
+                "same_drive": same_drive, "old_root": old_abs, "new_root": new_abs}
+
+    if not _ws_start("migrate"):
+        raise HTTPException(409, "已有工作区任务在运行")
+    os.makedirs(new_abs, exist_ok=True)
+    threading.Thread(target=_migrate_worker, args=(old_abs, new_abs), daemon=True).start()
+    return {"started": True}
+
+
+def _link_local_worker():
+    import base64
+    import hashlib as _hl
+    try:
+        root = _resolve(str(cfg("ASSET_ROOT_DIR", "resource/imports") or "resource/imports"))
+        imap = _load_immich_map()
+        known = set(imap.keys())
+        exts = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
+        files = []
+        for dp, _dn, fns in os.walk(root):
+            for fn in fns:
+                if fn.lower().endswith(exts) and "__im-" not in fn and fn not in known:
+                    files.append(os.path.join(dp, fn))
+        _WS_TASK["total"] = len(files)
+        checks = []
+        for i, fp in enumerate(files):
+            _WS_TASK.update({"done": i, "note": f"计算校验 {os.path.basename(fp)}"})
+            h = _hl.sha1()
+            with open(fp, "rb") as f:
+                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                    h.update(chunk)
+            checks.append({"fp": fp, "hex": h.hexdigest(),
+                           "b64": base64.b64encode(h.digest()).decode()})
+        linked = 0
+        _WS_TASK["note"] = "查询 Immich…"
+        for k in range(0, len(checks), 50):
+            batch = checks[k:k + 50]
+            r = _immich_req("/assets/bulk-upload-check", "POST",
+                            {"assets": [{"id": c["fp"], "checksum": c["hex"]} for c in batch]})
+            for res in (r.get("results") or []):
+                aid = res.get("assetId")
+                if not aid:
+                    continue
+                c = next((x for x in batch if x["fp"] == res.get("id")), None)
+                if not c:
+                    continue
+                imap[os.path.basename(c["fp"])] = {
+                    "id": aid, "checksum": c["b64"],
+                    "original_name": os.path.basename(c["fp"]),
+                    "linked": "local-original",
+                }
+                linked += 1
+        map_path = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_map.json")
+        with open(map_path, "w", encoding="utf-8") as f:
+            json.dump(imap, f, ensure_ascii=False, indent=2)
+        _WS_TASK.update({"running": False, "done": _WS_TASK["total"],
+                         "result": {"scanned": len(files), "linked": linked}})
+    except Exception as e:  # noqa: BLE001
+        _WS_TASK.update({"running": False, "error": str(e)[:400]})
+
+
+@app.post("/api/workspace/link_local")
+def workspace_link_local():
+    """Match manually-copied originals to their Immich assets by SHA-1 (the
+    checksum Immich stores) via bulk-upload-check, and bind them into
+    immich_map — album badges and 在 Immich 中查看 then work for them too."""
+    if not _ws_start("link_local"):
+        raise HTTPException(409, "已有工作区任务在运行")
+    threading.Thread(target=_link_local_worker, daemon=True).start()
+    return {"started": True}
+
+
 # ── Immich annotation write-back ────────────────────────────────────────────
 # Push CutClaw's VLM annotation into the Immich asset description, making the
 # analysis searchable inside Immich itself. Our block is delimited so repeated
@@ -1359,9 +1650,16 @@ def _assets_with_annotations(assets: list) -> list:
     from src.asset_manager.index_store import load_index
     idx = load_index()
     local_store = _load_local_annotations()
+    # Immich back-link: workspace file name → Immich asset (proxies always,
+    # manual originals after 识别本地原片 ran)
+    _imap = _load_immich_map()
+    _im_base = str(cfg("IMMICH_URL", "") or "").rstrip("/")
     out = []
     for meta in assets:
         d = _dump(meta)
+        _iid = (_imap.get(d.get("file_name") or "") or {}).get("id")
+        if _iid and _im_base:
+            d["immich_url"] = f"{_im_base}/photos/{_iid}"
         h = getattr(meta, "content_hash", "")
         ann = idx.get(h)
         d["annotated"] = ann is not None
@@ -3227,7 +3525,8 @@ def bgm_stitch(body: BgmStitchRequest):
                       "role": p.get("role", "")} for p in picks]
 
     root = cfg("ASSET_ROOT_DIR", "resource/imports")
-    out_dir = os.path.join(PROJECT_ROOT, root)
+    # AI products live in their own workspace subfolder, apart from raw footage
+    out_dir = os.path.join(_resolve(root), "products")
     os.makedirs(out_dir, exist_ok=True)
     base = (body.name or "").strip() or ("BGMmix_" + time.strftime("%m%d_%H%M%S"))
     base = re.sub(r'[\\/:*?"<>|]', "_", base)

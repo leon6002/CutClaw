@@ -517,6 +517,12 @@ function DetailView({
             {asset.width ? `${asset.width}×${asset.height} · ` : ""}
             {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
             {asset.absolute_path || asset.file_path}
+            {(asset as any).immich_url && (
+              <a
+                href={(asset as any).immich_url} target="_blank" rel="noreferrer"
+                className="ml-2 rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10.5px] text-violet-300 hover:bg-violet-500/20"
+              >🖼 在 Immich 中查看</a>
+            )}
           </div>
 
           {/* measured voice/laughter segments — click to LISTEN at that spot */}
@@ -1860,6 +1866,72 @@ export default function AssetsView({
                     }}>
                     🖼 同步标注到 Immich 描述
                   </button>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"
+                    onClick={async () => {
+                      setMoreOpen(false); setError("");
+                      try {
+                        const d = await api<any>("/api/workspace/cleanup", { method: "POST", body: JSON.stringify({ dry_run: true }) });
+                        if (!d.count) { setError("没有可清理的代理（未被项目引用且已标注的才会清）"); return; }
+                        const mb = (d.bytes / 1048576).toFixed(0);
+                        if (!window.confirm(`清理 ${d.count} 个未使用代理，释放约 ${mb} MB？\n（分析成果按内容绑定保留，再次导入会自动恢复文件）`)) return;
+                        const r = await api<any>("/api/workspace/cleanup", { method: "POST", body: JSON.stringify({ dry_run: false }) });
+                        setError(`✓ 已清理 ${r.count} 个代理，释放 ${(r.bytes / 1048576).toFixed(0)} MB`);
+                        scan();
+                      } catch (e: any) { setError(`清理失败：${e.message}`); }
+                    }}>
+                    🧹 清理未使用代理…
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"
+                    onClick={async () => {
+                      setMoreOpen(false); setError("");
+                      try {
+                        await api<any>("/api/workspace/link_local", { method: "POST", body: "{}" });
+                        setError("识别中…（对手动拷入的原片计算校验并匹配 Immich）");
+                        const t = window.setInterval(async () => {
+                          try {
+                            const s = await api<any>("/api/workspace/task");
+                            if (s.running) { setError(`识别中… ${s.done}/${s.total} ${s.note || ""}`); return; }
+                            window.clearInterval(t);
+                            if (s.error) setError(`识别失败：${s.error}`);
+                            else setError(`✓ 扫描 ${s.result?.scanned ?? 0} 个本地原片，成功关联 ${s.result?.linked ?? 0} 个到 Immich`);
+                            scan();
+                          } catch { window.clearInterval(t); }
+                        }, 1500);
+                      } catch (e: any) { setError(`识别失败：${e.message}`); }
+                    }}>
+                    🔗 识别本地原片 ↔ Immich…
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"
+                    onClick={async () => {
+                      setMoreOpen(false); setError("");
+                      const np = window.prompt("新工作区的绝对路径（文件将被移动，所有数据里的路径会自动改写）：");
+                      if (!np?.trim()) return;
+                      try {
+                        const d = await api<any>("/api/workspace/migrate", { method: "POST", body: JSON.stringify({ new_root: np, dry_run: true }) });
+                        const gb = (d.bytes / 1073741824).toFixed(1);
+                        if (!window.confirm(`迁移工作区：\n${d.old_root}\n→ ${d.new_root}\n\n${d.files} 个文件 · ${gb} GB · ${d.same_drive ? "同盘（瞬间完成）" : "跨盘（需要拷贝，可能较久）"}\n\n确认开始？`)) return;
+                        await api<any>("/api/workspace/migrate", { method: "POST", body: JSON.stringify({ new_root: np, dry_run: false }) });
+                        const t = window.setInterval(async () => {
+                          try {
+                            const s = await api<any>("/api/workspace/task");
+                            if (s.running) { setError(`迁移中… ${s.done}/${s.total} ${s.note || ""}`); return; }
+                            window.clearInterval(t);
+                            if (s.error) setError(`迁移失败：${s.error}`);
+                            else {
+                              const r = s.result || {};
+                              setError(`✓ 迁移完成：移动 ${r.moved} 个文件，改写 ${r.rewritten} 处路径，校验 ${r.verified} 条${r.missing ? `（⚠️ ${r.missing} 条缺失，请检查）` : "，全部在位"}`);
+                              setRoot(r.new_root || np);
+                              scan();
+                            }
+                          } catch { window.clearInterval(t); }
+                        }, 1200);
+                      } catch (e: any) { setError(`迁移失败：${e.message}`); }
+                    }}>
+                    📦 迁移工作区…
+                  </button>
                 </div>
               )}
             </div>
@@ -1974,7 +2046,7 @@ export default function AssetsView({
             "flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-medium transition-colors",
             source === "local" ? "bg-cyan-500/15 text-cyan-300" : "text-slate-400 hover:text-slate-200",
           )}>
-          本地素材{assets.length ? ` (${assets.length})` : ""}
+          工作区{assets.length ? ` (${assets.length})` : ""}
         </button>
         <button
           onClick={openImmich}
