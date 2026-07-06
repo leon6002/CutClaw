@@ -123,7 +123,9 @@ def _highlight_pool_step(content_hash: str, progress_callback=None):
 
 def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
                          video_reader, video_fps: float, config,
-                         reader_lock=None, prog_idx: int = -1) -> list[dict] | None:
+                         reader_lock=None, prog_idx: int = -1,
+                         model: str | None = None, api_base: str | None = None,
+                         api_key: str | None = None) -> list[dict] | None:
     """Run dense captioning on a time range: extract frames → VLM → segments.
 
     reader_lock: when clips are processed in parallel threads, decord readers
@@ -178,16 +180,19 @@ def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
             user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
         msgs.append({"role": "user", "content": user_content})
 
-        kwargs = dict(model=config.VIDEO_ANALYSIS_MODEL, messages=msgs,
+        _model = model or config.VIDEO_ANALYSIS_MODEL
+        _base = api_base if api_base is not None else config.VIDEO_ANALYSIS_ENDPOINT
+        _key = api_key if api_key is not None else config.VIDEO_ANALYSIS_API_KEY
+        kwargs = dict(model=_model, messages=msgs,
                       max_tokens=config.VIDEO_ANALYSIS_MODEL_MAX_TOKEN, temperature=0.0)
-        if config.VIDEO_ANALYSIS_ENDPOINT:
-            kwargs["api_base"] = config.VIDEO_ANALYSIS_ENDPOINT
-        if config.VIDEO_ANALYSIS_API_KEY:
-            kwargs["api_key"] = config.VIDEO_ANALYSIS_API_KEY
+        if _base:
+            kwargs["api_base"] = _base
+        if _key:
+            kwargs["api_key"] = _key
 
         if prog_idx >= 0:
             _prog_emit("video_dense", 0, prog_idx, "step", phase="action", iter=1, max_iter=1,
-                       tool=f"VLM 密集描述 · {len(b64_frames)} 帧 → {config.VIDEO_ANALYSIS_MODEL}",
+                       tool=f"VLM 密集描述 · {len(b64_frames)} 帧 → {_model}",
                        args=prompt[:2000])
         _t0 = time.time()
         raw = litellm.completion(**kwargs)
@@ -463,6 +468,18 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
             _prog_emit("video_dense", len(_need_dense), _di, "start", label=_cf.replace(".json", ""))
             _segments = _dense_caption_clip(abs_path, _start_sec, _end_sec, _reader,
                                             _video_fps, config, reader_lock=_rd_lock, prog_idx=_di)
+            if not _segments:
+                # cloud VLM down/flaky → LOCAL VLM for just this clip (when up).
+                # Explicit override params — mutating global config here would
+                # poison the OTHER dense threads still on the cloud.
+                from src.video.deconstruction.video_caption import local_vlm_fallback
+                _lv = local_vlm_fallback()
+                if _lv:
+                    print(f"🛟 [DenseCaption] {_cf}: cloud failed — local {_lv['model']}")
+                    _segments = _dense_caption_clip(
+                        abs_path, _start_sec, _end_sec, _reader, _video_fps, config,
+                        reader_lock=_rd_lock, prog_idx=_di,
+                        model=_lv["model"], api_base=_lv["endpoint"], api_key=_lv["api_key"])
             if _segments:
                 _cd["dense_segments"] = _segments
                 with open(_cp, "w", encoding="utf-8") as _f2:

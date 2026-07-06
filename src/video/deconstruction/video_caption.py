@@ -34,6 +34,35 @@ messages = [
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 
+def local_vlm_fallback() -> Optional[Dict]:
+    """The local ollama VLM entry — ONLY when the daemon is actually up.
+
+    Used as a last-resort captioner when the cloud VLM keeps disconnecting
+    (100%-success rule): the affected clips get local captions (provenance
+    recorded via _captioner) instead of stalling the whole pipeline."""
+    try:
+        import urllib.request
+        entry = None
+        pool_p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "..", "api_pool.json")
+        try:
+            with open(pool_p, "r", encoding="utf-8") as f:
+                for e in json.load(f):
+                    if "11434" in str(e.get("endpoint", "")):
+                        entry = e
+                        break
+        except Exception:  # noqa: BLE001
+            pass
+        entry = entry or {"model": "openai/qwen2.5vl:latest",
+                          "endpoint": "http://127.0.0.1:11434/v1", "api_key": "sk-local"}
+        base = str(entry["endpoint"]).split("/v1")[0]
+        urllib.request.urlopen(base + "/api/tags", timeout=3)
+        return {"model": entry["model"], "endpoint": entry["endpoint"],
+                "api_key": entry.get("api_key") or "sk-local"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 
 
 def gather_clip_frames(
@@ -317,6 +346,8 @@ def _save_caption_result(
     if json_data:
         json_data["duration"] = {"clip_start_time": clip_start_time, "clip_end_time": clip_end_time}
         json_data["frame_range"] = frame_range
+        # provenance: which model produced this caption (cloud vs local fallback)
+        json_data["_captioner"] = getattr(config, "VIDEO_ANALYSIS_MODEL", "")
         if clip_info is not None:
             json_data["long_shot_id"] = clip_info.get("long_shot_id")
             json_data["is_sub_clip"] = bool(clip_info.get("is_sub_clip", False))
@@ -415,13 +446,13 @@ def process_video(
                           reply=(content or "")[:4000])
         return clip, meta, content, clip_idx
 
-    async def _run_overlapped(clip_iter, pbar, timeout, is_last_attempt=False):
+    async def _run_overlapped(clip_iter, pbar, timeout, is_last_attempt=False, concurrency=None):
         """
         Producer-consumer: read frames synchronously, caption concurrently.
         decord VideoReader is not thread-safe, so get_batch is called directly
         in the event loop thread (blocks briefly per clip, but safe).
         """
-        semaphore = asyncio.Semaphore(CONCURRENCY)
+        semaphore = asyncio.Semaphore(concurrency or CONCURRENCY)
         failed_clips = []
         pending_tasks = set()
 
@@ -503,6 +534,32 @@ def process_video(
         loop.close()
 
     pbar.close()
+
+    if failed:
+        # LAST RESORT: the cloud VLM kept failing (disconnects/rate limits) —
+        # caption just the survivors with the LOCAL VLM when ollama is up.
+        # Slower and coarser, but the pipeline finishes (100%-success rule);
+        # provenance is recorded per clip via _captioner.
+        _lv = local_vlm_fallback()
+        if _lv:
+            print(f"🛟 [VideoCaption] {len(failed)} clip(s) still failing on the cloud VLM — "
+                  f"falling back to LOCAL {_lv['model']} for just these clips")
+            _prev = (config.VIDEO_ANALYSIS_MODEL, config.VIDEO_ANALYSIS_ENDPOINT,
+                     config.VIDEO_ANALYSIS_API_KEY)
+            config.VIDEO_ANALYSIS_MODEL = _lv["model"]
+            config.VIDEO_ANALYSIS_ENDPOINT = _lv["endpoint"]
+            config.VIDEO_ANALYSIS_API_KEY = _lv["api_key"]
+            loop2 = asyncio.new_event_loop()
+            pbar2 = tqdm(total=len(failed), desc="Local VLM fallback")
+            try:
+                failed = loop2.run_until_complete(
+                    _run_overlapped(iter(failed), pbar2, timeout=300,
+                                    is_last_attempt=True, concurrency=2))
+            finally:
+                pbar2.close()
+                loop2.close()
+                (config.VIDEO_ANALYSIS_MODEL, config.VIDEO_ANALYSIS_ENDPOINT,
+                 config.VIDEO_ANALYSIS_API_KEY) = _prev
 
     if failed:
         # HARD STOP before scene merge. Proceeding with a partial clip set used

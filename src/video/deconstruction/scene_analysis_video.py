@@ -138,10 +138,14 @@ class SceneVideoAnalyzer:
         if self.subtitles:
             print(f"✅ [SceneAnalysis] Loaded {len(self.subtitles)} subtitle entries")
 
-    async def _call_vlm(self, system_prompt: str, content: List[Dict], max_tokens: int = 4096, timeout: float = 120) -> Optional[str]:
-        """调用 VLM"""
+    async def _call_vlm(self, system_prompt: str, content: List[Dict], max_tokens: int = 4096,
+                        timeout: float = 120, override: Optional[Dict] = None) -> Optional[str]:
+        """调用 VLM(override: 本地兜底时显式换模型,不动全局 config)"""
+        _model = (override or {}).get("model") or config.VIDEO_ANALYSIS_MODEL
+        _base = (override or {}).get("endpoint") or config.VIDEO_ANALYSIS_ENDPOINT
+        _key = (override or {}).get("api_key") or config.VIDEO_ANALYSIS_API_KEY
         kwargs = dict(
-            model=config.VIDEO_ANALYSIS_MODEL,
+            model=_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
@@ -150,10 +154,10 @@ class SceneVideoAnalyzer:
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
-        if config.VIDEO_ANALYSIS_ENDPOINT:
-            kwargs["api_base"] = config.VIDEO_ANALYSIS_ENDPOINT
-        if config.VIDEO_ANALYSIS_API_KEY:
-            kwargs["api_key"] = config.VIDEO_ANALYSIS_API_KEY
+        if _base:
+            kwargs["api_base"] = _base
+        if _key:
+            kwargs["api_key"] = _key
 
         try:
             response = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=timeout)
@@ -247,6 +251,25 @@ class SceneVideoAnalyzer:
                              reply=(result or "")[:4000])
             if attempt < max_retries - 1:
                 print(f"⚠️  [SceneAnalysis] Output missing required fields, retrying ({attempt + 1}/{max_retries})...")
+
+        # LAST RESORT: cloud VLM exhausted its retries — one local-VLM attempt
+        # (explicit override, never mutating config under concurrent tasks)
+        try:
+            from src.video.deconstruction.video_caption import local_vlm_fallback
+            _lv = local_vlm_fallback()
+        except Exception:  # noqa: BLE001
+            _lv = None
+        if _lv:
+            print(f"🛟 [SceneAnalysis] cloud VLM failed {max_retries}× — local {_lv['model']}")
+            _emit_scene_step(phase="action", iter=max_retries + 1, max_iter=max_retries + 1,
+                             tool=f"本地 VLM 兜底 → {_lv['model']}", args=prompt[:2000])
+            result = await self._call_vlm(prompt, content, max_tokens=4096, timeout=300, override=_lv)
+            parsed = parse_json_safely(result) if result else None
+            if parsed and 'scene_classification' in parsed:
+                _emit_scene_step(phase="result", iter=max_retries + 1, max_iter=max_retries + 1,
+                                 verdict="warn", result="本地 VLM 兜底成功",
+                                 reply=(result or "")[:4000])
+                return parsed
 
         print(f"❌ [SceneAnalysis] Failed to get valid output after {max_retries} attempts")
         return parsed
