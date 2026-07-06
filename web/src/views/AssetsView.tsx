@@ -1373,7 +1373,7 @@ export default function AssetsView({
   const [typeTab, setTypeTab] = useState<string>("video");
   const [annWb, setAnnWb] = useState<{ task: string; idx?: number } | null>(null);
   const [query, setQuery] = useState("");
-  const [sortBy, setSortBy] = useState<"score" | "time_desc" | "time_asc">("score");
+  const [sortBy, setSortBy] = useState<"trip" | "score" | "time_desc" | "time_asc">("trip");
   const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "local" | "none">("all");
   const [tagFilter, setTagFilter] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
@@ -1459,9 +1459,14 @@ export default function AssetsView({
   const [interrupted, setInterrupted] = useState<{ unfinished: number } | null>(null);
   // cards queued while another batch runs (server chains them automatically)
   const [localQueued, setLocalQueued] = useState<Set<string>>(new Set());
-  // asset source: local folder vs the Immich library (full-page grid mode)
+  // asset source: local folder vs the Immich library (full-page grid mode).
+  // The Immich tab is ALBUM-FIRST: the user organizes Immich by destination
+  // albums, so that's the browsing unit; search is the secondary path.
   const [source, setSource] = useState<"local" | "immich">("local");
   const [imStatus, setImStatus] = useState<{ version?: string; videos?: number } | null>(null);
+  const [imMode, setImMode] = useState<"albums" | "album" | "search">("albums");
+  const [imAlbums, setImAlbums] = useState<any[] | null>(null);
+  const [imAlbum, setImAlbum] = useState<{ id: string; name: string; items: any[]; total: number } | null>(null);
   const [imItems, setImItems] = useState<any[]>([]);
   const [imQuery, setImQuery] = useState("");
   const [imLoading, setImLoading] = useState(false);
@@ -1471,7 +1476,7 @@ export default function AssetsView({
   const [imMsg, setImMsg] = useState("");
 
   const imSearch = async (q: string, page = 1, append = false) => {
-    setImLoading(true);
+    setImLoading(true); setImMode("search");
     try {
       const r = await api<{ items: any[] }>("/api/immich/search", {
         method: "POST", body: JSON.stringify({ query: q, size: 36, page }),
@@ -1482,11 +1487,30 @@ export default function AssetsView({
     setImLoading(false);
   };
 
+  const imLoadAlbums = async () => {
+    setImLoading(true); setImMode("albums"); setImAlbum(null);
+    try {
+      const r = await api<{ albums: any[] }>("/api/immich/albums");
+      setImAlbums(r.albums ?? []);
+    } catch (e: any) { setImMsg(`相簿加载失败：${e.message}`); }
+    setImLoading(false);
+  };
+
+  const imOpenAlbum = async (al: any) => {
+    setImLoading(true);
+    try {
+      const r = await api<any>(`/api/immich/albums/${al.id}`);
+      setImAlbum({ id: al.id, name: r.name || al.name, items: r.items ?? [], total: r.total ?? 0 });
+      setImMode("album");
+    } catch (e: any) { setImMsg(`相簿打开失败：${e.message}`); }
+    setImLoading(false);
+  };
+
   const openImmich = () => {
     setSource("immich");
     if (!imStatus) {
       api<any>("/api/immich/status")
-        .then((st) => { setImStatus(st); imSearch(""); })
+        .then((st) => { setImStatus(st); imLoadAlbums(); })
         .catch((e) => setImMsg(e.message || "无法连接 Immich — 检查 IMMICH_URL / IMMICH_API_KEY"));
     }
   };
@@ -1502,6 +1526,8 @@ export default function AssetsView({
         (r.errors.length ? ` · 失败 ${r.errors.length}` : ""));
       setImPicked(new Set());
       scan();
+      // refresh badges in the open album so 已导入 shows immediately
+      if (imAlbum) imOpenAlbum({ id: imAlbum.id, name: imAlbum.name });
     } catch (e: any) { setImMsg(`导入失败：${e.message}`); }
     setImImporting(false);
   };
@@ -1642,7 +1668,8 @@ export default function AssetsView({
       // artifacts, not raw material — keep them visually apart)
       const gm = Number(!!b.bgmmix) - Number(!!a.bgmmix);
       if (gm !== 0) return gm;
-      if (sortBy === "time_desc") return (b.capture_time ?? "").localeCompare(a.capture_time ?? "");
+      if (sortBy === "time_desc" || sortBy === "trip")
+        return (b.capture_time ?? "").localeCompare(a.capture_time ?? "");
       if (sortBy === "time_asc") {
         // assets without capture time sink to the end
         const ta = a.capture_time ?? "9999", tb = b.capture_time ?? "9999";
@@ -1650,6 +1677,79 @@ export default function AssetsView({
       }
       return assetScore(b) - assetScore(a);
     });
+
+  // ── trip sections (旅程分组): the wall mirrors how the user thinks —
+  // "which trip" — using the SAME >14-day-gap rule as the journey layer and
+  // the pipeline canvas. Audio has no capture time → stays flat.
+  const tripGroups = (() => {
+    if (sortBy !== "trip" || typeTab === "audio") return null;
+    const dateOf = (a: any): string | null => {
+      const ct = (a.capture_time ?? "").slice(0, 10);
+      if (ct) return ct;
+      const m = (a.file_name || "").match(/(20\d{2})[-_]?(\d{2})[-_]?(\d{2})/);
+      if (!m) return null;
+      const mo = Number(m[2]), dy = Number(m[3]);
+      return (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) ? `${m[1]}-${m[2]}-${m[3]}` : null;
+    };
+    const dated = shown.filter((a) => dateOf(a));
+    const undated = shown.filter((a) => !dateOf(a));
+    const groups: { label: string; sub: string; items: typeof shown }[] = [];
+    for (const a of dated) {   // already sorted new→old
+      const d = dateOf(a)!;
+      const g = groups[groups.length - 1];
+      const lastD = g ? dateOf(g.items[g.items.length - 1])! : null;
+      if (g && lastD && Math.abs(Date.parse(lastD) - Date.parse(d)) / 86400000 <= 14) {
+        g.items.push(a);
+      } else {
+        groups.push({ label: "", sub: "", items: [a] });
+      }
+    }
+    for (const g of groups) {
+      const ds = g.items.map(dateOf).filter(Boolean) as string[];
+      const s = ds[ds.length - 1], e = ds[0];   // new→old order
+      const fmt = (d: string) => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+      g.label = s === e ? `${e.slice(0, 4)}年 ${fmt(e)}` : `${e.slice(0, 4)}年 ${fmt(s)} – ${fmt(e)}`;
+      const locs = new Map<string, number>();
+      for (const a of g.items) if (a.location) locs.set(a.location, (locs.get(a.location) ?? 0) + 1);
+      const top = [...locs.entries()].sort((x, y) => y[1] - x[1])[0];
+      g.sub = top ? `📍 ${top[0]}` : "";
+    }
+    if (undated.length) groups.push({ label: "未归类", sub: "", items: undated });
+    return groups;
+  })();
+
+  // one card renderer shared by the flat grid and the trip sections.
+  // key falls back to file_path: unannotated assets all have content_hash ""
+  // and React key collisions rendered several cards as clones of one file.
+  const renderAssetCard = (a: (typeof shown)[number], i: number) => (
+    <AssetCard
+      key={a.content_hash || a.file_path || a.file_name || String(i)}
+      a={a} index={i} onOpen={() => setDetail(a)}
+      picked={a.asset_type === "audio" ? pickedAudios.includes(a.content_hash) : picked.has(a.content_hash)}
+      onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
+      hearted={hearts.has(a.content_hash)}
+      onToggleHeart={() => toggleHeart(a)}
+      annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
+      queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
+      annStage={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.stage || annJob.meta.stage}
+      annStageDetail={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.detail || annJob.meta.stage_detail}
+      annBusy={
+        // only the card's OWN activity blocks its button — other
+        // cards stay clickable and join the queue mid-batch
+        (busy && (annJob.meta.files ?? {})[a.content_hash] !== undefined)
+        || localQueued.has(a.content_hash)
+      }
+      queuedLocal={localQueued.has(a.content_hash)}
+      onAnnotate={() => {
+        if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;
+        annotate([a.content_hash], a.annotated);
+      }}
+      onAnnotateLocal={a.asset_type === "video" ? () => {
+        if (a.annotated_local && !window.confirm(`用本地 VLM 重新标注「${a.file_name || a.file_path}」？只更新本地轨道，不影响云端结果。`)) return;
+        annotate([a.content_hash], !!a.annotated_local, "local");
+      } : undefined}
+    />
+  );
 
   const selSel = selJob.meta.selection;
   const glass = "rounded-2xl border-white/[0.07] bg-slate-900/50";
@@ -1886,25 +1986,83 @@ export default function AssetsView({
         </button>
       </div>
 
-      {source === "immich" ? (
+      {source === "immich" ? (() => {
+        // one card renderer for both the search grid and the album grid —
+        // with local status badges (已导入 / Q 分) inline where picking happens
+        const imCard = (it: any) => (
+          <button
+            key={it.id}
+            disabled={it.imported}
+            title={it.imported
+              ? (it.annotated ? "已导入并标注（按内容识别，不会重复）" : "该素材已导入本地（按内容识别，不会重复）")
+              : undefined}
+            className={cn(
+              "group relative overflow-hidden rounded-lg border text-left transition-all",
+              it.imported
+                ? "cursor-default border-emerald-500/40"
+                : imPicked.has(it.id)
+                  ? "border-violet-400/70 shadow-[0_0_12px_rgba(167,139,250,0.3)]"
+                  : "border-white/[0.08] hover:border-white/25",
+            )}
+            onClick={() => {
+              if (it.imported) return;
+              setImPicked((s0) => {
+                const n = new Set(s0);
+                if (n.has(it.id)) n.delete(it.id); else n.add(it.id);
+                return n;
+              });
+            }}
+          >
+            <img src={it.thumb} loading="lazy"
+              className={cn("aspect-video w-full object-cover", it.imported && "opacity-40")} />
+            {it.imported ? (
+              <span className="absolute top-1.5 left-1.5 rounded-full border border-emerald-400/50 bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                {it.annotated ? (it.quality != null ? `✓ Q ${it.quality}` : "✓ 已标注") : "已导入"}
+              </span>
+            ) : imPicked.has(it.id) && (
+              <span className="absolute top-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-violet-400 text-xs font-bold text-slate-950">✓</span>
+            )}
+            <div className="truncate bg-black/55 px-1.5 py-0.5 text-[10.5px] text-slate-300">{it.name}</div>
+          </button>
+        );
+        const gridItems = imMode === "album" ? (imAlbum?.items ?? []) : imItems;
+        return (
         <>
           <div className="my-4 flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 basis-[360px]">
+            {imMode !== "albums" && (
+              <Button variant="outline" size="sm" className="h-9 border-white/10 bg-white/[0.04] text-xs"
+                onClick={imLoadAlbums}>← 相簿</Button>
+            )}
+            {imMode === "album" && imAlbum && (
+              <span className="text-sm font-semibold text-slate-200">
+                📁 {imAlbum.name}
+                <span className="ml-2 text-[11px] font-normal text-slate-500">
+                  {imAlbum.items.length} 个视频{imAlbum.total > imAlbum.items.length ? ` · 共 ${imAlbum.total} 项（照片不列出）` : ""}
+                </span>
+              </span>
+            )}
+            <div className="relative flex-1 basis-[300px]">
               <Search className="absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
               <Input
                 className="h-9 w-full border-white/10 bg-black/25 pl-8 text-xs"
-                placeholder="CLIP 语义搜索（英文效果最佳，如 two women running in flower field）— 回车搜索，留空显示最新"
+                placeholder="CLIP 语义搜索全库（英文效果最佳）— 回车搜索"
                 value={imQuery}
                 onChange={(e) => setImQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && imSearch(imQuery)}
               />
             </div>
-            <Button variant="outline" className="h-9 border-white/10 bg-white/[0.04] text-xs"
-              onClick={() => imSearch(imQuery)} disabled={imLoading}>
-              {imLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "搜索"}
-            </Button>
             {imMsg && <span className="text-xs text-emerald-400">{imMsg}</span>}
             <div className="ml-auto flex items-center gap-2">
+              {imMode === "album" && imAlbum && imAlbum.items.some((x: any) => !x.imported) && (
+                <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
+                  onClick={() => setImPicked((s0) => {
+                    const n = new Set(s0);
+                    imAlbum.items.forEach((x: any) => { if (!x.imported) n.add(x.id); });
+                    return n;
+                  })}>
+                  全选未导入 ({imAlbum.items.filter((x: any) => !x.imported).length})
+                </Button>
+              )}
               {imPicked.size > 0 && (
                 <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
                   onClick={() => setImPicked(new Set())}>清空 ({imPicked.size})</Button>
@@ -1919,56 +2077,58 @@ export default function AssetsView({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
-            {imItems.map((it: any) => (
-              <button
-                key={it.id}
-                disabled={it.imported}
-                title={it.imported ? "该素材已导入本地（按内容识别，不会重复）" : undefined}
-                className={cn(
-                  "group relative overflow-hidden rounded-lg border text-left transition-all",
-                  it.imported
-                    ? "cursor-default border-emerald-500/40"
-                    : imPicked.has(it.id)
-                      ? "border-violet-400/70 shadow-[0_0_12px_rgba(167,139,250,0.3)]"
-                      : "border-white/[0.08] hover:border-white/25",
-                )}
-                onClick={() => {
-                  if (it.imported) return;
-                  setImPicked((s0) => {
-                    const n = new Set(s0);
-                    if (n.has(it.id)) n.delete(it.id); else n.add(it.id);
-                    return n;
-                  });
-                }}
-              >
-                <img src={it.thumb} loading="lazy"
-                  className={cn("aspect-video w-full object-cover", it.imported && "opacity-40")} />
-                {it.imported ? (
-                  <span className="absolute top-1.5 left-1.5 rounded-full border border-emerald-400/50 bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">已导入</span>
-                ) : imPicked.has(it.id) && (
-                  <span className="absolute top-1.5 left-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-violet-400 text-xs font-bold text-slate-950">✓</span>
-                )}
-                <div className="truncate bg-black/55 px-1.5 py-0.5 text-[10.5px] text-slate-300">{it.name}</div>
-              </button>
-            ))}
-          </div>
-          {imItems.length === 0 && !imLoading && (
-            <EmptyHint>{imMsg || "没有结果"}</EmptyHint>
-          )}
-          {imItems.length >= 36 && (
-            <div className="mt-3 text-center">
-              <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
-                disabled={imLoading} onClick={() => imSearch(imQuery, imPage + 1, true)}>
-                {imLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "加载更多"}
-              </Button>
-            </div>
+          {imMode === "albums" ? (
+            <>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
+                {(imAlbums ?? []).map((al: any) => (
+                  <button
+                    key={al.id}
+                    className="group overflow-hidden rounded-xl border border-white/[0.08] text-left transition-all hover:border-violet-400/50"
+                    onClick={() => imOpenAlbum(al)}
+                  >
+                    <div className="relative aspect-[4/3] w-full overflow-hidden bg-slate-900">
+                      {al.thumb && (
+                        <img src={al.thumb} loading="lazy"
+                          className="h-full w-full object-cover transition-transform group-hover:scale-[1.04]" />
+                      )}
+                      <span className="absolute right-1.5 bottom-1.5 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-slate-200">{al.count}</span>
+                    </div>
+                    <div className="px-2 py-1.5">
+                      <div className="truncate text-xs font-medium text-slate-200">{al.name}</div>
+                      <div className="text-[10px] text-slate-500">{al.start}{al.end && al.end !== al.start ? ` ~ ${al.end}` : ""}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+              {imAlbums !== null && imAlbums.length === 0 && !imLoading && (
+                <EmptyHint>Immich 里还没有相簿 — 也可以直接用上方语义搜索</EmptyHint>
+              )}
+              {imLoading && imAlbums === null && <EmptyHint>加载相簿中…</EmptyHint>}
+            </>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
+                {gridItems.map(imCard)}
+              </div>
+              {gridItems.length === 0 && !imLoading && (
+                <EmptyHint>{imMsg || (imMode === "album" ? "这个相簿里没有视频" : "没有结果")}</EmptyHint>
+              )}
+              {imMode === "search" && imItems.length >= 36 && (
+                <div className="mt-3 text-center">
+                  <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
+                    disabled={imLoading} onClick={() => imSearch(imQuery, imPage + 1, true)}>
+                    {imLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "加载更多"}
+                  </Button>
+                </div>
+              )}
+            </>
           )}
           <p className="mt-3 text-[11px] text-slate-600">
             导入的是 Immich 转码代理（约 3-10MB/个），标注/剪辑全程用代理，4K 原片仅渲染时按需读取。
           </p>
         </>
-      ) : scanned ? (
+        );
+      })() : scanned ? (
         <>
           <div className="my-4 flex flex-wrap items-center gap-3">
             <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-1">
@@ -2004,6 +2164,7 @@ export default function AssetsView({
               className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
               value={sortBy} onChange={(e) => setSortBy(e.target.value as any)}
             >
+              <option value="trip">按旅程分组</option>
               <option value="score">按评分 高→低</option>
               <option value="time_desc">按拍摄时间 新→旧</option>
               <option value="time_asc">按拍摄时间 旧→新</option>
@@ -2049,39 +2210,24 @@ export default function AssetsView({
 
           {shown.length === 0 ? (
             <EmptyHint>该类型下没有素材</EmptyHint>
+          ) : tripGroups ? (
+            tripGroups.map((g) => (
+              <div key={g.label} className="mb-5">
+                <div className="mb-2 flex items-baseline gap-2 border-b border-white/[0.07] pb-1.5">
+                  <span className="text-sm font-semibold text-slate-200">{g.label}</span>
+                  {g.sub && <span className="text-xs text-slate-400">{g.sub}</span>}
+                  <span className="text-[11px] text-slate-600">{g.items.length} 个</span>
+                </div>
+                <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
+                  {g.items.map((a, i) => renderAssetCard(a, i))}
+                </div>
+              </div>
+            ))
           ) : (
             <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
-              {shown.map((a, i) => (
-                <AssetCard
-                  key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
-                  picked={a.asset_type === "audio" ? pickedAudios.includes(a.content_hash) : picked.has(a.content_hash)}
-                  onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
-                  hearted={hearts.has(a.content_hash)}
-                  onToggleHeart={() => toggleHeart(a)}
-                  annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
-                  queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
-                  annStage={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.stage || annJob.meta.stage}
-                  annStageDetail={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.detail || annJob.meta.stage_detail}
-                  annBusy={
-                    // only the card's OWN activity blocks its button — other
-                    // cards stay clickable and join the queue mid-batch
-                    (busy && (annJob.meta.files ?? {})[a.content_hash] !== undefined)
-                    || localQueued.has(a.content_hash)
-                  }
-                  queuedLocal={localQueued.has(a.content_hash)}
-                  onAnnotate={() => {
-                    if (a.annotated && !window.confirm(`重新标注「${a.file_name || a.file_path}」？将重跑视觉分析（消耗 API）。`)) return;
-                    annotate([a.content_hash], a.annotated);
-                  }}
-                  onAnnotateLocal={a.asset_type === "video" ? () => {
-                    if (a.annotated_local && !window.confirm(`用本地 VLM 重新标注「${a.file_name || a.file_path}」？只更新本地轨道，不影响云端结果。`)) return;
-                    annotate([a.content_hash], !!a.annotated_local, "local");
-                  } : undefined}
-                />
-              ))}
+              {shown.map((a, i) => renderAssetCard(a, i))}
             </div>
           )}
-
           {/* manual selection apply bar */}
           {(pickedVideos.length > 0 || pickedAudioAssets.length > 0) && (
             <div className="sticky bottom-3 z-20 mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-slate-900/95 px-4 py-2.5 shadow-[0_0_24px_rgba(0,0,0,0.5)]">

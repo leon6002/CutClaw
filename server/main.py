@@ -41,6 +41,12 @@ from pydantic import BaseModel
 from src.utils.env_keys import env_expr_name, resolve_env_expr, write_env_var
 from src.utils.ui_state import UI_STATE_KEYS, read_state, write_state
 
+# env-backed secrets (cfg() resolves os.getenv exprs) need .env in THIS
+# process from the start — previously they only worked after some request
+# happened to lazily import src.config, which load_dotenv's as a side effect
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "src", "config.py")
 
 app = FastAPI(title="CutClaw API")
@@ -684,6 +690,74 @@ def immich_search(body: ImmichSearch):
         d["imported"] = (d.get("id") in imported_ids) or (a.get("checksum") in imported_cks)
         slim.append(d)
     return {"items": slim, "next": (r.get("assets") or {}).get("nextPage")}
+
+
+@app.get("/api/immich/albums")
+def immich_albums():
+    """The user organizes Immich by DESTINATION albums — that's the mental
+    model for finding footage, so the Immich tab browses albums first."""
+    albums = _immich_req("/albums")
+    out = []
+    for al in albums or []:
+        out.append({
+            "id": al.get("id"),
+            "name": al.get("albumName", ""),
+            "count": al.get("assetCount", 0),
+            "thumb": (f"/api/immich/thumb/{al.get('albumThumbnailAssetId')}"
+                      if al.get("albumThumbnailAssetId") else None),
+            "start": (al.get("startDate") or "")[:10],
+            "end": (al.get("endDate") or "")[:10],
+        })
+    out.sort(key=lambda x: x.get("end") or "", reverse=True)
+    return {"albums": out}
+
+
+@app.get("/api/immich/albums/{album_id}")
+def immich_album_assets(album_id: str):
+    """One album's VIDEO assets with local status inline: imported? annotated?
+    quality score? — the decision signals live where the picking happens,
+    instead of only appearing after import+annotate."""
+    safe = "".join(c for c in album_id if c.isalnum() or c == "-")
+    al = _immich_req(f"/albums/{safe}")
+    # Immich v3 album payloads no longer embed assets — pull them via
+    # metadata search filtered by albumIds (paginated, capped at ~600)
+    assets: list = []
+    page = 1
+    while page and len(assets) < 600:
+        r = _immich_req("/search/metadata", "POST",
+                        {"albumIds": [safe], "type": "VIDEO", "size": 200,
+                         "page": page, "withExif": True, "order": "asc"})
+        chunk = (r.get("assets") or {}).get("items", [])
+        assets.extend(chunk)
+        page = (r.get("assets") or {}).get("nextPage")
+    imap = _load_immich_map()
+    by_id = {v.get("id"): k for k, v in imap.items() if v.get("id")}
+    by_ck = {v.get("checksum"): k for k, v in imap.items() if v.get("checksum")}
+    # proxy file name → quality score from the annotation index
+    ann_q: dict = {}
+    try:
+        from src.asset_manager.index_store import load_index
+        for ann in load_index().values():
+            fn = os.path.basename(getattr(ann.metadata, "absolute_path", "") or "")
+            if fn:
+                try:
+                    ann_q[fn] = (_dump(ann.annotation) or {}).get("quality_score")
+                except Exception:  # noqa: BLE001
+                    ann_q[fn] = None
+    except Exception:  # noqa: BLE001
+        pass
+    items = []
+    for a in assets:
+        d = _slim_immich_asset(a)
+        fname = by_id.get(d.get("id")) or by_ck.get(a.get("checksum"))
+        d["imported"] = bool(fname)
+        if fname and fname in ann_q:
+            d["annotated"] = True
+            d["quality"] = ann_q[fname]
+        items.append(d)
+    items.sort(key=lambda x: x.get("taken_at") or "")
+    return {"name": al.get("albumName", ""), "items": items,
+            "total": int(al.get("assetCount") or 0), "videos": len(items)}
 
 
 @app.get("/api/immich/thumb/{asset_id}")
