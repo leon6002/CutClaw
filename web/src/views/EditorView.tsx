@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { api, fmtDuration, type JobState } from "../api";
+import { api, fmtDuration, mediaUrl, type JobState } from "../api";
 import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
@@ -70,6 +70,10 @@ export default function EditorView({
   const [paramSugError, setParamSugError] = useState("");
   // multi-music fusion pre-step status (runs right before the pipeline)
   const [fusion, setFusion] = useState<{ state: "running" | "done" | "error"; detail: string } | null>(null);
+  // inline media preview — one shared player, no detail page needed
+  const [preview, setPreview] = useState<{ kind: "video" | "audio"; path: string } | null>(null);
+  const previewToggle = (kind: "video" | "audio", path: string) =>
+    setPreview((cur) => (cur?.path === path ? null : { kind, path }));
 
   const p = project;
   const job = pipelineJob;
@@ -246,15 +250,30 @@ export default function EditorView({
                   <div className="py-3 text-xs text-slate-500">resource/video 下没有视频 — 可在下方粘贴路径添加</div>
                 )}
                 {allVideoOptions.map((v) => (
-                  <label key={v} className="flex cursor-pointer items-center gap-2.5 py-1.5">
+                  <label key={v} className="group flex cursor-pointer items-center gap-2.5 py-1.5">
                     <Checkbox
                       checked={p.videos.includes(v)} disabled={running}
                       onCheckedChange={() => toggleVideo(v)}
                     />
-                    <span className="truncate text-[13px] text-slate-300" title={v}>{basename(v)}</span>
+                    <span className="min-w-0 flex-1 truncate text-[13px] text-slate-300" title={v}>{basename(v)}</span>
+                    <button
+                      className={cn("shrink-0 rounded px-1.5 text-[11px]",
+                        preview?.path === v ? "text-cyan-300" : "text-slate-600 opacity-0 group-hover:opacity-100 hover:text-cyan-300")}
+                      title="预览播放"
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); previewToggle("video", v); }}
+                    >{preview?.path === v ? "⏹" : "▶"}</button>
                   </label>
                 ))}
               </ScrollArea>
+              {preview?.kind === "video" && (
+                <div className="mt-2 rounded-lg border border-cyan-500/25 bg-black/40 p-2">
+                  <div className="mb-1 flex items-center text-[11px] text-slate-400">
+                    <span className="min-w-0 truncate">▶ {basename(preview.path)}</span>
+                    <button className="ml-auto shrink-0 text-slate-500 hover:text-slate-300" onClick={() => setPreview(null)}>✕</button>
+                  </div>
+                  <video src={mediaUrl(preview.path)} controls autoPlay className="max-h-[240px] w-full rounded bg-black" />
+                </div>
+              )}
               <div className="mt-2 flex gap-2">
                 <Input
                   className="h-8 flex-1 text-xs" placeholder="粘贴视频路径回车添加…"
@@ -281,9 +300,15 @@ export default function EditorView({
                 <div className="rounded-lg border border-violet-500/25 bg-black/25 p-2">
                   <div className="space-y-1">
                     {p.audios!.map((a, i) => (
-                      <div key={a} className="flex items-center gap-2 text-xs text-slate-300">
+                      <div key={a} className="group flex items-center gap-2 text-xs text-slate-300">
                         <span className="flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded-full border border-violet-400/50 bg-violet-500/15 font-mono text-[10px] text-violet-300">{i + 1}</span>
                         <span className="min-w-0 flex-1 truncate">{basename(a)}</span>
+                        <button
+                          className={cn("shrink-0 rounded px-1 text-[11px]",
+                            preview?.path === a ? "text-violet-300" : "text-slate-600 opacity-0 group-hover:opacity-100 hover:text-violet-300")}
+                          title="试听"
+                          onClick={() => previewToggle("audio", a)}
+                        >{preview?.path === a ? "⏹" : "▶"}</button>
                         <button
                           className="shrink-0 text-slate-600 hover:text-red-400"
                           title="从融合列表移除"
@@ -296,33 +321,60 @@ export default function EditorView({
                       </div>
                     ))}
                   </div>
-                  {/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") ? (
-                    <div className="mt-1.5 flex items-center gap-2 border-t border-white/[0.06] pt-1.5 text-[10.5px] text-emerald-400/90">
-                      <span className="min-w-0 truncate">✓ 已融合:{basename(p.audio)}</span>
-                      <button
-                        className="ml-auto shrink-0 rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-violet-300 hover:bg-violet-500/20"
-                        disabled={running}
-                        title="丢弃这次融合结果,下次运行时按当前列表和目标时长重新融合"
-                        onClick={() => set({ audio: p.audios![0] || "" })}
-                      >重新融合</button>
-                    </div>
-                  ) : (
+                  {!/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
                     <div className="mt-1.5 border-t border-white/[0.06] pt-1.5 text-[10.5px] text-violet-300/70">
                       运行时会按目标时长 AI 融合成一条 BGM
                     </div>
                   )}
                 </div>
               ) : (
-                <Select value={p.audio || undefined} onValueChange={(v) => set({ audio: v === NONE ? "" : v, audios: v === NONE ? [] : [v] })} disabled={running}>
-                  <SelectTrigger className="w-full border-white/10 bg-black/25">
-                    <SelectValue placeholder="选择音频…" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {allAudioOptions.map((a) => (
-                      <SelectItem key={a} value={a}>{basename(a)}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="flex items-center gap-2">
+                  <Select value={p.audio || undefined} onValueChange={(v) => set({ audio: v === NONE ? "" : v, audios: v === NONE ? [] : [v] })} disabled={running}>
+                    <SelectTrigger className="w-full border-white/10 bg-black/25">
+                      <SelectValue placeholder="选择音频…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {allAudioOptions.map((a) => (
+                        <SelectItem key={a} value={a}>{basename(a)}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {p.audio && (
+                    <button
+                      className={cn("shrink-0 rounded border border-white/10 px-2 py-1.5 text-xs",
+                        preview?.path === p.audio ? "text-violet-300" : "text-slate-500 hover:text-violet-300")}
+                      title="试听" onClick={() => previewToggle("audio", p.audio)}
+                    >{preview?.path === p.audio ? "⏹" : "▶"}</button>
+                  )}
+                </div>
+              )}
+              {/* 合成 BGM — a project ARTIFACT, shown apart from the raw tracks */}
+              {(p.audios?.length ?? 0) > 1 && /BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
+                <div className="mt-2 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.05] p-2">
+                  <div className="flex items-center gap-2 text-xs text-emerald-300">
+                    <span className="shrink-0">🤖 合成 BGM</span>
+                    <span className="min-w-0 flex-1 truncate text-emerald-400/90" title={p.audio}>{basename(p.audio)}</span>
+                    <button
+                      className={cn("shrink-0 rounded px-1 text-[11px]",
+                        preview?.path === p.audio ? "text-emerald-300" : "text-slate-500 hover:text-emerald-300")}
+                      title="试听合成结果"
+                      onClick={() => previewToggle("audio", p.audio)}
+                    >{preview?.path === p.audio ? "⏹" : "▶"}</button>
+                    <button
+                      className="shrink-0 rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-[10.5px] text-violet-300 hover:bg-violet-500/20"
+                      disabled={running}
+                      title="丢弃这次融合结果,下次运行时按当前列表和目标时长重新融合"
+                      onClick={() => set({ audio: p.audios![0] || "" })}
+                    >重新融合</button>
+                  </div>
+                </div>
+              )}
+              {preview?.kind === "audio" && (
+                <div className="mt-2 flex items-center gap-2 rounded-lg border border-violet-500/25 bg-black/40 p-2">
+                  <span className="min-w-0 shrink truncate text-[11px] text-slate-400">🎵 {basename(preview.path)}</span>
+                  <audio src={mediaUrl(preview.path)} controls autoPlay className="h-8 min-w-0 flex-1" />
+                  <button className="shrink-0 text-slate-500 hover:text-slate-300" onClick={() => setPreview(null)}>✕</button>
+                </div>
               )}
             </div>
 
