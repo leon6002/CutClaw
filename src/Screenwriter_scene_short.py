@@ -231,13 +231,30 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
             )
             _sw_state("done")
 
+        def _salvage() -> str | None:
+            # deepseek reasoning models occasionally finish with an EMPTY
+            # content while the actual answer sits in reasoning_content (the
+            # BGM planner hit the same quirk). Hand the thinking text to the
+            # callers' JSON extractors instead of failing the step.
+            r = (_reasoning or "").strip()
+            if not r:
+                return None
+            print("⚠️ [Screenwriter] 模型正文为空但思考非空（推理模型已知怪癖）——"
+                  "把思考文本交给解析器抢救答案", flush=True)
+            return r
+
         if content is None:
-            _emit_ok(None)
-            return None
+            s = _salvage()
+            _emit_ok(s)
+            return s
         if isinstance(content, str):
             content = content.strip()
+            if not content:
+                s = _salvage()
+                _emit_ok(s)
+                return s
             _emit_ok(content)
-            return content or None
+            return content
         # Some providers may return structured content blocks.
         if isinstance(content, list):
             text_parts = []
@@ -247,11 +264,19 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
                 elif isinstance(item, str):
                     text_parts.append(item.strip())
             merged = "\n".join([p for p in text_parts if p]).strip()
+            if not merged:
+                s = _salvage()
+                _emit_ok(s)
+                return s
             _emit_ok(merged)
-            return merged or None
+            return merged
         merged = str(content).strip()
+        if not merged:
+            s = _salvage()
+            _emit_ok(s)
+            return s
         _emit_ok(merged)
-        return merged or None
+        return merged
     except Exception as e:
         _sw_emit(
             phase="result", tool="screenwriter", iter=_n,

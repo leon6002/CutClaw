@@ -444,6 +444,29 @@ def parse_structure_proposal_output(output: str) -> Optional[Dict]:
         except Exception:
             continue
 
+    # Balanced-brace scan, LAST object first: when the reply is reasoning-model
+    # thinking text, stray braces break the greedy regex above, and the real
+    # answer JSON usually sits at the END of the thinking.
+    objs = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(output):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}' and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objs.append(output[start:i + 1])
+    for b in reversed(objs):
+        try:
+            result = json.loads(b)
+            if _validate(result):
+                return result
+        except Exception:
+            continue
+
     print("parse_structure_proposal_output: all attempts failed.")
     print(output[:500])
     return None
