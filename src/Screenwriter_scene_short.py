@@ -714,6 +714,9 @@ def generate_shot_plan(
                     _t = (f" | shot at {m['capture_time'][5:16].replace('T', ' ')}"
                           if m.get("capture_time") else "")
                     _lk = f" | look {m['cluster']}" if m.get("cluster") else ""
+                    _mo = (m.get("motion") or {}).get("type") or ""
+                    if _mo and _mo != "unmeasured":
+                        _lk += f" | cam {_mo}"
                     _lines.append(
                         f"- {m['id']} | scene {m.get('scene', '?')}{_lk} | "
                         f"{m['start']:.1f}-{m['end']:.1f}s ({m['duration']:.1f}s) | "
@@ -738,12 +741,34 @@ def generate_shot_plan(
                     "already de-duplicated, so pick freely — just place two moments sharing a look "
                     "tag FAR apart (one early, one late; never in neighboring shots), and spread "
                     "each source video across the film rather than bunching it.\n"
+                    "- MOTION CONTINUITY: the \"cam\" tag names each moment's measured camera move. "
+                    "Neighboring shots flow when the move CONTINUES (pan_left → pan_left, "
+                    "push_in → push_in) or settles into stillness (moving → static). Avoid "
+                    "REVERSING direction between neighbors (pan_left → pan_right jolts the eye).\n"
                     + _voice_rule +
                     "- \"anchor_id\": null is allowed ONLY when every listed moment is already used "
                     "or truly none fits the segment — scarcity is the only excuse, not preference.\n"
                     "quality is MEASURED (blur/shake + content). Capture times give the journey order.\n"
                     + "\n".join(_lines)
                 )
+    # learned taste profile: principles distilled from the user's own praise
+    # (点赞 + 理由 → LLM analysis → likes.json) ride into every future plan
+    try:
+        from src.curation import load_likes
+        _taste: list = []
+        for _lk in load_likes():
+            for _p in ((_lk.get("analysis") or {}).get("principles") or []):
+                if _p and _p not in _taste:
+                    _taste.append(str(_p))
+        if _taste:
+            anchors_block += (
+                "\n\n[USER TASTE — distilled from shots the user personally praised; "
+                "follow these when choosing and arranging]\n"
+                + "\n".join(f"- {p}" for p in _taste[-8:])
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     prompt = prompt + anchors_block
 
     return _call_agent_litellm([{"role": "user", "content": prompt}], max_tokens=config.AGENT_MODEL_MAX_TOKEN)
@@ -915,6 +940,9 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
             # voice moments must not be slid off during the anchored trim
             "sound": bool(m.get("sound")),
         }
+        # measured camera move rides along for the transition picker
+        if m.get("motion"):
+            shot["camera_motion"] = m["motion"]
         n += 1
 
     def _substitute(shot, pos):

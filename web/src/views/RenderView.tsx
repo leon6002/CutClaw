@@ -86,6 +86,27 @@ export default function RenderView({
     }
   };
 
+  const likeShot = async (c: { section_idx: number; shot_idx: number }) => {
+    const reason = window.prompt(
+      "为什么满意这个镜头?(可留空,AI 会自行分析画面特征)\nAI 会把你的理由提炼成剪辑偏好并永久记住,以后自动优先选择同类镜头。", "") ?? null;
+    if (reason === null) return;   // 取消
+    try {
+      const r = await api<{ ok: boolean; analysis: any }>("/api/shots/like", {
+        method: "POST",
+        body: JSON.stringify({
+          shot_point: shotPoint, section_idx: c.section_idx,
+          shot_idx: c.shot_idx, reason,
+        }),
+      });
+      const a = r.analysis;
+      window.alert(a
+        ? `已记住这条偏好 ✓\n\nAI 的理解:${a.summary || ""}\n${(a.principles || []).map((p: string) => "· " + p).join("\n")}\n适用范围:${a.applies_to || "所有镜头"}\n\n该片段已获得全局加分,提炼出的原则会进入以后每次编排。`
+        : "已记录点赞 ✓(AI 理由分析暂时不可用,原始理由已保存,该片段已获得全局加分)");
+    } catch (e: any) {
+      window.alert(`点赞失败:${e.message}`);
+    }
+  };
+
   const shotPoint = project.shotPoint;
   const { clips: clipMap, error: clipMapError, reload: reloadClipMap } = useClipMap(shotPoint);
   const activeIdx = activeClipAt(clipMap, playhead);
@@ -401,6 +422,7 @@ export default function RenderView({
                     shotPoint={shotPoint} playhead={playhead}
                     transitions={activeOutput?.render_meta?.transitions ?? null}
                     audio={activeOutput?.render_meta?.audio ?? null}
+                    onSeek={seekTo}
                   />
                 </div>
               </div>
@@ -409,7 +431,7 @@ export default function RenderView({
                   List height is capped so both columns end together — no
                   page-long scroll, no blank space under the player. */}
               <div className="min-w-[360px] flex-[2] basis-[400px]">
-                <ActiveClipCard clip={activeClip} index={activeIdx} playhead={playhead} onReplace={replaceShot} />
+                <ActiveClipCard clip={activeClip} index={activeIdx} playhead={playhead} onReplace={replaceShot} onLike={likeShot} />
                 <div className="mt-3">
                   <ClipInspector
                     clips={clipMap} currentTime={playhead} error={clipMapError}

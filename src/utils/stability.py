@@ -137,16 +137,32 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
         if dur < 0.3 or n < 10:
             return {"score": -1.0}
         sharps, disorders, speeds, tilts = [], [], [], []
+        mxs, mys, rads = [], [], []
         for i in range(samples):
             t = start_sec + (i + 0.5) * dur / samples
             f0 = min(max(0, int(t * fps)), n - 2)
-            fr = vr.get_batch([f0, f0 + 1]).asnumpy()
+            # motion signature needs a LONGER baseline than adjacent frames:
+            # a gentle glide moves sub-pixel per frame at 320px wide and reads
+            # as static. ~0.25s apart amplifies it into measurable pixels.
+            f2 = min(n - 1, f0 + max(2, int(round(fps * min(1.0, max(0.25, dur * 0.4))))))
+            fr = vr.get_batch([f0, f0 + 1, f2]).asnumpy()
             g0, g1 = _gray(fr[0]), _gray(fr[1])
             flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
             mag = np.hypot(flow[..., 0], flow[..., 1])
             speeds.append(float(np.median(mag)) / 320.0 * fps)      # widths/s
             disorders.append(float(np.std(mag)) / 320.0 * fps)
             sharps.append(_sharp(g0))
+            if f2 > f0 + 1:
+                # global-motion fit over a LONG baseline: the user's favorite
+                # glides move <1px/s at 320px wide — adjacent frames read as
+                # noise. LK tracks give pan/zoom (similarity fit) plus the
+                # bottom-third parallax drift that carries a low drone pass.
+                g2 = _gray(fr[2])
+                _sig = _global_motion(g0, g2, fps / float(f2 - f0))
+                if _sig is not None:
+                    mxs.append(_sig[0])
+                    mys.append(_sig[1])
+                    rads.append(_sig[2])
             # camera roll: near-vertical structures (trees/poles) deviating
             # from vertical = crooked gimbal. Needs enough lines to trust.
             _edges = cv2.Canny(g0, 60, 160)
@@ -164,6 +180,9 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
     rel = float(np.median(sharps)) / base
     disorder = float(np.median(disorders))
     speed = float(np.median(speeds))
+    motion = (_classify_motion(float(np.median(mxs)), float(np.median(mys)),
+                               float(np.median(rads)), disorder)
+              if mxs else {"type": "unmeasured"})
 
     # rel ≥ 0.75 → full sharpness marks; decays smoothly below
     sharp_score = 10.0 * min(1.0, rel / 0.75) ** 0.8
@@ -189,7 +208,90 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
         "disorder": round(disorder, 3),
         "speed": round(speed, 3),
         "tilt": tilt,
+        "motion": motion,
     }
+
+
+def _elem_slope(x, y) -> float:
+    """Least-squares slope via elementwise ops ONLY — np.polyfit pulls in
+    LAPACK, which hard-crashes (0xc06d007f) when loaded after decord/cv2."""
+    xm = x - x.mean()
+    ym = y - y.mean()
+    return float((xm * ym).mean() / ((xm * xm).mean() + 1e-9))
+
+
+def _global_motion(g0, g2, per_sec: float):
+    """(content_dx, content_dy, zoom_rate) per second, or None if untrackable.
+
+    Combines two cues from LK feature tracks:
+    - RANSAC similarity fit → rotational pans and true zooms
+    - bottom-third parallax drift + displacement divergence → the near-field
+      signal that carries a low drone pass over distant scenery (the global
+      fit locks onto the far background there and reads ~zero)
+    All rates in frame-widths/s; zoom_rate = relative expansion per second."""
+    pts = cv2.goodFeaturesToTrack(g0, maxCorners=250, qualityLevel=0.01, minDistance=7)
+    if pts is None or len(pts) < 12:
+        return None
+    p1, st, _err = cv2.calcOpticalFlowPyrLK(g0, g2, pts, None,
+                                            winSize=(21, 21), maxLevel=4)
+    if p1 is None:
+        return None
+    ok = st.reshape(-1) == 1
+    a, b = pts.reshape(-1, 2)[ok], p1.reshape(-1, 2)[ok]
+    if len(a) < 12:
+        return None
+    d = b - a
+    h, w = g0.shape[:2]
+
+    # cue 1: global similarity (pan of the frame center + scale zoom)
+    ndx = ndy = zoom_fit = 0.0
+    M, _inl = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC,
+                                          ransacReprojThreshold=2.0)
+    if M is not None:
+        cx, cy = w / 2.0, h / 2.0
+        ndx = (M[0, 0] * cx + M[0, 1] * cy + M[0, 2] - cx) / w * per_sec
+        ndy = (M[1, 0] * cx + M[1, 1] * cy + M[1, 2] - cy) / w * per_sec
+        zoom_fit = (math.hypot(M[0, 0], M[0, 1]) - 1.0) * per_sec
+
+    # cue 2: near-field parallax (bottom third) + expansion of the track field
+    bot = a[:, 1] > h * 2.0 / 3.0
+    bdx = bdy = 0.0
+    if int(bot.sum()) >= 8:
+        bdx = float(np.median(d[bot, 0])) / w * per_sec
+        bdy = float(np.median(d[bot, 1])) / w * per_sec
+    zoom_div = 0.0
+    if len(a) >= 24:
+        zoom_div = (_elem_slope(a[:, 0], d[:, 0]) + _elem_slope(a[:, 1], d[:, 1])) / 2.0 * per_sec
+
+    # strongest cue wins per axis; zoom = larger-magnitude of fit vs divergence
+    mx = ndx if abs(ndx) >= abs(bdx) else bdx
+    my = ndy if abs(ndy) >= abs(bdy) else bdy
+    zoom = zoom_fit if abs(zoom_fit) >= abs(zoom_div) else zoom_div
+    return (float(mx), float(my), float(zoom))
+
+
+def _classify_motion(mx: float, my: float, zoom: float, disorder: float) -> dict:
+    """Name the camera move from its global-motion signature.
+
+    mx/my = CONTENT drift (widths/s) — the camera moves the opposite way
+    (pan right ⇒ scene slides left). zoom > 0 = expanding = pushing forward.
+    Imperceptibly slow motion is honestly labeled static: the user's gold
+    aerials drift <1px/s at 320px — for cutting purposes that IS steady.
+    乱晃 (chaotic, framing-adjustment junk) comes from flow disorder."""
+    tm = math.hypot(mx, my)
+    coherence = round(max(tm, abs(zoom)) / (max(tm, abs(zoom)) + disorder + 1e-6), 2)
+    if disorder > 0.30:
+        mtype = "chaotic"
+    elif abs(zoom) > 0.008 and abs(zoom) > tm * 0.6:
+        mtype = "push_in" if zoom > 0 else "pull_out"
+    elif tm < 0.0022:   # < ~0.7px/s at 320px — below cutting-relevant motion
+        mtype = "static"
+    elif abs(mx) >= abs(my):
+        mtype = "pan_right" if mx < 0 else "pan_left"
+    else:
+        mtype = "tilt_up" if my > 0 else "tilt_down"
+    return {"type": mtype, "dx": round(-mx, 4), "dy": round(-my, 4),
+            "zoom": round(zoom, 4), "coherence": coherence}
 
 
 def quality_per_second(video_path: str, start_sec: float, end_sec: float) -> list:

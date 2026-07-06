@@ -219,12 +219,14 @@ export interface RenderAudioMeta {
   path: string; start: number; duration: number; total?: number; name?: string;
 }
 
-export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, audio = null }: {
+export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, audio = null, onSeek }: {
   shotPoint: string; playhead?: number;
   /** per-cut transition list from the render sidecar, e.g. ["cut","fade:0.4",...] */
   transitions?: (string | null)[] | null;
   /** music window used by the render (start/duration within the full track) */
   audio?: RenderAudioMeta | null;
+  /** click a clip block / transition diamond → jump the player there */
+  onSeek?: (t: number) => void;
 }) {
   const [clips, setClips] = useState<TimelineClip[] | null>(null);
 
@@ -285,7 +287,16 @@ export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, aud
         {trMarkers.length > 0 && <span className="text-amber-400/80"> · ◆ = 转场 ({trMarkers.length} 处)</span>}
       </Label>
       <Chart
-        height={Math.max(140, sources.length * 44 + 70)}
+        // per-lane height drives the vertical gap between source rows. 30px per
+        // lane against a 22px bar leaves a tight ~8px gutter (was 44 → too airy).
+        height={Math.max(130, sources.length * 30 + 60)}
+        onEvents={onSeek ? {
+          click: (p: any) => {
+            // clip rect: value[0] = output-timeline start; diamond: data.x
+            const t = p?.data?.zh ? p.data.x : (Array.isArray(p?.value) ? p.value[0] : null);
+            if (typeof t === "number" && isFinite(t)) onSeek(t);
+          },
+        } : undefined}
         option={{
           tooltip: {
             ...TOOLTIP,

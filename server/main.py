@@ -2850,6 +2850,117 @@ def replace_shot(body: ShotReplaceRequest):
             "moment": {"id": m.get("id"), "score": m.get("score"), "desc": m.get("desc", "")[:120]}}
 
 
+class ShotLikeRequest(BaseModel):
+    shot_point: str
+    section_idx: int
+    shot_idx: int
+    reason: str = ""
+
+
+def _analyze_like(reason: str, desc: str, motion: dict) -> dict | None:
+    """Distill the user's praise into reusable editing principles (LLM).
+
+    The point is UNDERSTANDING, not storage: '很稳的平移,3-5秒,像专业旅拍'
+    becomes concrete selection rules the Screenwriter can follow forever."""
+    import litellm
+    from src import config as _cfg
+    _mo = ""
+    if motion:
+        _mo = (f"{motion.get('type', '?')} (dx={motion.get('dx')}, "
+               f"dy={motion.get('dy')}, zoom={motion.get('zoom')})")
+    prompt = (
+        "你是旅拍混剪的剪辑助手。用户点赞了成片中的一个镜头。请把这次点赞提炼成"
+        "可复用的剪辑偏好原则,供未来自动选材/编排时遵循。\n\n"
+        f"镜头画面描述: {desc or '(无)'}\n"
+        f"实测相机运动: {_mo or '(未测)'}\n"
+        f"用户给出的理由: {reason or '(未给出——请从镜头特征推断用户可能欣赏的点)'}\n\n"
+        '只输出一个 JSON 对象,不要其他内容: {"summary": "一句话总结这条偏好", '
+        '"principles": ["可执行的选材/编排原则,最多4条"], '
+        '"applies_to": "适用范围,如: 航拍 / 手持 / 所有镜头"}'
+    )
+    candidates = [
+        (cfg("AGENT_LITELLM_MODEL", ""), cfg("AGENT_LITELLM_URL", ""), cfg("AGENT_LITELLM_API_KEY", "")),
+        (getattr(_cfg, "TRANSLATE_MODEL", ""), getattr(_cfg, "TRANSLATE_ENDPOINT", ""),
+         getattr(_cfg, "TRANSLATE_API_KEY", "")),
+    ]
+    for model, base, key in candidates:
+        if not model:
+            continue
+        try:
+            kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}],
+                          temperature=0.3, max_tokens=2000, timeout=60)
+            if base:
+                kwargs["api_base"] = base
+            if key:
+                kwargs["api_key"] = key
+            r = litellm.completion(**kwargs)
+            raw = (r.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            parsed = json.loads(m.group(0) if m else raw)
+            if isinstance(parsed, dict) and parsed.get("principles"):
+                return parsed
+        except Exception as e:  # noqa: BLE001
+            print(f"[like] analysis via {model} failed: {str(e)[:150]}")
+    return None
+
+
+@app.post("/api/shots/like")
+def like_shot(body: ShotLikeRequest):
+    """Positive taste memory: record WHY the user liked a shot.
+
+    The liked range gets a global score bonus in every future pool build
+    (curation.load_likes), and the LLM-distilled principles ride into the
+    Screenwriter prompt as a learned taste profile."""
+    from src.utils.time_format_convert import hhmmss_to_seconds as _ts
+    abs_point = _resolve(body.shot_point)
+    if not os.path.exists(abs_point):
+        raise HTTPException(404, "shot_point 不存在")
+    with open(abs_point, "r", encoding="utf-8") as f:
+        shots = json.load(f)
+    tgt = next((s for s in shots if s.get("section_idx") == body.section_idx
+                and s.get("shot_idx") == body.shot_idx), None)
+    if not tgt:
+        raise HTTPException(404, "找不到该镜头")
+    clip = tgt["clips"][0]
+    src, c_s, c_e = clip.get("video_path", ""), _ts(clip["start"]), _ts(clip["end"])
+
+    # context from the pool moment this clip came from (desc + measured motion)
+    desc, motion = "", {}
+    try:
+        with open(os.path.join(os.path.dirname(abs_point), "highlight_pool.json"),
+                  "r", encoding="utf-8") as f:
+            for m in json.load(f).get("moments", []):
+                if os.path.normcase(os.path.normpath(m.get("video_path", ""))) == \
+                        os.path.normcase(os.path.normpath(src)) \
+                        and min(c_e, float(m.get("end", 0))) - max(c_s, float(m.get("start", 0))) > 0.5:
+                    desc, motion = m.get("desc", ""), m.get("motion") or {}
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    analysis = _analyze_like(body.reason, desc, motion)
+
+    from src.curation import LIKES_PATH, load_likes
+    likes = load_likes()
+    likes.append({"video_path": src, "start": c_s, "end": c_e,
+                  "reason": body.reason, "analysis": analysis,
+                  "desc": desc[:200], "motion": motion,
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    likes_path = os.path.join(PROJECT_ROOT, LIKES_PATH)
+    os.makedirs(os.path.dirname(likes_path), exist_ok=True)
+    with open(likes_path, "w", encoding="utf-8") as f:
+        json.dump(likes, f, ensure_ascii=False, indent=2)
+
+    tgt["liked"] = True
+    if body.reason:
+        tgt["like_reason"] = body.reason
+    with open(abs_point, "w", encoding="utf-8") as f:
+        json.dump(shots, f, ensure_ascii=False, indent=2)
+    return {"ok": True, "analysis": analysis}
+
+
 def _ts_to_sec(v) -> float:
     """Accept '00:00:13.2' | '13.2' | 13.2 → seconds."""
     if v is None:

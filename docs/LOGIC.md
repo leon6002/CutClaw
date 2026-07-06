@@ -22,6 +22,7 @@
 12. [口味记忆（全局拒绝名单）](#12-口味记忆)
 13. [换镜头闭环 UI](#13-换镜头闭环-ui)
 14. [视觉去重与前置品控（锚点预算器）](#14-视觉去重与前置品控锚点预算器)
+15. [相机运动标注 + 动势匹配 + 正向口味记忆](#15-相机运动标注--动势匹配--正向口味记忆)
 
 ---
 
@@ -508,6 +509,44 @@ shot_point.json（多源 clip 各带 video_path）
 - 别把配额检查加回编辑器提交路径——那是打回机制回魂。前置环节出 bug 就修前置环节，保险丝日志会指出来。
 - 剥锚（strip → agent 自由选）永远是最后手段：agent 自由行不受簇配额保护，选回同质画面等于白干。
 - 池 v6 的 dHash 字段是"换镜头闭环"（§13）按簇降权的地基——拒绝一个镜头时可顺带压掉同款机位（待接线）。
+
+---
+
+## 15. 相机运动标注 + 动势匹配 + 正向口味记忆
+
+### 动机
+用户看片反馈（2026-07-05）三连：
+1. 特别满意的航拍 = 稳定平移/左移/右移/推进、3-5s，"跟专业旅拍博主非常接近"——这些精华应该在**标注阶段**就被识别出来。
+2. 镜头切换有个技巧：上一镜头左移，下一镜头也接着左移，不跳跃（= 专业剪辑的**动势匹配** motion continuity，用户自己悟到的，判断正确）。用户点名 #12→#13（向前飞→继续向前推湖面+叠化）为完美示范。
+3. 想给满意的镜头**点赞**并给出理由，AI 必须真正理解为什么好，作为以后剪辑的参考。
+
+### 运动测量（src/utils/stability.py，纯本地计算）
+- `_global_motion()`：LK 特征点跟踪 + 双信号——RANSAC 相似变换（旋转平移+缩放）和**底部三分之一视差漂移**（低空掠过远景时全局拟合锁在远山上读数为零，近场视差才是真信号）+ 位移散度（推进的扩张率）。
+- 基线取 `min(1s, 时长×0.4)`——用户最爱的缓飞在 320px 宽下每帧亚像素位移，相邻帧读不出来。
+- `_classify_motion()`：chaotic（紊乱度>0.30，乱晃废料）/ push_in / pull_out / pan_left/right / tilt_up/down / static。**不可感知的缓移诚实标 static**（<0.7px/s@320，对剪辑而言它就是"稳"）——不给 LLM 编方向的机会。
+- 实测校准：0373 明显推进→push_in(zoom 0.097)✓；0680 开场→push_in✓；观景台缓移→tilt_down✓；用户最爱的超缓飞行→static（正确：光学上近乎定格）。
+- ⚠️ **np.polyfit/LAPACK 在 decord/cv2 之后加载会硬崩(0xc06d007f)**——斜率一律用逐元素运算 `_elem_slope`（铁律10 新款）。
+
+### 池 v7 与"博主精华"加分（src/curation.py）
+- moment 带 `motion` 字段；v5/v6→v7 升级只补指纹+运动，不重跑逐秒扫描。
+- **gem 加分** +0.06：实测稳定≥7 + 运动非 chaotic + 时长 3-6s（用户校准的专业旅拍节奏）。
+- **正向口味记忆** `Output/asset_index/likes.json`（与 rejections 对称）：点赞区间在每次池构建时 +0.15/次（封顶+0.45，`liked_overlap` 字段）。
+
+### 动势匹配接线
+- 编剧菜单行带 `cam {motion_type}` 标签 + MOTION CONTINUITY 规则（延续方向或落定为静，禁止相邻反向）。
+- `_attach_anchors` 把 motion 写进 shot（`camera_motion`）→ 存入 shot_plan → 渲染时 `_ai_pick_transitions` 的 boundaries 带上双侧运动 → 转场规则：同向流动时用 cut/fade 保动势，smoothleft/right 只许顺着共同方向划，双静用叠化托住宁静。
+
+### 点赞闭环（server `/api/shots/like` + RenderView）
+- 焦点卡片 👍满意 / 👎换掉（👎走原 replace 流程）。👍收理由（可空）→ `_analyze_like()` 用 agent 模型(降级 flash)提炼成结构化剪辑原则 JSON（summary/principles/applies_to）→ 存 likes.json → alert 展示"AI 的理解"给用户确认。
+- **原则进编剧**：generate_shot_plan 聚合全部点赞原则(去重取最近8条)为 `[USER TASTE]` 块注入 prompt——用户的审美随点赞持续积累。
+
+### UI
+- 成片时间轴色块/转场菱形**点击跳播**（ShotTimeline onSeek → video.currentTime）。
+
+### 调优入口
+- gem 加分 0.06 / 点赞加分 0.15：`curation.py` `build_highlight_pool`。
+- 运动分类阈值（chaotic 0.30 / static 0.0022 w/s / zoom 0.008）：`stability._classify_motion`。
+- 口味原则条数上限 8：`Screenwriter_scene_short.py` taste block。
 
 ---
 

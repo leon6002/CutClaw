@@ -20,7 +20,18 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 6   # v6: dHash visual signature per moment (dedup clustering)
+_POOL_VERSION = 7   # v7: camera-motion signature (direction/push/chaos) per moment
+
+# GLOBAL positive taste memory — user likes apply across every project.
+LIKES_PATH = os.path.join("Output", "asset_index", "likes.json")
+
+
+def load_likes() -> list:
+    try:
+        with open(LIKES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return []
 
 # GLOBAL taste memory — user rejections apply across every project.
 REJECTIONS_PATH = os.path.join("Output", "asset_index", "rejections.json")
@@ -35,17 +46,22 @@ def load_rejections() -> list:
 
 
 def _upgrade_pool_v5(moments: list) -> list | None:
-    """Backfill dHash signatures on a v5 pool (nothing else changed in v6)."""
+    """Backfill dHash (v6) + camera-motion (v7) signatures on an older pool."""
     try:
-        from src.utils.stability import visual_hashes
+        from src.utils.stability import visual_hashes, measure_stability
         for m in moments:
-            if m.get("phash"):
-                continue
             vp = m.get("video_path") or ""
-            if vp and os.path.exists(vp):
-                m["phash"] = visual_hashes(vp, float(m.get("start", 0)), float(m.get("end", 0)))
-            else:
-                m["phash"] = []
+            here = bool(vp and os.path.exists(vp))
+            if not m.get("phash"):
+                m["phash"] = (visual_hashes(vp, float(m.get("start", 0)), float(m.get("end", 0)))
+                              if here else [])
+            if not m.get("motion"):
+                if here:
+                    _st = measure_stability(vp, float(m.get("start", 0)), float(m.get("end", 0)),
+                                            samples=3)
+                    m["motion"] = _st.get("motion") or {"type": "unmeasured"}
+                else:
+                    m["motion"] = {"type": "unmeasured"}
         return moments
     except Exception:  # noqa: BLE001
         return None
@@ -62,10 +78,10 @@ def _source_pool(content_hash: str) -> list:
                 d = json.load(f)
             if int(d.get("version", 0)) >= _POOL_VERSION:
                 return d.get("moments", [])
-            if int(d.get("version", 0)) == 5 and d.get("moments"):
-                # v5→v6 upgrade: only the dHash signatures are new — the trims
-                # and stability measurements are expensive and unchanged, so
-                # backfill hashes instead of rebuilding the whole pool
+            if int(d.get("version", 0)) in (5, 6) and d.get("moments"):
+                # v5/v6 → v7 upgrade: only dHash + motion signatures are new —
+                # the trims and quality scores are expensive and unchanged, so
+                # backfill signatures instead of rebuilding the whole pool
                 up = _upgrade_pool_v5(d.get("moments", []))
                 if up is not None:
                     try:
@@ -174,6 +190,7 @@ def _source_pool(content_hash: str) -> list:
             stab = float(_st.get("score", -1))
             stab_detail = {"rel_sharp": _st.get("rel_sharp"),
                            "disorder": _st.get("disorder")}
+            _motion = _st.get("motion") or {"type": "unmeasured"}
             if 0 <= stab < 3.5:
                 continue      # measured blur/violent motion — never a highlight
         voice = highlights_in_range(shl, s, e, min_overlap=0.5)
@@ -191,6 +208,7 @@ def _source_pool(content_hash: str) -> list:
             _ph = visual_hashes(src_path, s, e)
         moments.append({
             "phash": _ph,
+            "motion": _motion if can_measure else {"type": "unmeasured"},
             "video_path": src_path,
             "source_hash": content_hash,
             "start": round(s, 2),
@@ -295,6 +313,38 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
         pool = kept
         if banned_n:
             print(f"🚫 [Curation] {banned_n} moment(s) excluded by permanent bans (rejections.json)")
+
+    # Positive taste memory: liked ranges get a boost (symmetric to the
+    # rejection penalty), so praised material floats to the menu's top.
+    likes = load_likes()
+    if likes:
+        def _normp2(p):
+            return os.path.normcase(os.path.normpath(p or ""))
+        for m in pool:
+            bonus, why = 0.0, []
+            for lk in likes:
+                if _normp2(lk.get("video_path")) != _normp2(m.get("video_path")):
+                    continue
+                ov = min(m["end"], float(lk.get("end", 0))) - max(m["start"], float(lk.get("start", 0)))
+                if ov <= 0.3:
+                    continue
+                bonus += 0.15
+                if lk.get("reason"):
+                    why.append(str(lk["reason"])[:40])
+            if bonus > 0:
+                m["score"] = round(m["score"] + min(bonus, 0.45), 3)
+                m["liked_overlap"] = why[:3]
+
+    # Blogger-gem bonus (user-calibrated): a steady, coherent camera move
+    # (glide/pan/push — NOT chaotic) at the pro travel-reel length of 3-6s
+    # is exactly the material worth surfacing first.
+    for m in pool:
+        _mo = m.get("motion") or {}
+        if (float(m.get("stability", -1)) >= 7.0
+                and _mo.get("type") not in (None, "chaotic", "unmeasured")
+                and 3.0 <= float(m.get("duration", 0)) <= 6.0):
+            m["score"] = round(m["score"] + 0.06, 3)
+            m["gem"] = True
 
     # ── Visual clustering (§14): near-identical compositions become one
     # "look" — the dedup unit the viewer actually perceives. Applied at

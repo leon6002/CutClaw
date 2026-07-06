@@ -168,10 +168,12 @@ export function ClipCaption({ clip, playhead = -1 }: { clip: ClipMapEntry | null
 
 /** Focus card pinned beside the player: the CURRENT shot's full script,
  * always in the same spot — no hunting inside the scrolling list. */
-export function ActiveClipCard({ clip, index, playhead = -1, onReplace }: {
+export function ActiveClipCard({ clip, index, playhead = -1, onReplace, onLike }: {
   clip: ClipMapEntry | null; index: number; playhead?: number;
   /** "这个镜头我不满意" — swap it for another highlight-pool moment */
   onReplace?: (clip: ClipMapEntry) => void;
+  /** "这个镜头我特别满意" — positive taste memory, AI 分析并记住理由 */
+  onLike?: (clip: ClipMapEntry) => void;
 }) {
   const [zh] = useZhFlag();
   const zhMap = useZh([clip?.content, clip?.analysis], zh);
@@ -200,14 +202,27 @@ export function ActiveClipCard({ clip, index, playhead = -1, onReplace }: {
             <span className="truncate tabular-nums text-slate-500">
               ← {clip.video} [{clip.src_start?.toFixed(1)}–{clip.src_end?.toFixed(1)}s]
             </span>
-            {onReplace && (
-              <button
-                className="ml-auto shrink-0 rounded-md border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[10.5px] text-amber-300 hover:bg-amber-500/20"
-                title="不满意这个镜头?告诉 AI 原因,从高光池换一个(该区间进入拒绝名单,以后也不会再选)"
-                onClick={(e) => { e.stopPropagation(); onReplace(clip); }}
-              >
-                换掉
-              </button>
+            {(onLike || onReplace) && (
+              <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                {onLike && (
+                  <button
+                    className="shrink-0 rounded-md border border-emerald-400/40 bg-emerald-500/10 px-2 py-0.5 text-[10.5px] text-emerald-300 hover:bg-emerald-500/20"
+                    title="特别满意这个镜头?说说为什么(可不填)——AI 会分析你的理由并记住这种偏好,以后优先选同类镜头"
+                    onClick={(e) => { e.stopPropagation(); onLike(clip); }}
+                  >
+                    👍 满意
+                  </button>
+                )}
+                {onReplace && (
+                  <button
+                    className="shrink-0 rounded-md border border-amber-400/40 bg-amber-500/10 px-2 py-0.5 text-[10.5px] text-amber-300 hover:bg-amber-500/20"
+                    title="不满意这个镜头?告诉 AI 原因,从高光池换一个(该区间进入拒绝名单,以后也不会再选)"
+                    onClick={(e) => { e.stopPropagation(); onReplace(clip); }}
+                  >
+                    👎 换掉
+                  </button>
+                )}
+              </span>
             )}
           </div>
           <div className="mt-2 shrink-0 rounded-lg bg-black/25 px-2.5 py-1.5">
