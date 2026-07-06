@@ -593,6 +593,34 @@ def _annotate_video_in_process(meta, model, endpoint, api_key, q=None):
         return None
 
 
+def _annotate_audio_in_process(meta, model, endpoint, api_key, q=None):
+    """Child-process entry point: annotate ONE audio track end-to-end.
+
+    A separate process because madmom + numpy/LAPACK loaded after torch in
+    the SERVER process aborts natively (0xc06d007f) and takes the whole
+    backend down — a child gets a clean DLL slate (铁律10). Stage events
+    stream back through the queue for the live per-card UI."""
+    try:
+        if q is not None:
+            try:
+                q.put({"type": "begin", "file": meta.file_name, "hash": meta.content_hash})
+            except Exception:
+                pass
+
+        def _cb(stage, status, detail):
+            if q is not None:
+                try:
+                    q.put({"type": "stage", "file": meta.file_name, "hash": meta.content_hash,
+                           "stage": stage, "status": status, "detail": str(detail or "")[:80]})
+                except Exception:
+                    pass
+        return annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key,
+                              progress_callback=_cb)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
 def batch_annotate(
     new_assets: list,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -731,14 +759,65 @@ def batch_annotate(
                     print(f"[AssetAnnotator] Failed to annotate image {meta.file_name}: {e}")
                 _report(meta.file_name)
 
-    # Audio: sequential
-    for meta in audios:
-        _starting(meta.file_name)
+    # Audio: sequential, each track in its OWN subprocess. madmom +
+    # numpy/LAPACK after torch inside the server process hard-crashes
+    # (0xc06d007f, no traceback) and killed the backend mid-batch — a fresh
+    # child per track gets a clean DLL slate, and a native crash only loses
+    # that one track (resumable) instead of the whole server.
+    if audios:
+        import multiprocessing as _mp2
+        import threading as _threading2
+        from concurrent.futures import ProcessPoolExecutor as _PPE2
+
+        _mgr2 = _mp2.Manager()
+        _q2 = _mgr2.Queue()
+        _stop2 = _threading2.Event()
+
+        def _drain2():
+            while not (_stop2.is_set() and _q2.empty()):
+                try:
+                    ev = _q2.get(timeout=0.5)
+                except Exception:
+                    continue
+                try:
+                    if ev.get("type") == "begin":
+                        _starting(ev.get("file", ""))
+                    elif ev.get("type") == "stage" and stage_callback:
+                        try:
+                            stage_callback(ev["stage"], ev["status"], ev["detail"],
+                                           filename=ev.get("file"))
+                        except TypeError:
+                            stage_callback(ev["stage"], ev["status"], ev["detail"])
+                except Exception:
+                    pass
+
+        _dt2 = _threading2.Thread(target=_drain2, daemon=True)
+        _dt2.start()
         try:
-            result = annotate_asset(meta, model=model, endpoint=endpoint, api_key=api_key, progress_callback=stage_callback)
-            results.append(result)
-        except Exception as e:
-            print(f"[AssetAnnotator] Failed to annotate audio {meta.file_name}: {e}")
-        _report(meta.file_name)
+            for meta in audios:
+                _starting(meta.file_name)
+                _failed = False
+                try:
+                    # a NEW single-worker pool per track: a native crash breaks
+                    # the pool, so sharing one would poison the rest of the batch
+                    with _PPE2(max_workers=1) as _ex2:
+                        _r = _ex2.submit(_annotate_audio_in_process, meta,
+                                         model, endpoint, api_key, _q2).result()
+                    if _r is not None:
+                        results.append(_r)
+                    else:
+                        _failed = True
+                except Exception as e:
+                    print(f"[AssetAnnotator] audio worker failed for {meta.file_name}: {e}")
+                    _failed = True
+                if _failed and stage_callback:
+                    try:
+                        stage_callback("annotate", "fail", "analysis failed — resumable", filename=meta.file_name)
+                    except TypeError:
+                        pass
+                _report(meta.file_name)
+        finally:
+            _stop2.set()
+            _dt2.join(timeout=3)
 
     return results
