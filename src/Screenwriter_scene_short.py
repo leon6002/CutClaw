@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Annotated as A
 from src import config
 from src.func_call_shema import doc as D
-from src.prompt import GENERATE_STRUCTURE_PROPOSAL_PROMPT, GENERATE_SHOT_PLAN_PROMPT, SELECT_AUDIO_SEGMENT_PROMPT, SELECT_HOOK_DIALOGUE_PROMPT
+from src.prompt import (
+    GENERATE_STRUCTURE_PROPOSAL_PROMPT,
+    GENERATE_SHOT_PLAN_PROMPT,
+    GENERATE_SHOT_PLAN_PROMPT_LEGACY,
+    SELECT_AUDIO_SEGMENT_PROMPT,
+    SELECT_HOOK_DIALOGUE_PROMPT,
+)
 from src.utils.media_utils import (
     hhmmss_to_seconds,
     load_scene_summaries,
@@ -634,24 +640,29 @@ def generate_shot_plan(
     feedback: str | None = None,
 ) -> str | None:
     """Generate a one-to-one shot mapping for each music segment."""
-    if isinstance(music_detailed_structure, (dict, list)):
-        music_json = json.dumps(music_detailed_structure, ensure_ascii=False, indent=2)
+    # Compact one-line-per-segment rendering with explicit S{i} ids: the model
+    # only needs id + measured feel to arrange, and the old indent=2 JSON dump
+    # burned thousands of input tokens on whitespace and repeated keys.
+    if isinstance(music_detailed_structure, list) and music_detailed_structure:
+        _seg_lines = []
+        for _i, _s in enumerate(music_detailed_structure):
+            if not isinstance(_s, dict):
+                _seg_lines.append(f"S{_i} | {str(_s)[:140]}")
+                continue
+            try:
+                _st = float(_s.get("Start_Time", 0) or 0)
+                _en = float(_s.get("End_Time", 0) or 0)
+            except (TypeError, ValueError):
+                _st = _en = 0.0
+            _seg_lines.append(
+                f"S{_i} | {_st:.1f}-{_en:.1f}s ({max(0.0, _en - _st):.1f}s) | "
+                f"{_s.get('Emotional_Tone', '')} | {_s.get('energy', '')} | "
+                f"{_s.get('rhythm', '')} | {str(_s.get('description', ''))[:140]}")
+        music_json = "\n".join(_seg_lines)
+    elif isinstance(music_detailed_structure, (dict, list)):
+        music_json = json.dumps(music_detailed_structure, ensure_ascii=False)
     else:
         music_json = str(music_detailed_structure or '')
-
-    from src.prompt import character_policy
-    _policy, _ = character_policy(main_character)
-    prompt = GENERATE_SHOT_PLAN_PROMPT
-    prompt = prompt.replace("CHARACTER_POLICY_PLACEHOLDER", _policy)
-    prompt = prompt.replace("AUDIO_SUMMARY_PLACEHOLDER", music_json)
-    prompt = prompt.replace("VIDEO_SECTION_INFO_PLACEHOLDER", str(video_section_proposal))
-    prompt = prompt.replace("INSTRUCTION_PLACEHOLDER", user_instruction)
-    prompt = prompt.replace("MAIN_CHARACTER_PLACEHOLDER", main_character or "the main character")
-    if feedback:
-        prompt += (
-            "\n\n**IMPORTANT — YOUR PREVIOUS ATTEMPT WAS REJECTED:**\n"
-            f"{feedback}\nFix this in your new plan."
-        )
 
     related_video_context = ""
     related_scenes = video_section_proposal.get("related_scenes", []) if isinstance(video_section_proposal, dict) else []
@@ -675,8 +686,6 @@ def generate_shot_plan(
                 except Exception:
                     pass
         related_video_context = "\n".join(scene_descriptions)
-
-    prompt = prompt.replace("RELATED_VIDEO_PLACEHOLDER", related_video_context)
 
     # ── Curation-first: anchor shots on REAL measured moments ──────────────
     # The pool file sits next to the merged_scenes dir (project convention).
@@ -734,8 +743,7 @@ def generate_shot_plan(
                     "below. Anchoring is the DEFAULT, not the exception — these are the best real "
                     "moments this footage has; your job is to ARRANGE them to fit the music, not to "
                     "imagine better ones.\n"
-                    "- Describe the CHOSEN moment's visible imagery in \"content\" and set "
-                    "\"related_scene\" to the moment's scene.\n"
+                    "- Set \"scene\" to the chosen moment's scene number.\n"
                     "- Never assign the same moment to two shots.\n"
                     "- Each moment carries a \"look\" tag (visual-composition cluster). The list is "
                     "already de-duplicated, so pick freely — just place two moments sharing a look "
@@ -769,9 +777,66 @@ def generate_shot_plan(
     except Exception:  # noqa: BLE001
         pass
 
+    # Slim decision-only prompt when a curated menu exists (the normal path):
+    # the LLM emits {id, anchor_id, scene} per shot and every prose/number
+    # field is backfilled from measured data. Without a pool (curation off /
+    # missing) the legacy free-form prompt still carries the full schema.
+    from src.prompt import character_policy
+    _policy, _ = character_policy(main_character)
+    prompt = GENERATE_SHOT_PLAN_PROMPT if anchors_block else GENERATE_SHOT_PLAN_PROMPT_LEGACY
+    prompt = prompt.replace("CHARACTER_POLICY_PLACEHOLDER", _policy)
+    prompt = prompt.replace("AUDIO_SUMMARY_PLACEHOLDER", music_json)
+    prompt = prompt.replace("VIDEO_SECTION_INFO_PLACEHOLDER", str(video_section_proposal))
+    prompt = prompt.replace("INSTRUCTION_PLACEHOLDER", user_instruction)
+    prompt = prompt.replace("MAIN_CHARACTER_PLACEHOLDER", main_character or "the main character")
+    prompt = prompt.replace("RELATED_VIDEO_PLACEHOLDER", related_video_context)
     prompt = prompt + anchors_block
+    if feedback:
+        prompt += (
+            "\n\n**IMPORTANT — YOUR PREVIOUS ATTEMPT WAS REJECTED:**\n"
+            f"{feedback}\nFix this in your new plan."
+        )
 
     return _call_agent_litellm([{"role": "user", "content": prompt}], max_tokens=config.AGENT_MODEL_MAX_TOKEN)
+
+
+def _backfill_shot_fields(shot_plan: dict, segments) -> None:
+    """Fill every non-decision shot field from MEASURED data (LOGIC.md: the
+    LLM outputs decisions only — {id, anchor_id, scene}). 66-shot plans used
+    to emit ~9k tokens of prose restating the inputs and hit max_tokens;
+    the decision-only reply is ~1k and cannot be truncated in practice.
+
+    - time_duration: authoritative copy of the music segment span (the prompt
+      used to demand the model echo it EXACTLY — a pure waste and a typo risk)
+    - emotion / visual_beat: the segment's measured tone + energy/rhythm
+      (consumed by the transition picker and the agent-path prompt)
+    - content: segment description as an agent-path brief; anchored shots get
+      the real moment's measured desc in _attach_anchors right after
+    """
+    if not isinstance(shot_plan, dict) or not isinstance(segments, list):
+        return
+    for i, shot in enumerate(shot_plan.get("shots") or []):
+        if not isinstance(shot, dict) or i >= len(segments):
+            continue
+        seg = segments[i] if isinstance(segments[i], dict) else {}
+        shot["id"] = i
+        try:
+            _st = float(seg.get("Start_Time", 0) or 0)
+            _en = float(seg.get("End_Time", 0) or 0)
+        except (TypeError, ValueError):
+            _st = _en = 0.0
+        if _en > _st:
+            shot["time_duration"] = round(_en - _st, 2)
+        if shot.get("related_scene") is None and shot.get("scene") is not None:
+            shot["related_scene"] = shot.pop("scene")
+        if not shot.get("emotion"):
+            shot["emotion"] = str(seg.get("Emotional_Tone", "") or "")
+        if not shot.get("visual_beat"):
+            shot["visual_beat"] = " · ".join(
+                x for x in (str(seg.get("energy", "") or ""), str(seg.get("rhythm", "") or "")) if x)
+        if not shot.get("content"):
+            shot["content"] = str(seg.get("description", "") or "")
+        shot.setdefault("visuals", "")
 
 
 def _validate_shot_plan_result(shot_plan: dict | None, expect_non_empty: bool = True) -> tuple[bool, str]:
@@ -933,6 +998,15 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         s_used[s or ""] = s_used.get(s or "", 0) + 1
         _prev = (m.get("video_path"), float(m.get("start", 0)))
         shot["anchor_id"] = m.get("id")
+        # the anchored shot SHOWS this measured moment — describe the real
+        # footage, not whatever brief rode in (slim plans carry no prose at all)
+        if m.get("desc"):
+            shot["content"] = str(m["desc"])[:220]
+        _mo = (m.get("motion") or {}).get("type")
+        if _mo and _mo != "unmeasured":
+            shot["visuals"] = f"camera {_mo}"
+        if m.get("scene") is not None:
+            shot["related_scene"] = m.get("scene")
         shot["anchor"] = {
             "video_path": m.get("video_path", ""),
             "start": float(m.get("start", 0.0)),
@@ -981,11 +1055,7 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         if sub is not None:
             print(f"🔧 [Curation] shot {pos + 1}: {reason} → substituted {sub['id']} "
                   f"(look {sub.get('cluster') or '—'}, {sub.get('score', 0) * 10:.1f}/10)")
-            # keep the narrative slot but describe the REAL footage it now shows
-            if sub.get("desc"):
-                shot["content"] = str(sub["desc"])[:200]
-            if sub.get("scene") is not None:
-                shot["related_scene"] = sub.get("scene")
+            # _commit rewrites content/visuals/scene to the REAL footage it now shows
             _commit(shot, sub, pos)
             repaired += 1
             continue
@@ -1035,7 +1105,17 @@ def generate_shot_plan_with_retry(
                 parsed_shot_plan,
                 expect_non_empty=expected_non_empty,
             )
+            # decision-only replies are tiny, so a count mismatch is cheap to
+            # re-ask — and it's the one structural error backfill can't repair
+            if (is_valid and isinstance(music_detailed_structure, list)
+                    and music_detailed_structure):
+                _n_shots = len(parsed_shot_plan.get("shots") or [])
+                if _n_shots != len(music_detailed_structure):
+                    is_valid = False
+                    reason = (f"expected {len(music_detailed_structure)} shots "
+                              f"(one per music segment, in order), got {_n_shots}")
             if is_valid:
+                _backfill_shot_fields(parsed_shot_plan, music_detailed_structure)
                 _attach_anchors(parsed_shot_plan, scene_folder_path)
                 load_ok, load_reason = _check_scene_load(parsed_shot_plan, scene_folder_path)
                 if load_ok:

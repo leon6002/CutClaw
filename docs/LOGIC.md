@@ -183,6 +183,15 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
 - **顺带修**：`_check_scene_load` 识别「重分配也救不了」（总请求秒数 > 引用场景总预算，或无空闲场景）时直接放行、不再空转重试；spare/budget 只算**被引用的**场景，不会建议模型去用跳过的场景。
 - **效果**：少素材项目从 ~6 轮压到 ~3 轮；更关键的是校验从「不可能满足」变「可满足」，反馈不再自相矛盾，输出质量也提升。**规则：任何按「场景数」推导的逻辑，都必须用「可用场景 id 集合」，绝不用文件总数或假设稠密 0..N-1。**
 
+### 分镜输出瘦身：决策 JSON + 确定性回填（2026-07-06）
+- **症状**：BGM 融合后项目 235s → 66 个镜头槽位，分镜回复被 `max_tokens` 截断（`finish_reason=length`），24576→49152 翻倍重试，每次重试重付几万 token 输入 + 推理模型思考也翻倍。
+- **根因**：旧 prompt 让模型每镜头输出 ~630 字符散文（content/visuals/visual_beat/emotion/time_duration），其中真正的决策只有 `anchor_id + scene` ~20 字符；`time_duration` 更是让模型**抄输入**（prompt 要求"必须精确等于音乐段落时长"）。66 镜头 ≈ 9k token 输出 + 成比例的思考 token。
+- **修法**（三处，`src/Screenwriter_scene_short.py` + `src/prompt.py`）：
+  1. **决策专用 prompt**（`GENERATE_SHOT_PLAN_PROMPT`）：输出只有 `{"shots":[{"id","anchor_id","scene"}]}`，实测 66 镜头 ~730 token。音乐段落输入也改紧凑单行（`S{i} | 起-止 | tone | energy | rhythm | 描述`），不再 `indent=2` JSON。无锚点池时（curation 关闭）回落 `GENERATE_SHOT_PLAN_PROMPT_LEGACY`（旧全量 schema）。
+  2. **`_backfill_shot_fields`**：`time_duration` 从音乐段落实测抄写（权威，顺带消灭抄错）；`emotion`/`visual_beat` 从段落的 `Emotional_Tone`/`energy·rhythm` 回填；`content` 先用段落描述作 agent 路径简报。数量不匹配（镜头数≠段落数）在校验层打回重试——回复很小，重试便宜。
+  3. **`_attach_anchors._commit`**：锚定成功即用 moment 的实测 `desc` 覆盖 `content`、`motion.type` 写 `visuals`（`camera pan_left`）、`scene` 权威覆盖 `related_scene`——下游（转场选择器 / agent prompt / UI 焦点卡片）拿到的描述比模型复述更忠实。
+- **效果**：输出 9k→<1k token，截断机制上不可能，翻倍重试梯子保留当保险丝但预期不再触发。**规则：模型只输出决策，凡输入里已有或可实测的字段一律确定性回填，禁止让模型复述。**
+
 ### 编排器（`ParallelShotOrchestrator.run_parallel`，src/core.py）
 - **按源分组**：同源镜头串行（前面的选择进后面的禁选区 → 结构上杜绝同源重叠），不同源并行（`PARALLEL_SHOT_MAX_WORKERS`）。
 - **容量守卫**：派发前按"每源需求 vs 供给"重平衡，把超订源上最小的镜头挪到最空的源（解决"最后一个镜头只剩边角料"）。大镜头先选（长窗口优先）。

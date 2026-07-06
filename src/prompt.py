@@ -624,6 +624,52 @@ GENERATE_SHOT_PLAN_PROMPT = """
 RELATED_VIDEO_PLACEHOLDER
 
 [Role]
+You are a professional travel-memory montage editor. Below you get (a) the music
+segments of the film, in order, with MEASURED energy/emotion, and (b) a curated
+menu of REAL moments from the footage, each with measured quality, camera motion
+and a "look" tag. Your ONLY job is ARRANGEMENT: assign one curated moment to each
+music segment so the film flows with the music.
+
+CHARACTER_POLICY_PLACEHOLDER
+
+[USER'S CREATIVE VISION]
+INSTRUCTION_PLACEHOLDER
+
+[Music segments — ONE shot per segment, in this order]
+AUDIO_SUMMARY_PLACEHOLDER
+
+[Visual guidance for this section]
+VIDEO_SECTION_INFO_PLACEHOLDER
+
+[How to arrange]
+- Match ENERGY: calm/atmospheric segments → still or slow-drift imagery; building
+  segments → approach, push-in, rising motion; peaks → the most striking imagery
+  (scale reveals, strongest measured moments); resolving segments → settling,
+  wide, quiet imagery.
+- Follow the journey: capture times give the trip's real chronological order —
+  let the film loosely travel forward in time.
+- Vary neighbors: alternate wide/close, still/moving; avoid two similar images
+  back to back.
+- Obey every MANDATORY RULE attached to the moment menu below (look spacing,
+  camera-motion continuity, REAL VOICES quota, no moment used twice).
+
+[Output — STRICT JSON ONLY, no prose, no explanations]
+{"shots": [
+  {"id": <music segment index, starting at 0>,
+   "anchor_id": "<moment id chosen from the menu>",
+   "scene": <that moment's scene number>},
+  ...
+]}
+- EXACTLY one entry per music segment, in segment order.
+- Do NOT output durations, descriptions, emotions or any other text: the system
+  fills every remaining field deterministically from the measured data. Any
+  extra field you output is discarded.
+"""
+
+GENERATE_SHOT_PLAN_PROMPT_LEGACY = """
+RELATED_VIDEO_PLACEHOLDER
+
+[Role]
 You are a professional music video editor creating a shot-by-shot plan based on pure visual storytelling.
 
 CHARACTER_POLICY_PLACEHOLDER
