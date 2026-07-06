@@ -91,6 +91,34 @@ def _prog_emit(task: str, total: int, idx: int, event: str, **extra):
         pass
 
 
+def _highlight_pool_step(content_hash: str, progress_callback=None):
+    """Measured highlight scoring (curation pool) as an analysis step.
+
+    Pure local compute (per-second quality scan + camera motion + dHash),
+    zero API. Version-cached: instant when already built. Non-fatal — a
+    failure here must never fail the analysis. NOTE: this is OUTER-scope
+    code; `_emit` only exists inside _analyze_video_inner (a NameError here
+    once killed a pipeline), so it reports via progress_callback directly."""
+    def _stage(status, detail=""):
+        if progress_callback:
+            try:
+                progress_callback("highlight_pool", status, detail)
+            except Exception:  # noqa: BLE001
+                pass
+    _stage("start", "逐秒画质 + 运动 + 视觉指纹(本地计算)")
+    try:
+        _t0 = time.time()
+        from src.curation import _source_pool
+        pool = _source_pool(content_hash)
+        _stage("done", f"{len(pool)} moments")
+        _el = time.time() - _t0
+        if _el > 2:
+            print(f"✨ [Analyze] Highlight pool: {len(pool)} moments · {_el:.0f}s")
+    except Exception as e:  # noqa: BLE001
+        _stage("skip", str(e)[:60])
+        print(f"⚠️ [Analyze] highlight pool build skipped: {e}")
+
+
 # ── Video analysis ─────────────────────────────────────────────────────────
 
 def _dense_caption_clip(video_path: str, start_sec: float, end_sec: float,
@@ -598,6 +626,9 @@ def analyze_video(
     if existing and not force:
         if _looks_complete(existing):
             print(f"♻️  [Analyze] Video already analyzed: {os.path.basename(video_path)} (hash={content_hash[:12]})")
+            # measured highlight scoring may still be missing for caches from
+            # before the auto-build era — ensure it (instant when current)
+            _highlight_pool_step(content_hash, progress_callback)
             return content_hash
         print(f"🔁 [Analyze] Previous run incomplete — resuming: {os.path.basename(video_path)} (hash={content_hash[:12]})")
 
@@ -672,19 +703,10 @@ def analyze_video(
     except Exception as _e:  # noqa: BLE001
         print(f"⚠️ [Analyze] sound-highlight detection skipped: {_e}")
 
-    # Highlight scoring (curation pool) — pure local compute (per-second
-    # quality scan + camera motion + dHash), no API. Building it here means
-    # the 高光评分 tab and auto-select have measured scores the moment
-    # annotation finishes, instead of waiting for a pipeline run or a manual
-    # build. Cached (v-checked) — re-annotations are instant.
-    _emit("highlight_pool", "start", "逐秒画质 + 运动 + 视觉指纹(本地计算)")
-    try:
-        _hp_t0 = time.time()
-        from src.curation import _source_pool
-        _pool = _source_pool(content_hash)
-        _emit("highlight_pool", "done", f"{len(_pool)} moments · {time.time() - _hp_t0:.0f}s")
-    except Exception as _e:  # noqa: BLE001
-        print(f"⚠️ [Analyze] highlight pool build skipped: {_e}")
+    # Highlight scoring — see _highlight_pool_step. Runs as the analysis
+    # finishing step so the 高光评分 tab and auto-select have measured scores
+    # the moment annotation completes.
+    _highlight_pool_step(content_hash, progress_callback)
 
     # Update metadata with completion marker — only NOW does the cache count
     # as "already analyzed" (see the resume check above)
