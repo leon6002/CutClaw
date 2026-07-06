@@ -3060,6 +3060,106 @@ def translate_texts(body: TranslateRequest):
     return {"translations": [out.get(t, "") for t in texts]}
 
 
+class BgmStitchRequest(BaseModel):
+    tracks: list  # [{"path": str, "start": float?, "end": float?}] in play order
+    crossfade: float = 0.0   # seconds; 0 = auto (2 bars of the outgoing track)
+    name: str = ""
+
+
+@app.post("/api/bgm/stitch")
+def bgm_stitch(body: BgmStitchRequest):
+    """Standalone BGM stitcher — no pipeline run needed. The result lands in
+    the asset imports dir as a normal audio file: scan it and it's a BGM."""
+    from src.audio.bgm_stitch import stitch_bgm
+    from src.analyzer import _ensure_ffmpeg_on_path
+    _ensure_ffmpeg_on_path()
+    tracks = [{"path": _resolve(str(t.get("path", ""))),
+               "start": t.get("start"), "end": t.get("end")}
+              for t in (body.tracks or []) if t.get("path")]
+    if len(tracks) < 2:
+        raise HTTPException(400, "请选择至少两首音乐(按播放顺序)")
+    root = cfg("ASSET_ROOT_DIR", "resource/imports")
+    out_dir = os.path.join(PROJECT_ROOT, root)
+    os.makedirs(out_dir, exist_ok=True)
+    base = (body.name or "").strip() or ("BGMmix_" + time.strftime("%m%d_%H%M%S"))
+    base = re.sub(r'[\\/:*?"<>|]', "_", base)
+    out_path = os.path.join(out_dir, base + ".mp3")
+    try:
+        meta = stitch_bgm(tracks, out_path, crossfade=body.crossfade)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"拼接失败: {e}")
+    rel = os.path.relpath(out_path, PROJECT_ROOT).replace("\\", "/")
+    return {"ok": True, "path": rel, "meta": meta}
+
+
+# ── Asset hearts: asset-level "我喜欢这个素材/这首歌" (global, by hash) ────
+_HEARTS_PATH = os.path.join(PROJECT_ROOT, "Output", "asset_index", "asset_hearts.json")
+
+
+def _hearts_load() -> dict:
+    try:
+        with open(_HEARTS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class HeartRequest(BaseModel):
+    content_hash: str
+    hearted: bool = True
+
+
+@app.get("/api/assets/hearts")
+def assets_hearts():
+    return {"hearts": sorted(h for h, v in _hearts_load().items() if v.get("hearted"))}
+
+
+@app.post("/api/assets/heart")
+def asset_heart(body: HeartRequest):
+    """Toggle the ❤️ on an asset. Hearted videos get a modest pool bonus and
+    a +1 source quota; hearted music is preferred by the BGM planner."""
+    if not body.content_hash:
+        raise HTTPException(400, "content_hash required")
+    hearts = _hearts_load()
+    hearts[body.content_hash] = {"hearted": bool(body.hearted),
+                                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    os.makedirs(os.path.dirname(_HEARTS_PATH), exist_ok=True)
+    with open(_HEARTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(hearts, f, ensure_ascii=False, indent=2)
+    return {"ok": True, "hearted": bool(body.hearted)}
+
+
+@app.get("/api/render/beats")
+def render_beats(path: str, start: float = 0.0, duration: float = 0.0):
+    """Measured music keypoints (madmom) mapped into a render's music window —
+    the beat grid the pacing engine cuts on, for timeline visualization.
+    (Distinct from /api/audio/keypoints, which returns the raw per-method
+    dict for the asset-detail drawer.)"""
+    ap = _resolve(path)
+    if not os.path.exists(ap):
+        return {"beats": []}
+    try:
+        from src.asset_manager.scanner import compute_content_hash
+        from src.analyzer import get_analysis_path
+        h = compute_content_hash(ap)
+        with open(os.path.join(PROJECT_ROOT, get_analysis_path(h), "captions.json"),
+                  "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"beats": []}
+    end = start + duration if duration and duration > 0 else float("inf")
+    beats = []
+    for k in (d.get("_keypoints_detail") or []):
+        try:
+            t = float(k.get("time", -1))
+        except (TypeError, ValueError):
+            continue
+        if start <= t <= end:
+            beats.append({"t": round(t - start, 2), "type": str(k.get("type", "")),
+                          "w": round(float(k.get("normalized_intensity", 0) or 0), 2)})
+    return {"beats": beats, "bar_sec": (d.get("facts") or {}).get("bar_sec")}
+
+
 @app.get("/api/render/clip_map")
 def render_clip_map(shot_point: str):
     """Map the finished-video timeline → each source clip + the AI description

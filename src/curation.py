@@ -33,6 +33,18 @@ def load_likes() -> list:
     except Exception:  # noqa: BLE001
         return []
 
+
+# Asset-level ❤️ — "我喜欢这个素材" (coarser than a shot-level 👍 with reason)
+HEARTS_PATH = os.path.join("Output", "asset_index", "asset_hearts.json")
+
+
+def load_hearts() -> set:
+    try:
+        with open(HEARTS_PATH, "r", encoding="utf-8") as f:
+            return {h for h, v in json.load(f).items() if v.get("hearted")}
+    except Exception:  # noqa: BLE001
+        return set()
+
 # GLOBAL taste memory — user rejections apply across every project.
 REJECTIONS_PATH = os.path.join("Output", "asset_index", "rejections.json")
 
@@ -335,6 +347,15 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
                 m["score"] = round(m["score"] + min(bonus, 0.45), 3)
                 m["liked_overlap"] = why[:3]
 
+    # Asset hearts: a modest whole-source boost (coarser signal than a
+    # shot-level like, so a smaller bonus — the user asked for "稍稍多一点")
+    _hearts = load_hearts()
+    if _hearts:
+        for m in pool:
+            if m.get("source_hash") in _hearts:
+                m["score"] = round(m["score"] + 0.05, 3)
+                m["hearted_source"] = True
+
     # Blogger-gem bonus (user-calibrated): a steady, coherent camera move
     # (glide/pan/push — NOT chaotic) at the pro travel-reel length of 3-6s
     # is exactly the material worth surfacing first.
@@ -401,6 +422,8 @@ def build_anchor_budget(pool: list, n_slots: int,
     # voices first within the greedy order; score decides the rest
     ordered = sorted(pool, key=lambda m: (-int(bool(m.get("sound"))), -m.get("score", 0)))
 
+    _hearts = load_hearts()   # hearted sources earn one extra menu slot
+
     def _select(cm: int, sm: int) -> list:
         by_c: dict = {}
         by_s: dict = {}
@@ -409,7 +432,7 @@ def build_anchor_budget(pool: list, n_slots: int,
             c, s = m.get("cluster"), m.get("source_hash")
             if c is not None and by_c.get(c, 0) >= cm:
                 continue
-            if by_s.get(s, 0) >= sm:
+            if by_s.get(s, 0) >= (sm + 1 if s in _hearts else sm):
                 continue
             chosen.append(m)
             if c is not None:

@@ -22,6 +22,7 @@ import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
+import AudioTimeline, { parseSectionTimes, SectionsBar } from "../components/flow/AudioTimeline";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
 import LocalGpuPanel from "../components/LocalGpuPanel";
@@ -110,6 +111,51 @@ function EmptyHint({ children }: { children: React.ReactNode }) {
   return <div className="py-10 text-center text-sm text-slate-500">{children}</div>;
 }
 
+// ── color swatches (key_colors) — click a swatch to copy its hex ────────────
+
+function ColorSwatch({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // clipboard API needs a secure context — fall back to a temp textarea
+      const ta = document.createElement("textarea");
+      ta.value = value; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  };
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button" onClick={copy}
+          className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/[0.04] py-1 pr-2 pl-1 transition-colors hover:border-white/30"
+        >
+          <span className="h-4 w-4 shrink-0 rounded-sm border border-white/25"
+            style={{ backgroundColor: value }} />
+          <span className="font-mono text-[11px] text-slate-300">{copied ? "已复制 ✓" : value}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>点击复制 {value}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function ColorSwatches({ colors }: { colors: any[] }) {
+  const list = colors.filter((c) => typeof c === "string" && c.trim());
+  if (list.length === 0) return <span className="text-slate-500">—</span>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {list.map((c, i) => <ColorSwatch key={i} value={c.trim()} />)}
+    </div>
+  );
+}
+
 function AnnotationTable({ ann }: { ann: Record<string, any> }) {
   const entries = Object.entries(ann).filter(([, v]) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0));
   const known = entries.filter(([k]) => FIELD_LABELS[k]);
@@ -122,7 +168,13 @@ function AnnotationTable({ ann }: { ann: Record<string, any> }) {
         {rows.map(([k, v]) => (
           <tr key={k}>
             <td className="kv-key">{FIELD_LABELS[k] ?? k}</td>
-            <td className="kv-val">{fmtVal(v)}</td>
+            <td className="kv-val">
+              {k === "key_colors" && Array.isArray(v)
+                ? <ColorSwatches colors={v} />
+                : k === "sections_summary" && typeof v === "string"
+                  ? <SectionsBar text={v} />
+                  : fmtVal(v)}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -248,6 +300,10 @@ function DetailView({
   // VAD sensitivity: lower = more sensitive + wider segments
   const [shlThr, setShlThr] = useState(() => Number(localStorage.getItem("cutclaw_shl_thr") || 0.5));
   const videoRef = useRef<HTMLVideoElement>(null);
+  // AudioTimeline owns its own <audio>; this lets the beats chart seek it.
+  const audioSeekRef = useRef<((s: number) => void) | null>(null);
+  // live playback time reported by AudioTimeline → drives the beats chart playhead
+  const [audioTime, setAudioTime] = useState(0);
 
   const buildPool = async (force = false) => {
     if (!asset) return;
@@ -329,6 +385,8 @@ function DetailView({
   if (!asset) return null;
   const src = mediaUrl(asset.absolute_path || asset.file_path);
   const seek = (s: number) => {
+    // audio uses the custom AudioTimeline player (no shared DOM ref)
+    if (asset.asset_type === "audio" && audioSeekRef.current) { audioSeekRef.current(s); return; }
     const v = videoRef.current;
     if (v) { v.currentTime = Math.max(0, s); v.play().catch(() => {}); }
   };
@@ -337,6 +395,12 @@ function DetailView({
   const onLocal = track === "local";
   const ann = (onLocal ? asset.annotation_local : asset.annotation) ?? {};
   const hasAnn = onLocal ? !!asset.annotated_local : asset.annotated;
+  // timed sections for the waveform player (parsed from sections_summary)
+  const audioSections = asset.asset_type === "audio" && typeof ann.sections_summary === "string"
+    ? parseSectionTimes(ann.sections_summary) : [];
+  const audioDur = typeof ann.duration_sec === "number" && ann.duration_sec > 0
+    ? ann.duration_sec
+    : (asset.duration_sec || (audioSections.length ? audioSections[audioSections.length - 1].end : 0));
 
   return (
     <div>
@@ -401,7 +465,15 @@ function DetailView({
         <div className="min-w-[360px] flex-[3] basis-[520px]">
           {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[480px] w-full rounded-xl bg-black" />}
           {asset.asset_type === "image" && <img src={src} className="max-h-[480px] w-full rounded-xl bg-black object-contain" />}
-          {asset.asset_type === "audio" && <audio ref={videoRef as any} src={src} controls className="w-full" />}
+          {asset.asset_type === "audio" && (
+            audioSections.length > 0
+              ? <AudioTimeline
+                  src={src} sections={audioSections} duration={audioDur}
+                  seekRef={audioSeekRef} keypointsPath={asset.absolute_path || asset.file_path}
+                  onTime={(t) => setAudioTime(t)}
+                />
+              : <audio ref={videoRef as any} src={src} controls className="w-full" />
+          )}
           <div className="mt-1.5 text-xs text-slate-500">
             {asset.capture_time && <span className="text-slate-400">📅 {fmtCapture(asset.capture_time)} · </span>}
             {asset.location && <span className="text-slate-400">📍 {asset.location} · </span>}
@@ -668,7 +740,8 @@ function DetailView({
             <TabsContent value="beats" className="pt-3">
               <AudioKeypointsChart
                 path={asset.absolute_path || asset.file_path}
-                duration={asset.duration_sec} onSeek={seek}
+                duration={audioDur || asset.duration_sec} onSeek={seek}
+                playhead={audioTime}
               />
             </TabsContent>
           )}
@@ -688,9 +761,11 @@ const STAGE_LABELS: Record<string, string> = {
   scene_merge: "场景合并", scene_analysis: "场景分析",
 };
 
-function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, onAnnotateLocal, annBusy }: {
+function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, onAnnotateLocal, annBusy, hearted, onToggleHeart }: {
   a: Asset; onOpen: () => void; index: number;
   picked?: boolean; onTogglePick?: () => void;
+  /** asset-level ❤️ — 全局口味,红心素材选材权重稍高 */
+  hearted?: boolean; onToggleHeart?: () => void;
   /** this exact asset is currently being annotated (hash-keyed job state) */
   annotating?: boolean;
   /** waiting in the current annotation batch */
@@ -781,6 +856,20 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             <span className="absolute right-1.5 bottom-1.5 rounded bg-black/65 px-1.5 py-0.5 font-mono text-[10.5px] text-slate-200">
               {dur}
             </span>
+          )}
+          {onToggleHeart && (
+            <button
+              title={hearted ? "取消红心" : "红心:我喜欢这个素材(选材权重稍微提高,全局生效)"}
+              className={cn(
+                "absolute bottom-1.5 left-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-full border text-[13px] transition-all",
+                hearted
+                  ? "border-rose-400/70 bg-rose-500/25 shadow-[0_0_10px_rgba(244,63,94,0.45)]"
+                  : "border-white/25 bg-black/50 opacity-0 grayscale group-hover:opacity-100 hover:grayscale-0",
+              )}
+              onClick={(e) => { e.stopPropagation(); onToggleHeart(); }}
+            >
+              ❤️
+            </button>
           )}
           {annotating && (
             <span className="absolute top-2 right-1.5 flex items-center gap-1 rounded-full border border-cyan-400/50 bg-black/70 px-2 py-0.5 text-[10.5px] text-cyan-300">
@@ -1014,6 +1103,125 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
   );
 }
 
+// ── BGM stitch panel: join favorite tracks WITHOUT running the pipeline ─────
+// The result is written into the imports dir as a normal audio file — scan
+// and it becomes a selectable BGM (the pipeline treats it as one song).
+function BgmStitchPanel({ tracks, hearts, onClose }: {
+  tracks: Asset[]; hearts: Set<string>; onClose: () => void;
+}) {
+  const [order, setOrder] = useState<string[]>([]);
+  const [ranges, setRanges] = useState<Record<string, { start?: string; end?: string }>>({});
+  const [name, setName] = useState("");
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<{ path: string; meta: any } | null>(null);
+  const [err, setErr] = useState("");
+  // hearted tracks first — they're the ones the user reaches for
+  const sorted = [...tracks].sort(
+    (a, b) => Number(hearts.has(b.content_hash)) - Number(hearts.has(a.content_hash)));
+  const toggle = (h: string) =>
+    setOrder((o) => (o.includes(h) ? o.filter((x) => x !== h) : [...o, h]));
+
+  const generate = async () => {
+    setRunning(true); setErr(""); setResult(null);
+    try {
+      const body = {
+        name,
+        tracks: order.map((h) => {
+          const a = tracks.find((t) => t.content_hash === h)!;
+          const r = ranges[h] ?? {};
+          return {
+            path: a.absolute_path || a.file_path,
+            start: r.start ? Number(r.start) : undefined,
+            end: r.end ? Number(r.end) : undefined,
+          };
+        }),
+      };
+      setResult(await api<any>("/api/bgm/stitch", { method: "POST", body: JSON.stringify(body) }));
+    } catch (e: any) {
+      setErr(e.message || String(e));
+    }
+    setRunning(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+      <div
+        className="max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-violet-500/30 bg-slate-900 p-5 shadow-[0_0_40px_rgba(0,0,0,0.6)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-1 flex items-center gap-2 text-sm font-bold text-violet-300">
+          <Music2 className="h-4 w-4" /> BGM 拼接
+          <button className="ml-auto text-slate-500 hover:text-slate-300" onClick={onClose}>✕</button>
+        </div>
+        <p className="mb-3 text-[11px] leading-relaxed text-slate-500">
+          按播放顺序点选歌曲(再点取消)。起止秒数可留空=整首;填了也会自动吸附到该曲的小节线上,
+          段与段之间按 2 小节交叉淡化、响度自动统一。生成的文件存入素材库,重新扫描后即可选为项目音乐。
+        </p>
+        <div className="space-y-1.5">
+          {sorted.map((a) => {
+            const idx = order.indexOf(a.content_hash);
+            const sel = idx >= 0;
+            return (
+              <div key={a.content_hash}
+                className={cn("rounded-lg border px-2.5 py-1.5 text-xs transition-colors",
+                  sel ? "border-violet-400/50 bg-violet-500/10" : "border-white/[0.07] bg-black/20 hover:border-white/20")}>
+                <div className="flex cursor-pointer items-center gap-2" onClick={() => toggle(a.content_hash)}>
+                  <span className={cn("flex h-5 w-5 shrink-0 items-center justify-center rounded-full border font-mono text-[10px]",
+                    sel ? "border-violet-300 bg-violet-400 text-slate-950" : "border-white/25 text-transparent")}>
+                    {sel ? idx + 1 : "·"}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-slate-200">{a.file_name || a.file_path}</span>
+                  {hearts.has(a.content_hash) && <span className="text-[11px]">❤️</span>}
+                  {a.duration_sec ? <span className="font-mono text-[10px] text-slate-500">{Math.round(a.duration_sec)}s</span> : null}
+                </div>
+                {sel && (
+                  <div className="mt-1.5 flex items-center gap-2 pl-7 text-[11px] text-slate-400">
+                    取
+                    <input className="h-6 w-16 rounded border border-white/10 bg-black/30 px-1.5 font-mono text-[11px] text-slate-200 outline-none"
+                      placeholder="起(s)" value={ranges[a.content_hash]?.start ?? ""}
+                      onChange={(e) => setRanges((r) => ({ ...r, [a.content_hash]: { ...r[a.content_hash], start: e.target.value } }))} />
+                    →
+                    <input className="h-6 w-16 rounded border border-white/10 bg-black/30 px-1.5 font-mono text-[11px] text-slate-200 outline-none"
+                      placeholder="止(s)" value={ranges[a.content_hash]?.end ?? ""}
+                      onChange={(e) => setRanges((r) => ({ ...r, [a.content_hash]: { ...r[a.content_hash], end: e.target.value } }))} />
+                    <span className="text-slate-600">留空 = 整首</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            className="h-8 flex-1 rounded-md border border-white/10 bg-black/30 px-2 text-xs text-slate-200 outline-none"
+            placeholder="文件名(可选,默认 BGMmix_时间戳)"
+            value={name} onChange={(e) => setName(e.target.value)}
+          />
+          <Button
+            className="h-8 gap-1.5 bg-violet-500 text-xs font-semibold text-slate-950 hover:bg-violet-400"
+            disabled={order.length < 2 || running} onClick={generate}
+          >
+            {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Music2 className="h-3.5 w-3.5" />}
+            生成拼接 BGM
+          </Button>
+        </div>
+        {err && <div className="mt-2 text-[11px] text-red-400">{err}</div>}
+        {result && (
+          <div className="mt-3 rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] p-3">
+            <div className="mb-1.5 text-[11.5px] font-semibold text-emerald-300">
+              ✓ 拼好了 · 总长 {result.meta?.total?.toFixed?.(0)}s · 衔接 {result.meta?.joins?.map((j: number) => `${j}s`).join(" / ")}
+            </div>
+            <audio controls className="w-full" src={mediaUrl(result.path)} />
+            <div className="mt-1.5 text-[10.5px] text-slate-500">
+              已存入素材库({result.path})— 重新扫描后即可选为项目音乐,流水线会把它当一首歌分析。
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── main view ───────────────────────────────────────────────────────────────
 
 const TYPE_TABS = [
@@ -1049,6 +1257,21 @@ export default function AssetsView({
   // command-bar popovers
   const [modelsOpen, setModelsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  // asset-level ❤️ (global taste, by content hash) + BGM stitch panel
+  const [hearts, setHearts] = useState<Set<string>>(new Set());
+  const [stitchOpen, setStitchOpen] = useState(false);
+  useEffect(() => {
+    api<{ hearts: string[] }>("/api/assets/hearts")
+      .then((r) => setHearts(new Set(r.hearts ?? []))).catch(() => {});
+  }, []);
+  const toggleHeart = (a: Asset) => {
+    const on = !hearts.has(a.content_hash);
+    setHearts((s) => { const n = new Set(s); if (on) n.add(a.content_hash); else n.delete(a.content_hash); return n; });
+    api("/api/assets/heart", {
+      method: "POST",
+      body: JSON.stringify({ content_hash: a.content_hash, hearted: on }),
+    }).catch(() => {});
+  };
 
   const busy = annJob.status === "running";
 
@@ -1303,6 +1526,13 @@ export default function AssetsView({
 
   return (
     <div>
+      {stitchOpen && (
+        <BgmStitchPanel
+          tracks={assets.filter((a) => a.asset_type === "audio")}
+          hearts={hearts}
+          onClose={() => setStitchOpen(false)}
+        />
+      )}
       {/* ── ① command bar: scan → annotate. Low-frequency stuff lives in popovers ── */}
       <Card className={cn(glass, (busy || selecting) && "border-beam")}>
         <CardContent className="px-4 py-3">
@@ -1652,6 +1882,15 @@ export default function AssetsView({
             <div className="ml-auto flex items-center gap-2">
               <span className="text-[11px] text-slate-600">勾选卡片=手动选材</span>
               <Button
+                variant="outline"
+                className="h-8 gap-1.5 border-violet-500/40 bg-violet-500/10 text-xs text-violet-300 hover:bg-violet-500/20"
+                onClick={() => setStitchOpen(true)}
+                disabled={assets.filter((a) => a.asset_type === "audio").length < 2}
+                title="把几首喜欢的音乐无缝拼成一条 BGM(不用跑流水线)"
+              >
+                <Music2 className="h-3.5 w-3.5" /> 拼接 BGM
+              </Button>
+              <Button
                 className="h-8 gap-1.5 bg-cyan-500 text-xs font-semibold text-slate-950 shadow-[0_0_14px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
                 onClick={autoSelect} disabled={selecting || assets.every((a) => !a.annotated)}>
                 {selecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
@@ -1669,6 +1908,8 @@ export default function AssetsView({
                   key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
                   picked={a.asset_type === "audio" ? a.content_hash === pickedAudio : picked.has(a.content_hash)}
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
+                  hearted={hearts.has(a.content_hash)}
+                  onToggleHeart={() => toggleHeart(a)}
                   annotating={busy && (annJob.meta.files ?? {})[a.content_hash] === "r"}
                   queued={busy && (annJob.meta.files ?? {})[a.content_hash] === "p"}
                   annStage={(annJob.meta.stage_by_hash ?? {})[a.content_hash]?.stage || annJob.meta.stage}
