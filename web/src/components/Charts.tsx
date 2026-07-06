@@ -129,8 +129,10 @@ export function QualityCurve({ clips, onSeek }: { clips: any[]; onSeek?: (s: num
 
 const METHOD_LABEL: Record<string, string> = { downbeat: "节拍", pitch: "音高", mel: "能量", mel_energy: "能量" };
 
-export function AudioKeypointsChart({ path, duration, onSeek }: {
+export function AudioKeypointsChart({ path, duration, onSeek, playhead }: {
   path: string; duration?: number; onSeek?: (s: number) => void;
+  /** live playback time (s) — draws a synced vertical playhead on the chart. */
+  playhead?: number;
 }) {
   const [data, setData] = useState<Record<string, any[]> | null>(null);
 
@@ -170,9 +172,21 @@ export function AudioKeypointsChart({ path, duration, onSeek }: {
           tooltip: { ...TOOLTIP, formatter: (p: any) => `${p.seriesName}<br/>${p.value[0].toFixed(2)}s · 强度 ${p.value[1].toFixed(2)}` },
           legend: { textStyle: { color: "#94a3b8", fontSize: 11 }, top: 0 },
           grid: { left: 34, right: 14, top: 30, bottom: 24 },
-          xAxis: { type: "value", name: "s", max: duration, axisLabel: AXIS, splitLine: SPLIT },
+          xAxis: { type: "value", name: "s", min: 0, max: duration, axisLabel: AXIS, splitLine: SPLIT },
           yAxis: { type: "value", min: 0, max: 1, axisLabel: AXIS, splitLine: SPLIT },
-          series,
+          // attach a synced playhead markLine to the first series (no dummy
+          // series → no stray legend entry); updates as playback advances.
+          series: playhead != null && playhead > 0
+            ? series.map((s, i) => i === 0 ? {
+                ...s,
+                markLine: {
+                  silent: true, symbol: "none", animation: false,
+                  lineStyle: { color: "#c4b5fd", width: 1.5, shadowBlur: 6, shadowColor: "rgba(196,181,253,0.55)" },
+                  label: { show: true, position: "start", formatter: `${playhead.toFixed(1)}s`, color: "#c4b5fd", fontSize: 9 },
+                  data: [{ xAxis: playhead }],
+                },
+              } : s)
+            : series,
         }}
       />
     </div>
@@ -219,7 +233,9 @@ export interface RenderAudioMeta {
   path: string; start: number; duration: number; total?: number; name?: string;
 }
 
-export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, audio = null, onSeek }: {
+export interface BeatMark { t: number; type: string; w: number }
+
+export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, audio = null, onSeek, beats = null }: {
   shotPoint: string; playhead?: number;
   /** per-cut transition list from the render sidecar, e.g. ["cut","fade:0.4",...] */
   transitions?: (string | null)[] | null;
@@ -227,6 +243,9 @@ export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, aud
   audio?: RenderAudioMeta | null;
   /** click a clip block / transition diamond → jump the player there */
   onSeek?: (t: number) => void;
+  /** measured music keypoints (madmom) inside the render window — the beat
+   *  grid cuts should land on; drawn as faint vertical guides */
+  beats?: BeatMark[] | null;
 }) {
   const [clips, setClips] = useState<TimelineClip[] | null>(null);
 
@@ -285,6 +304,7 @@ export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, aud
       <Label>
         成片时间轴 — {clips.length} 个镜头 · 总时长 {total.toFixed(1)}s · 颜色 = 来源视频
         {trMarkers.length > 0 && <span className="text-amber-400/80"> · ◆ = 转场 ({trMarkers.length} 处)</span>}
+        {(beats?.length ?? 0) > 0 && <span className="text-violet-300/80"> · ┊ = 音乐卡点 ({beats!.length} 个)</span>}
       </Label>
       <Chart
         // per-lane height drives the vertical gap between source rows. 30px per
@@ -338,17 +358,33 @@ export function ShotTimeline({ shotPoint, playhead = -1, transitions = null, aud
             encode: { x: [0, 1], y: 2 },
             data: items,
             animation: false,
-            // moving playhead cursor while the preview video plays
-            markLine: playhead >= 0 && playhead <= total + 0.5 ? {
-              silent: true, symbol: "none", animation: false,
-              lineStyle: { color: "#22d3ee", width: 1.5 },
-              label: {
-                show: true, position: "end", rotate: 0, distance: 4,
-                formatter: () => `${playhead.toFixed(1)}s`,
-                color: "#22d3ee", fontSize: 10, fontWeight: "bold" as const,
-              },
-              data: [{ xAxis: Math.min(playhead, total) }],
-            } : undefined,
+            // vertical guides: measured beat grid (faint violet) + moving playhead
+            markLine: (() => {
+              const data: any[] = (beats ?? [])
+                .filter((b) => b.t >= 0 && b.t <= total + 0.5)
+                .map((b) => ({
+                  xAxis: b.t,
+                  lineStyle: {
+                    color: b.type === "Downbeat" ? "rgba(196,181,253,0.5)" : "rgba(196,181,253,0.22)",
+                    width: 1, type: "dashed" as const,
+                  },
+                  label: { show: false },
+                }));
+              if (playhead >= 0 && playhead <= total + 0.5) {
+                data.push({
+                  xAxis: Math.min(playhead, total),
+                  lineStyle: { color: "#22d3ee", width: 1.5, type: "solid" as const },
+                  label: {
+                    show: true, position: "end", rotate: 0, distance: 4,
+                    formatter: () => `${playhead.toFixed(1)}s`,
+                    color: "#22d3ee", fontSize: 10, fontWeight: "bold" as const,
+                  },
+                });
+              }
+              return data.length > 0
+                ? { silent: true, symbol: "none", animation: false, data }
+                : undefined;
+            })(),
           },
           // visible transitions as amber diamonds at their cut positions
           ...(trMarkers.length > 0 ? [{

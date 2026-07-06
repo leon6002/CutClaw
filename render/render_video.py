@@ -791,14 +791,16 @@ def _boundary_durations(clips, transitions, transition_duration) -> list:
 
 def _compute_duck_windows(clips, transitions, transition_duration) -> list:
     """Output-timeline windows where a clip's ORIGINAL audio carries voices —
-    the BGM ducks there and the real sound plays through. Mirrors the xfade
-    timeline math so windows stay aligned when transitions shorten the video."""
-    bdur = _boundary_durations(clips, transitions, transition_duration)
+    the BGM ducks there and the real sound plays through.
+
+    Beat-exact scheme: transitions no longer shorten the timeline (each clip
+    is extracted with an extra tail that the xfade consumes), so output
+    positions are the PLAIN cumulative planned durations."""
     pos = []
     S = 0.0
-    for k, c in enumerate(clips):
+    for c in clips:
         pos.append(S)
-        S += float(c.get("duration", 0.0)) - (bdur[k] if k < len(bdur) else 0.0)
+        S += float(c.get("duration", 0.0))
 
     windows = []
     hl_cache: dict = {}
@@ -841,9 +843,13 @@ def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, t
 
     Default: hard-cut concat demuxer (stream copy) — unchanged behavior.
     transition_duration > 0: crossfade (dissolve) between clips via chained xfade.
-    Note: xfade overlaps adjacent clips, so the total shortens by ~duration per cut
-    and cut points drift slightly off the beat. (Beat-exact transitions would need
-    each clip to grab an extra tail; kept out of v1 to avoid touching extraction.)
+
+    BEAT-EXACT: each clip is extracted with an extra TAIL equal to its outgoing
+    transition's overlap (clip['xfade_tail']), so the xfade consumes the tail
+    and every boundary stays at its PLANNED cumulative time — cuts keep landing
+    on the beats the Screenwriter placed them on, and the output duration equals
+    the planned total. (v1 overlapped the planned material instead: 34 fades ate
+    ~17s and every later cut drifted off the beat grid — user heard it.)
     xfade emits video only — the BGM step maps 0:v:0 so that's fine for music-only.
     """
     T = float(transition_duration or 0.0)
@@ -884,32 +890,41 @@ def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, t
         # when its two inputs disagree ("timebase do not match").
         parts = [f"[{i}:v]settb=AVTB[v{i}]" for i in range(n)]
         prev = '[v0]'
-        S = float(clips[0].get('duration', 0) or 0)   # running duration of the joined stream
+        S = float(clips[0].get('duration', 0) or 0)   # PLANNED cumulative time
         for k in range(1, n):
             name, dur = boundary[k - 1]
+            # the fade can only be as long as the tail the outgoing clip
+            # actually managed to grab (source may have ended right there)
+            tail = float(clips[k - 1].get('xfade_tail', 0.0) or 0.0)
+            if name != "cut" and tail < 0.2:
+                name = "cut"          # no tail material → clean cut, zero drift
+            dur = min(dur, tail) if name != "cut" else dur
             dk = float(clips[k].get('duration', 0) or 0)
             out = '[vout]' if k == n - 1 else f'[vx{k}]'
             if name == "cut":
-                parts.append(f"{prev}[v{k}]concat=n=2:v=1:a=0{out}")
-                S += dk
+                # trim any unused tail off the outgoing chain, then hard-join.
+                # fps+settb after concat: its output declares NO frame rate
+                # (1/0) and a downstream xfade hard-rejects that (ffmpeg 7.x:
+                # "inputs needs to be a constant frame rate").
+                parts.append(f"{prev}trim=end={S:.4f},setpts=PTS-STARTPTS[vt{k}]"
+                             if tail > 0.01 else f"{prev}null[vt{k}]")
+                parts.append(f"[vt{k}][v{k}]concat=n=2:v=1:a=0,"
+                             f"fps={video_fps},settb=AVTB{out}")
             else:
-                offset = max(0.05, S - dur)
-                parts.append(f"{prev}[v{k}]xfade=transition={name}:duration={dur}:offset={offset:.4f}{out}")
-                S += dk - dur
+                # fade starts exactly AT the planned boundary and consumes the
+                # outgoing tail; the incoming clip begins on its planned beat
+                parts.append(f"{prev}[v{k}]xfade=transition={name}:duration={dur:.3f}:offset={S:.4f}{out}")
+            S += dk
             prev = out
         maps = ['-map', '[vout]']
         acodec = []
         if with_audio:
-            # audio timeline must match the xfade-shortened video: trim each
-            # clip's audio tail by its boundary's overlap, then hard-concat.
+            # audio timeline = planned durations exactly (the extracted files
+            # carry the video tail too — trim audio back to the planned cut).
             # Clips are extracted with a guaranteed audio stream (silent
             # sources get anullsrc), so [k:a] always exists.
             for k in range(n):
-                d_next = 0.0
-                if k < n - 1:
-                    b_name, b_dur = boundary[k]
-                    d_next = b_dur if b_name != "cut" else 0.0
-                adur = max(0.1, float(clips[k].get('duration', 0) or 0) - d_next)
+                adur = max(0.1, float(clips[k].get('duration', 0) or 0))
                 parts.append(f"[{k}:a]atrim=duration={adur:.4f},asetpts=PTS-STARTPTS[ax{k}]")
             parts.append("".join(f"[ax{k}]" for k in range(n)) + f"concat=n={n}:v=0:a=1[aout_src]")
             maps += ['-map', '[aout_src]']
@@ -1059,6 +1074,12 @@ def render_video_ffmpeg(
     else:
         target_w, target_h = video_width, video_height
 
+    # BEAT-EXACT transitions: each clip is extracted with an extra TAIL equal
+    # to its outgoing transition's overlap. The xfade then consumes the tail
+    # instead of eating planned material — every cut stays on its planned
+    # (beat-aligned) time and the output duration equals the planned total.
+    _tail_req = _boundary_durations(clips, transitions, transition_duration)
+
     # Create temporary directory for intermediate files
     with tempfile.TemporaryDirectory() as temp_dir:
         clip_files = []
@@ -1074,6 +1095,9 @@ def render_video_ffmpeg(
             clip_files.append(clip_file)
 
             duration = clip['duration']
+            # extra tail this clip must grab for its outgoing transition
+            _x_tail = float(_tail_req[i]) if i < len(_tail_req) else 0.0
+            _t_extract = duration + _x_tail
             section_idx = clip.get('section_idx', 0)
             shot_idx = clip.get('shot_idx', 0)
             show_labels_for_clip = clip.get('show_labels', show_labels)
@@ -1297,7 +1321,7 @@ def render_video_ffmpeg(
                     '-y',  # Overwrite output
                     '-ss', str(start),
                     '-i', source_video,
-                    '-t', str(duration),
+                    '-t', str(_t_extract),
                     '-vf', video_filter,
                     '-r', str(video_fps),
                     *_video_codec_args(),  # NVENC when driver allows, else libx264
@@ -1362,7 +1386,7 @@ def render_video_ffmpeg(
                         '-y',  # Overwrite output
                         '-ss', str(start),
                         '-i', source_video,
-                        '-t', str(duration),
+                        '-t', str(_t_extract),
                         '-vf', video_filter,
                         # Uniform fps is REQUIRED: clips are joined with the concat
                         # demuxer in stream-copy mode, and mixed frame rates (e.g. a
@@ -1384,7 +1408,7 @@ def render_video_ffmpeg(
                         '-y',  # Overwrite output
                         '-ss', str(start),
                         '-i', source_video,
-                        '-t', str(duration),
+                        '-t', str(_t_extract),
                         '-r', str(video_fps),
                         *_video_codec_args(),  # NVENC when driver allows, else libx264
                         '-pix_fmt', 'yuv420p',  # force 8-bit (10-bit source → High10 breaks hw decoders)
@@ -1427,7 +1451,7 @@ def render_video_ffmpeg(
                 # trying to re-encode the attached-picture stream through libx264.
                 # Map only the first (real) video stream.
                 cmd = (cmd[:j]
-                       + ['-f', 'lavfi', '-t', str(duration), '-i',
+                       + ['-f', 'lavfi', '-t', str(_t_extract), '-i',
                           f'anullsrc=channel_layout=stereo:sample_rate={audio_ar}']
                        + cmd[j:-1] + ['-map', '0:v:0', '-map', '1:a'] + [clip_file])
 
@@ -1447,7 +1471,9 @@ def render_video_ffmpeg(
                     print(result.stderr.decode()[-500:])
                 return False
 
-            # Update clip duration to actual extracted duration (fps conversion or cutting may change it)
+            # Update clip duration to actual extracted duration (fps conversion or
+            # cutting may change it) — and split off the transition tail: the tail
+            # is join-only material, timeline math must stay on PLANNED durations.
             probe = subprocess.run(
                 ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                  '-of', 'default=noprint_wrappers=1:nokey=1', clip_file],
@@ -1456,7 +1482,11 @@ def render_video_ffmpeg(
             if probe.stdout.strip():
                 try:
                     actual_dur = float(probe.stdout.strip())
-                    clip['duration'] = actual_dur
+                    # source may have ended early — only the tail that actually
+                    # made it into the file is available to the crossfade
+                    _tail_actual = min(_x_tail, max(0.0, actual_dur - duration))
+                    clip['xfade_tail'] = round(_tail_actual, 4)
+                    clip['duration'] = round(actual_dur - _tail_actual, 4)
                 except ValueError:
                     pass
 

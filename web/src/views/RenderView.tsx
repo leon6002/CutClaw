@@ -9,7 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
-import { ShotTimeline } from "../components/Charts";
+import { ShotTimeline, type BeatMark } from "../components/Charts";
 import { ActiveClipCard, ClipCaption, ClipInspector, activeClipAt, useClipMap } from "../components/ClipInspector";
 import type { PipelineStatus, ProjectState } from "../App";
 
@@ -109,6 +109,19 @@ export default function RenderView({
 
   const shotPoint = project.shotPoint;
   const { clips: clipMap, error: clipMapError, reload: reloadClipMap } = useClipMap(shotPoint);
+
+  // measured music keypoints inside the render window → beat guides on the timeline
+  const [beats, setBeats] = useState<BeatMark[]>([]);
+  const renderAudio = outputs.find((o) => o.ratio === activeRatio)?.render_meta?.audio
+    ?? outputs[0]?.render_meta?.audio;
+  useEffect(() => {
+    if (!renderAudio?.path) { setBeats([]); return; }
+    api<{ beats: BeatMark[] }>(
+      `/api/render/beats?path=${encodeURIComponent(renderAudio.path)}`
+      + `&start=${renderAudio.start ?? 0}&duration=${renderAudio.duration ?? 0}`)
+      .then((r) => setBeats(r.beats ?? []))
+      .catch(() => setBeats([]));
+  }, [renderAudio?.path, renderAudio?.start, renderAudio?.duration]);
   const activeIdx = activeClipAt(clipMap, playhead);
   const activeClip = activeIdx >= 0 && clipMap ? clipMap[activeIdx] : null;
   const activeOutput = outputs.find((o) => o.ratio === activeRatio) ?? outputs[0];
@@ -423,6 +436,7 @@ export default function RenderView({
                     transitions={activeOutput?.render_meta?.transitions ?? null}
                     audio={activeOutput?.render_meta?.audio ?? null}
                     onSeek={seekTo}
+                    beats={beats}
                   />
                 </div>
               </div>
