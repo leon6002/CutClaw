@@ -270,7 +270,7 @@ export default function EditorView({
                     <span className="min-w-0 flex-1 truncate text-[13px] text-slate-300" title={v}>{basename(v)}</span>
                     <button
                       className={cn("shrink-0 rounded px-1.5 text-[11px]",
-                        preview?.path === v ? "text-cyan-300" : "text-slate-600 opacity-0 group-hover:opacity-100 hover:text-cyan-300")}
+                        preview?.path === v ? "text-cyan-300" : "text-slate-500 hover:text-cyan-300")}
                       title="预览播放"
                       onClick={(e) => { e.preventDefault(); e.stopPropagation(); previewToggle("video", v); }}
                     >{preview?.path === v ? "⏹" : "▶"}</button>
@@ -317,7 +317,7 @@ export default function EditorView({
                         <span className="min-w-0 flex-1 truncate">{basename(a)}</span>
                         <button
                           className={cn("shrink-0 rounded px-1 text-[11px]",
-                            preview?.path === a ? "text-violet-300" : "text-slate-600 opacity-0 group-hover:opacity-100 hover:text-violet-300")}
+                            preview?.path === a ? "text-violet-300" : "text-slate-500 hover:text-violet-300")}
                           title="试听"
                           onClick={() => previewToggle("audio", a)}
                         >{preview?.path === a ? "⏹" : "▶"}</button>
@@ -361,7 +361,7 @@ export default function EditorView({
                 </div>
               )}
               {/* 合成 BGM — a project ARTIFACT, shown apart from the raw tracks */}
-              {(p.audios?.length ?? 0) > 1 && /BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
+              {/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
                 <div className="mt-2 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.05] p-2">
                   <div className="flex items-center gap-2 text-xs text-emerald-300">
                     <span className="shrink-0">🤖 合成 BGM</span>
@@ -372,12 +372,14 @@ export default function EditorView({
                       title="试听合成结果"
                       onClick={() => previewToggle("audio", p.audio)}
                     >{preview?.path === p.audio ? "⏹" : "▶"}</button>
-                    <button
-                      className="shrink-0 rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-[10.5px] text-violet-300 hover:bg-violet-500/20"
-                      disabled={running}
-                      title="丢弃这次融合结果,下次运行时按当前列表和目标时长重新融合"
-                      onClick={() => set({ audio: p.audios![0] || "" })}
-                    >重新融合</button>
+                    {(p.audios?.length ?? 0) > 1 && (
+                      <button
+                        className="shrink-0 rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-[10.5px] text-violet-300 hover:bg-violet-500/20"
+                        disabled={running}
+                        title="丢弃这次融合结果,下次运行时按当前列表和目标时长重新融合"
+                        onClick={() => set({ audio: p.audios![0] || "" })}
+                      >重新融合</button>
+                    )}
                   </div>
                 </div>
               )}

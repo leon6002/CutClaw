@@ -84,7 +84,9 @@ const NAV_TABS = [
 function toState(p: any): ProjectState {
   return {
     id: p.id, name: p.name ?? "",
-    videos: p.videos ?? [], audio: p.audio ?? "", instruction: p.instruction ?? "",
+    videos: p.videos ?? [], audio: p.audio ?? "",
+    audios: p.audios ?? (p.audio ? [p.audio] : []),
+    instruction: p.instruction ?? "",
     hasDialogue: !!p.has_dialogue, mainCharacter: p.main_character ?? "", srt: p.srt ?? "",
     targetLength: p.target_length ?? 30, shotLength: p.shot_length ?? 4,
     selectionRationale: p.selection_rationale ?? "",
@@ -94,7 +96,8 @@ function toState(p: any): ProjectState {
 
 function toPatch(s: ProjectState): Record<string, any> {
   return {
-    name: s.name, videos: s.videos, audio: s.audio, instruction: s.instruction,
+    name: s.name, videos: s.videos, audio: s.audio, audios: s.audios ?? [],
+    instruction: s.instruction,
     has_dialogue: s.hasDialogue, main_character: s.mainCharacter, srt: s.srt,
     target_length: s.targetLength, shot_length: s.shotLength,
     selection_rationale: s.selectionRationale,

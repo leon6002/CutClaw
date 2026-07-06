@@ -2209,7 +2209,7 @@ PROJECTS_DIR = os.path.join(PROJECT_ROOT, "Output", "projects")
 
 _PROJECT_DEFAULTS = {
     "name": "",
-    "videos": [], "audio": "", "instruction": "",
+    "videos": [], "audio": "", "audios": [], "instruction": "",
     "has_dialogue": False, "main_character": "", "srt": "",
     "target_length": 30.0, "shot_length": 4.0,
     "selection_rationale": "",
