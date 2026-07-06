@@ -1130,8 +1130,10 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
   const [ranges, setRanges] = useState<Record<string, { start?: string; end?: string }>>({});
   const [name, setName] = useState("");
   const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<{ path: string; meta: any } | null>(null);
+  const [result, setResult] = useState<{ path: string; meta: any; plan?: any[]; why?: string } | null>(null);
   const [err, setErr] = useState("");
+  const [mode, setMode] = useState<"ai" | "manual">("ai");
+  const [targetSec, setTargetSec] = useState("180");
   // hearted tracks first — they're the ones the user reaches for
   const sorted = [...tracks].sort(
     (a, b) => Number(hearts.has(b.content_hash)) - Number(hearts.has(a.content_hash)));
@@ -1143,13 +1145,15 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
     try {
       const body = {
         name,
+        mode,
+        target_sec: Number(targetSec) || 180,
         tracks: order.map((h) => {
           const a = tracks.find((t) => t.content_hash === h)!;
           const r = ranges[h] ?? {};
           return {
             path: a.absolute_path || a.file_path,
-            start: r.start ? Number(r.start) : undefined,
-            end: r.end ? Number(r.end) : undefined,
+            start: mode === "manual" && r.start ? Number(r.start) : undefined,
+            end: mode === "manual" && r.end ? Number(r.end) : undefined,
           };
         }),
       };
@@ -1170,9 +1174,28 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
           <Music2 className="h-4 w-4" /> BGM 拼接
           <button className="ml-auto text-slate-500 hover:text-slate-300" onClick={onClose}>✕</button>
         </div>
+        <div className="mb-2 flex items-center gap-1.5">
+          {([["ai", "🤖 AI 融合"], ["manual", "✋ 手动"]] as const).map(([m, lab]) => (
+            <button key={m}
+              className={cn("rounded-md border px-2.5 py-1 text-[11px] transition-colors",
+                mode === m ? "border-violet-400/60 bg-violet-500/20 text-violet-200"
+                  : "border-white/10 bg-black/20 text-slate-500 hover:text-slate-300")}
+              onClick={() => setMode(m)}>{lab}</button>
+          ))}
+          {mode === "ai" && (
+            <span className="ml-2 flex items-center gap-1.5 text-[11px] text-slate-400">
+              目标总长
+              <input className="h-6 w-14 rounded border border-white/10 bg-black/30 px-1.5 text-center font-mono text-[11px] text-slate-200 outline-none"
+                value={targetSec} onChange={(e) => setTargetSec(e.target.value)} />
+              秒
+            </span>
+          )}
+        </div>
         <p className="mb-3 text-[11px] leading-relaxed text-slate-500">
-          按播放顺序点选歌曲(再点取消)。起止秒数可留空=整首;填了也会自动吸附到该曲的小节线上,
-          段与段之间按 2 小节交叉淡化、响度自动统一。生成的文件存入素材库,重新扫描后即可选为项目音乐。
+          {mode === "ai"
+            ? "点选参与融合的歌曲(需已标注,有节奏分析)。AI 会按实测段落的能量曲线,为每首挑最合适的一段,编排成 开场→铺垫→高潮→收尾 的弧线;衔接点自动吸附小节线、选能量低谷、响度统一。"
+            : "按播放顺序点选歌曲(再点取消)。起止秒数可留空=整首;填了也会自动吸附到该曲的小节线上,段与段之间按 2 小节交叉淡化、响度自动统一。"}
+          生成的文件存入素材库,重新扫描后即可选为项目音乐。
         </p>
         <div className="space-y-1.5">
           {sorted.map((a) => {
@@ -1191,7 +1214,7 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
                   {hearts.has(a.content_hash) && <span className="text-[11px]">❤️</span>}
                   {a.duration_sec ? <span className="font-mono text-[10px] text-slate-500">{Math.round(a.duration_sec)}s</span> : null}
                 </div>
-                {sel && (
+                {sel && mode === "manual" && (
                   <div className="mt-1.5 flex items-center gap-2 pl-7 text-[11px] text-slate-400">
                     取
                     <input className="h-6 w-16 rounded border border-white/10 bg-black/30 px-1.5 font-mono text-[11px] text-slate-200 outline-none"
@@ -1219,7 +1242,7 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
             disabled={order.length < 2 || running} onClick={generate}
           >
             {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Music2 className="h-3.5 w-3.5" />}
-            生成拼接 BGM
+            {mode === "ai" ? "AI 编排并拼接" : "生成拼接 BGM"}
           </Button>
         </div>
         {err && <div className="mt-2 text-[11px] text-red-400">{err}</div>}
@@ -1228,6 +1251,17 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
             <div className="mb-1.5 text-[11.5px] font-semibold text-emerald-300">
               ✓ 拼好了 · 总长 {result.meta?.total?.toFixed?.(0)}s · 衔接 {result.meta?.joins?.map((j: number) => `${j}s`).join(" / ")}
             </div>
+            {(result.plan?.length ?? 0) > 0 && (
+              <div className="mb-2 space-y-0.5 text-[11px] text-slate-300">
+                {result.plan!.map((p: any, i: number) => (
+                  <div key={i}>
+                    <span className="text-violet-300">{i + 1}. [{p.role || "段"}]</span>{" "}
+                    {p.track} <span className="font-mono text-slate-500">{p.start?.toFixed?.(0)}–{p.end?.toFixed?.(0)}s</span>
+                  </div>
+                ))}
+                {result.why && <div className="pt-0.5 text-[10.5px] text-slate-500">AI:{result.why}</div>}
+              </div>
+            )}
             <audio controls className="w-full" src={mediaUrl(result.path)} />
             <div className="mt-1.5 text-[10.5px] text-slate-500">
               已存入素材库({result.path})— 重新扫描后即可选为项目音乐,流水线会把它当一首歌分析。

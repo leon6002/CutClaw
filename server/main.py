@@ -3065,13 +3065,19 @@ class BgmStitchRequest(BaseModel):
     tracks: list  # [{"path": str, "start": float?, "end": float?}] in play order
     crossfade: float = 0.0   # seconds; 0 = auto (2 bars of the outgoing track)
     name: str = ""
+    mode: str = "manual"     # "manual" | "ai" (AI picks the best sections per track)
+    target_sec: float = 180.0  # ai mode: desired total duration
 
 
 @app.post("/api/bgm/stitch")
 def bgm_stitch(body: BgmStitchRequest):
     """Standalone BGM stitcher — no pipeline run needed. The result lands in
-    the asset imports dir as a normal audio file: scan it and it's a BGM."""
-    from src.audio.bgm_stitch import stitch_bgm
+    the asset imports dir as a normal audio file: scan it and it's a BGM.
+
+    mode=ai: the LLM arranges MEASURED sections of each track into an energy
+    arc (open→build→peak→resolve); all timestamps are signal-derived, joins
+    snap to bar lines, deterministic fallback if the LLM misbehaves."""
+    from src.audio.bgm_stitch import stitch_bgm, plan_bgm_mix
     from src.analyzer import _ensure_ffmpeg_on_path
     _ensure_ffmpeg_on_path()
     tracks = [{"path": _resolve(str(t.get("path", ""))),
@@ -3079,6 +3085,20 @@ def bgm_stitch(body: BgmStitchRequest):
               for t in (body.tracks or []) if t.get("path")]
     if len(tracks) < 2:
         raise HTTPException(400, "请选择至少两首音乐(按播放顺序)")
+
+    plan_why, plan_view = "", []
+    if body.mode == "ai":
+        try:
+            picks, plan_why = plan_bgm_mix([t["path"] for t in tracks],
+                                           target_sec=float(body.target_sec or 180.0))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"AI 编排失败: {e}")
+        tracks = [{"path": p["path"], "start": p.get("start"), "end": p.get("end")}
+                  for p in picks]
+        plan_view = [{"track": p.get("track_name", os.path.basename(p["path"])),
+                      "start": p.get("start"), "end": p.get("end"),
+                      "role": p.get("role", "")} for p in picks]
+
     root = cfg("ASSET_ROOT_DIR", "resource/imports")
     out_dir = os.path.join(PROJECT_ROOT, root)
     os.makedirs(out_dir, exist_ok=True)
@@ -3090,7 +3110,7 @@ def bgm_stitch(body: BgmStitchRequest):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"拼接失败: {e}")
     rel = os.path.relpath(out_path, PROJECT_ROOT).replace("\\", "/")
-    return {"ok": True, "path": rel, "meta": meta}
+    return {"ok": True, "path": rel, "meta": meta, "plan": plan_view, "why": plan_why}
 
 
 # ── Asset hearts: asset-level "我喜欢这个素材/这首歌" (global, by hash) ────
