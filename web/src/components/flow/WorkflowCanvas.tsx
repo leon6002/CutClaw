@@ -102,16 +102,17 @@ function useJobTraces(jobId: string | null) {
 const COL_W = 265;
 const LANE_H = 125;
 const LANE_TOP = 130;
-const X_ROOT = 1220;         // shot-root column — pushed right to make room for the
+const X_ROOT = 2190;         // shot-root column — pushed right to make room for the
                              // asset column + analysis chains + screenwriter + editor
 
 // ── pipeline columns (left → right): audio sources → assets/mix → analysis
-//    stages → screenwriter → editor → shots.
-const AUDIO_SRC_X = -290;              // original music tracks (feed the BGM mix)
-const ASSET_X = 10, ASSET_ROW = 196;   // input asset column (poster + name per row)
-const STAGE_X = 306, STAGE_ROW = 122;  // batch analysis stage chain (视频理解/音频分析)
-const SW_X = 600, SW_Y = 6;            // "AI 编剧" timeline node
-const EDITOR_X = 960;                  // editor hub, between screenwriter and shots
+//    stages → screenwriter → editor → shots. Edge-to-edge gaps ≈300px (user:
+//    the columns felt glued at ~70px).
+const AUDIO_SRC_X = -530;              // original music tracks (feed the BGM mix)
+const ASSET_X = 10, ASSET_ROW = 196;   // input asset column (group cards / posters)
+const STAGE_X = 580, STAGE_ROW = 122;  // batch analysis stage chain (视频理解/音频分析)
+const SW_X = 1100, SW_Y = 6;           // "AI 编剧" timeline node (300px wide)
+const EDITOR_X = 1700;                 // editor hub, between screenwriter and shots
 
 // batch tasks that render as canvas stage nodes, in dataflow order
 export const VIDEO_STAGE_CHAIN = ["video_analysis", "video_clips", "video_dense", "video_scenes"];
@@ -172,6 +173,8 @@ export interface AssetInfo {
   annotated: boolean;
   annotation?: Record<string, any>;
   content_hash?: string;
+  capture_time?: string | null;   // journey metadata → video clustering
+  location?: string | null;
 }
 
 export interface ClipInfo { video_path: string; start: string; end: string; duration: number }
@@ -314,12 +317,14 @@ function buildGraph(opts: {
   const videoEntry = vChain.length ? `stage-${vChain[0]}` : "sw";
   const audioEntry = aChain.length ? `stage-${aChain[0]}` : "sw";
 
-  // Input assets. Videos form the main column feeding the analysis chain. Music
-  // gets FUSION semantics: when the project audio is an AI mix, the original
+  // Input assets. Videos/images are CLUSTERED by trip (capture date, >14-day
+  // gaps split — same rule as the journey layer) into compact group cards with
+  // a thumbnail grid, so 14 sources don't stack a mile high. Music keeps
+  // FUSION semantics: when the project audio is an AI mix, the original
   // tracks sit in their own column further left, and ONLY the tracks that
   // actually made it into the mix get a violet edge into the mix node —
-  // unused tracks are dimmed and unconnected, so "谁进了最终 BGM" reads at
-  // a glance. The mix node alone feeds the audio analysis chain.
+  // unused tracks are dimmed and unconnected. The mix alone feeds audio analysis.
+  const assetNodeId: Record<number, string> = {};   // global asset idx → canvas node id
   const assetList = assets ?? [];
   if (assetList.length > 0) {
     const _normP = (s: string) => (s || "").replace(/\//g, "\\").toLowerCase();
@@ -328,6 +333,8 @@ function buildGraph(opts: {
     const mix = assetList.find((a) => a.asset_type === "audio" && isMix(a));
     const audioSrcs = mix ? assetList.filter((a) => a.asset_type === "audio" && !isMix(a)) : [];
     const mainCol = assetList.filter((a) => !audioSrcs.includes(a));
+    const visuals = mainCol.filter((a) => a.asset_type !== "audio");
+    const mainAudio = mainCol.filter((a) => a.asset_type === "audio");
     const usedSet = new Set((bgmUsedPaths ?? []).map(_base));
 
     const pushAsset = (a: AssetInfo, id: string, x: number, y: number, dimmed = false) => {
@@ -343,16 +350,83 @@ function buildGraph(opts: {
       });
     };
 
-    const startY = SW_Y + 150 - (mainCol.length * ASSET_ROW) / 2;
-    mainCol.forEach((a, i) => {
-      const gi = assetList.indexOf(a);      // stable id ↔ assetIndexByPath
-      const id = `asset-${gi}`;
-      pushAsset(a, id, ASSET_X, startY + i * ASSET_ROW);
-      const live = assetLive?.[(a.file_name || "").toLowerCase()];
-      const entry = a.asset_type === "audio" ? audioEntry : videoEntry;
+    // ── trip clustering: capture_time (backend) → filename date → 其他 ──
+    const fnameDate = (name: string): string | null => {
+      const m = (name || "").match(/(20\d{2})[-_]?(\d{2})[-_]?(\d{2})/);
+      if (!m) return null;
+      const mo = Number(m[2]), dy = Number(m[3]);
+      if (mo < 1 || mo > 12 || dy < 1 || dy > 31) return null;
+      return `${m[1]}-${m[2]}-${m[3]}`;
+    };
+    const dateOf = (a: AssetInfo) => (a.capture_time ?? "").slice(0, 10) || fnameDate(a.file_name);
+    const dayDiff = (a: string, b: string) => Math.abs(Date.parse(b) - Date.parse(a)) / 86400000;
+    const dated = visuals.filter((a) => dateOf(a)).sort((x, y) => dateOf(x)!.localeCompare(dateOf(y)!));
+    const undated = visuals.filter((a) => !dateOf(a));
+    const groups: AssetInfo[][] = [];
+    for (const a of dated) {
+      const g = groups[groups.length - 1];
+      if (g && dayDiff(dateOf(g[g.length - 1])!, dateOf(a)!) <= 14) g.push(a);
+      else groups.push([a]);
+    }
+    if (undated.length) groups.push(undated);
+
+    const fmtMD = (d: string) => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+    const groupLabel = (g: AssetInfo[]): string => {
+      const ds = g.map(dateOf).filter(Boolean) as string[];
+      if (!ds.length) return "其他素材";
+      const s = ds[0], e = ds[ds.length - 1];
+      return s === e ? `${s.slice(0, 4)}年 ${fmtMD(s)}` : `${s.slice(0, 4)}年 ${fmtMD(s)} – ${fmtMD(e)}`;
+    };
+    const groupSub = (g: AssetInfo[]): string | undefined => {
+      const counts = new Map<string, number>();
+      for (const a of g) if (a.location) counts.set(a.location, (counts.get(a.location) ?? 0) + 1);
+      const top = [...counts.entries()].sort((x, y) => y[1] - x[1])[0];
+      return top ? `📍 ${top[0]}` : undefined;
+    };
+    // rendered card height estimate: header + optional sub + thumb rows
+    const groupH = (g: AssetInfo[], sub?: string) =>
+      30 + (sub ? 16 : 0) + Math.ceil(g.length / 3) * 49 + 8;
+
+    const COL_GAP = 36;
+    const groupMeta = groups.map((g) => { const sub = groupSub(g); return { g, sub, h: groupH(g, sub) }; });
+    const colH = groupMeta.reduce((s, m) => s + m.h + COL_GAP, 0) + mainAudio.length * ASSET_ROW;
+    let cursorY = SW_Y + 150 - colH / 2;
+
+    groupMeta.forEach((m, gi) => {
+      const id = `assetgrp-${gi}`;
+      const anyLive = m.g.some((a) => assetLive?.[(a.file_name || "").toLowerCase()] === "r");
+      const allDone = m.g.every((a) => a.annotated || assetLive?.[(a.file_name || "").toLowerCase()] === "d");
+      nodes.push({
+        id, type: "assetGroup", position: { x: ASSET_X, y: cursorY },
+        data: {
+          label: groupLabel(m.g), sub: m.sub,
+          items: m.g.map((a) => ({
+            path: a.path, fileName: a.file_name, contentHash: a.content_hash ?? "",
+            annotated: a.annotated, live: assetLive?.[(a.file_name || "").toLowerCase()],
+            onOpen: () => onOpenAsset?.(a),
+          })),
+        },
+      });
+      for (const a of m.g) assetNodeId[assetList.indexOf(a)] = id;
       edges.push({
-        id: `e-${id}-${entry}`, source: id, target: entry,
-        ...(entry !== "sw" ? { targetHandle: "in" } : {}),
+        id: `e-${id}-${videoEntry}`, source: id, target: videoEntry,
+        ...(videoEntry !== "sw" ? { targetHandle: "in" } : {}),
+        ...edgeStyle(anyLive ? "active" : allDone ? "done" : "pending"),
+      });
+      cursorY += m.h + COL_GAP;
+    });
+
+    // audio in the main column (the AI mix, or a plain single track)
+    mainAudio.forEach((a) => {
+      const gi = assetList.indexOf(a);
+      const id = `asset-${gi}`;
+      assetNodeId[gi] = id;
+      pushAsset(a, id, ASSET_X, cursorY);
+      cursorY += ASSET_ROW;
+      const live = assetLive?.[(a.file_name || "").toLowerCase()];
+      edges.push({
+        id: `e-${id}-${audioEntry}`, source: id, target: audioEntry,
+        ...(audioEntry !== "sw" ? { targetHandle: "in" } : {}),
         ...edgeStyle(live === "r" ? "active" : (a.annotated || live === "d") ? "done" : "pending"),
       });
     });
@@ -361,11 +435,12 @@ function buildGraph(opts: {
       const mixIdx = assetList.indexOf(mix);
       const mixNodeId = `asset-${mixIdx}`;
       const mixPos = nodes.find((n) => n.id === mixNodeId)?.position;
-      const mixY = mixPos?.y ?? startY;
+      const mixY = mixPos?.y ?? cursorY;
       const srcStartY = mixY + 90 - (audioSrcs.length * ASSET_ROW) / 2;
       audioSrcs.forEach((a, i) => {
         const gi = assetList.indexOf(a);
         const id = `asset-${gi}`;
+        assetNodeId[gi] = id;
         const used = usedSet.size === 0 || usedSet.has(_base(a.path));
         pushAsset(a, id, AUDIO_SRC_X, srcStartY + i * ASSET_ROW, !used);
         if (used) {
@@ -563,10 +638,11 @@ function buildGraph(opts: {
       // thin, faint curve back to the source asset (leaves the clip's LEFT via
       // the "back" handle, enters the asset's right — a clean leftward arc)
       const ai = assetIndexByPath(shot.clips[0].video_path);
-      if (ai >= 0) {
+      const backTarget = ai >= 0 ? assetNodeId[ai] : undefined;   // group card or single node
+      if (backTarget) {
         edges.push({
-          id: `e-${clipId}-asset-${ai}`, source: clipId, sourceHandle: "back",
-          target: `asset-${ai}`, animated: false,
+          id: `e-${clipId}-${backTarget}`, source: clipId, sourceHandle: "back",
+          target: backTarget, animated: false,
           style: { stroke: "rgba(148,163,184,0.16)", strokeWidth: 1 },
         });
       }

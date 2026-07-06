@@ -499,6 +499,70 @@ export const OrchestratorNode = memo(({ data }: NodeProps) => {
   );
 });
 
+// ── D2. Asset Group Node (video column clustered by trip/location) ──────────
+// 14 individual poster cards made the input column a mile high; videos are
+// clustered by capture date (trip gaps) + location into one compact card per
+// group, a thumbnail grid inside. Click a thumbnail → that asset's annotation.
+
+export interface AssetGroupItem {
+  path: string; fileName: string; contentHash: string;
+  annotated: boolean; live?: string;
+  onOpen?: () => void;
+}
+export interface AssetGroupData {
+  label: string;          // e.g. "2026 06/15–06/18"
+  sub?: string;           // e.g. "📍 阿勒泰"
+  items: AssetGroupItem[];
+  [key: string]: unknown;
+}
+
+export const AssetGroupNode = memo(({ data }: NodeProps) => {
+  const d = data as AssetGroupData;
+  const anyLive = d.items.some((it) => it.live === "r");
+  return (
+    <div className={cn(
+      "w-[264px] rounded-xl border bg-slate-900/85 shadow-lg",
+      anyLive ? "border-sky-400/70 node-breathe" : "border-sky-500/25",
+    )}>
+      <div className="flex items-baseline gap-1.5 px-3 pt-2 pb-1">
+        <Film className="h-3 w-3 shrink-0 self-center text-sky-300" />
+        <span className="truncate text-[11.5px] font-semibold text-slate-200">{d.label}</span>
+        <span className="ml-auto shrink-0 font-mono text-[9.5px] text-slate-500">{d.items.length} 个</span>
+      </div>
+      {d.sub && <div className="px-3 pb-1 text-[10px] text-slate-400">{d.sub}</div>}
+      <div className="grid grid-cols-3 gap-1 px-2 pb-2">
+        {d.items.map((it) => (
+          <GroupThumb key={it.path} it={it} />
+        ))}
+      </div>
+      <Handle type="target" position={H.l} className={handleCls()} />
+      <Handle type="source" position={H.r} className={handleCls()} />
+    </div>
+  );
+});
+
+function GroupThumb({ it }: { it: AssetGroupItem }) {
+  const [failed, setFailed] = useState(false);
+  const url = `/api/assets/thumb?hash=${encodeURIComponent(it.contentHash || "")}&path=${encodeURIComponent(it.path)}`;
+  return (
+    <button
+      onClick={(ev) => { ev.stopPropagation(); it.onOpen?.(); }}
+      title={`${it.fileName} — 点击查看标注与预览`}
+      className={cn(
+        "relative aspect-video overflow-hidden rounded-md border bg-slate-950 transition-transform hover:z-10 hover:scale-[1.6]",
+        it.live === "r" ? "animate-pulse border-cyan-400/80"
+          : it.annotated || it.live === "d" ? "border-white/10 hover:border-sky-400/70"
+            : "border-amber-400/40",
+      )}
+    >
+      {!failed
+        ? <img src={url} loading="lazy" className="h-full w-full object-cover" onError={() => setFailed(true)} />
+        : <Film className="m-auto h-4 w-4 text-slate-700" />}
+      {it.live === "r" && <span className="pointer-events-none absolute inset-0 bg-cyan-500/20" />}
+    </button>
+  );
+}
+
 // ── E. Stage Node (batch analysis phases as first-class canvas citizens) ────
 // The per-file/per-segment grids (视频片段理解 / 密集片段描述 / …) used to live
 // under the canvas; each is now ONE node in an analysis chain between the
@@ -594,4 +658,5 @@ export const nodeTypes = {
   screenwriter: ScreenwriterNode,
   orchestrator: OrchestratorNode,
   stage: StageNode,
+  assetGroup: AssetGroupNode,
 };

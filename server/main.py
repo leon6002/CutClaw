@@ -1395,6 +1395,14 @@ def assets_by_paths(body: ByPathsRequest):
         }
         if ann is not None:
             d["annotation"] = _dump(ann.annotation)
+        # journey metadata (cached per file name) — the canvas clusters the
+        # video column by location/capture date to avoid a mile-high stack
+        try:
+            mm = _media_meta_for(os.path.abspath(_resolve(path)), d["file_name"])
+            d["capture_time"] = mm.get("capture_time")
+            d["location"] = mm.get("location")
+        except Exception:  # noqa: BLE001
+            pass
         out.append(d)
     return {"assets": out}
 
