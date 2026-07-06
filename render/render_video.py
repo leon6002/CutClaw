@@ -668,6 +668,14 @@ LETTERBOX_FILTER = ("crop=iw:floor(iw/2.35/2)*2,"
                     "pad=iw:floor(iw*9/16/2)*2:0:(oh-ih)/2:black")
 
 _HAS_AUDIO_CACHE: dict = {}
+_DIMS_CACHE: dict = {}
+
+
+def _dims_cached(path: str) -> tuple:
+    """Per-source width/height (multi-source renders mix 4K drone + 1080p phone)."""
+    if path not in _DIMS_CACHE:
+        _DIMS_CACHE[path] = get_video_dimensions(path)
+    return _DIMS_CACHE[path]
 
 
 def _source_has_audio(path: str) -> bool:
@@ -1004,6 +1012,16 @@ def render_video_ffmpeg(
         except ValueError:
             print(f"Warning: Could not parse crop ratio '{crop_ratio}'. Ignoring.")
 
+    # Common output size ALL clips are normalized to (concat demuxer stream-copies,
+    # so every clip must decode to identical dimensions). Derived from the primary
+    # video; per-clip crops are computed in each SOURCE's own pixel space below.
+    if crop_w_ratio and crop_h_ratio:
+        _r_out = crop_w_ratio / crop_h_ratio
+        target_w = round_to_even(min(video_width, video_height * _r_out))
+        target_h = round_to_even(min(video_height, video_width / _r_out))
+    else:
+        target_w, target_h = video_width, video_height
+
     # Create temporary directory for intermediate files
     with tempfile.TemporaryDirectory() as temp_dir:
         clip_files = []
@@ -1090,34 +1108,44 @@ def render_video_ffmpeg(
             start = clip['start_sec']
             source_video = clip.get('video_path') or video_path
 
+            # Multi-source: crop in THIS source's pixel space, then normalize to
+            # the common output size. Using the primary video's dimensions for
+            # every clip put a 4K crop window on 1080p phone footage — the crop
+            # overran the frame, the filter chain failed, and libx264 died with
+            # EINVAL before writing a single packet.
+            src_w, src_h = _dims_cached(source_video)
+
             # Generate crop filter for this clip (if crop ratio is provided)
             crop_filter = None
             crop_x_px = None
             crop_width_px = None
             if crop_w_ratio and crop_h_ratio:
-                # Calculate crop dimensions in pixels
-                # Keep height unchanged (video_height), calculate an encoder-safe width.
-                crop_width_px = round_to_even(video_height * crop_w_ratio / crop_h_ratio)
-                crop_height_px = video_height
+                # Largest crop of the target aspect that fits inside THIS source
+                _r = crop_w_ratio / crop_h_ratio
+                crop_width_px = round_to_even(min(src_w, src_h * _r))
+                crop_height_px = round_to_even(min(src_h, src_w / _r))
+                crop_y_px = max(0, int((src_h - crop_height_px) / 2))
 
                 # Check if this clip has a crop_center from protagonist detection
                 crop_center = clip.get('crop_center')
                 if crop_center:
                     # Use dynamic crop center based on protagonist position
                     center_x, center_y = crop_center
-                    # Calculate crop x position: center the crop on protagonist
                     crop_x_px = int(center_x - crop_width_px / 2)
-                    # Ensure crop stays within bounds: 0 <= x <= (video_width - crop_width)
-                    crop_x_px = max(0, min(crop_x_px, video_width - crop_width_px))
-                    crop_y_px = 0  # Keep y at 0 (top of frame)
-                    crop_filter = f"crop={crop_width_px}:{crop_height_px}:{crop_x_px}:{crop_y_px}"
+                    crop_x_px = max(0, min(crop_x_px, src_w - crop_width_px))
                     if verbose:
                         print(f"  Clip {i}: Using dynamic crop center at ({center_x:.1f}, {center_y:.1f}) -> crop_x={crop_x_px}")
                 else:
                     # No crop center info, use default center crop
-                    crop_x_px = int((video_width - crop_width_px) / 2)
-                    crop_y_px = 0
-                    crop_filter = f"crop={crop_width_px}:{crop_height_px}:{crop_x_px}:{crop_y_px}"
+                    crop_x_px = max(0, int((src_w - crop_width_px) / 2))
+                crop_filter = f"crop={crop_width_px}:{crop_height_px}:{crop_x_px}:{crop_y_px}"
+                if (crop_width_px, crop_height_px) != (target_w, target_h):
+                    crop_filter += f",scale={target_w}:{target_h},setsar=1"
+            elif (src_w, src_h) != (target_w, target_h):
+                # No crop requested but this source differs from the primary —
+                # letterbox it into the common frame so concat stays homogeneous
+                crop_filter = (f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                               f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
 
             # Build visualization filters if requested
             viz_filters = []
