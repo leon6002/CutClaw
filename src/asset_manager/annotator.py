@@ -202,8 +202,12 @@ def annotate_video_asset(
     # batch run would SKIP it forever — the per-step resume never got a
     # chance. Let it propagate; the asset stays 未标注 and the next run
     # resumes from the per-clip checkpoints.
+    # Key the analysis cache by metadata.content_hash rather than the file
+    # bytes. For local files these are identical; for Immich proxies the server
+    # re-keys content_hash to the ORIGINAL's stable checksum, so a re-downloaded
+    # proxy (new bytes) still hits the same cache instead of re-analyzing.
     content_hash = analyze_video(metadata.absolute_path, progress_callback=progress_callback,
-                                 variant=variant)
+                                 variant=variant, content_hash=metadata.content_hash or None)
 
     # Distill scene summaries into compact annotation
     try:
@@ -363,6 +367,7 @@ def annotate_audio_asset(
     endpoint: str | None = None,
     api_key: str | None = None,
     force: bool = False,
+    progress_callback=None,
 ) -> AudioAnnotation:
     """Delegate to the existing madmom pipeline, then distill to AudioAnnotation.
 
@@ -401,7 +406,9 @@ def annotate_audio_asset(
                     max_tokens=getattr(cfg, "AUDIO_KEYPOINT_MAX_TOKENS", 4096),
                     temperature=getattr(cfg, "AUDIO_KEYPOINT_TEMPERATURE", 0.7),
                     top_p=getattr(cfg, "AUDIO_KEYPOINT_TOP_P", 0.95),
-                    max_workers=1,
+                    # was 1 — serialized LLM calls made annotation feel stuck
+                    max_workers=getattr(cfg, "AUDIO_BATCH_SIZE", 4),
+                    progress_callback=progress_callback,
                     detection_methods=getattr(cfg, "AUDIO_DETECTION_METHODS", ["downbeat", "pitch", "mel_energy"]),
                     beats_per_bar=[getattr(cfg, "AUDIO_BEATS_PER_BAR", 4)],
                     min_bpm=getattr(cfg, "AUDIO_MIN_BPM", 60),
@@ -543,7 +550,8 @@ def annotate_asset(
     elif isinstance(metadata, ImageAssetMetadata):
         ann = annotate_image_asset(metadata, model=m, endpoint=ep, api_key=key)
     elif isinstance(metadata, AudioAssetMetadata):
-        ann = annotate_audio_asset(metadata, model=m, endpoint=ep, api_key=key)
+        ann = annotate_audio_asset(metadata, model=m, endpoint=ep, api_key=key,
+                                   progress_callback=progress_callback)
     else:
         raise TypeError(f"Unknown asset type: {type(metadata)}")
 

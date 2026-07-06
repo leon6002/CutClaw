@@ -460,20 +460,49 @@ function DetailView({
           </div>
         )}
 
-      {/* top split: player left, annotation overview right — full page width */}
+      {/* AUDIO: full-width player, with the beat chart aligned directly below and
+          the annotation overview under that — everything stacked & full width */}
+      {asset.asset_type === "audio" && (
+        <div className="mb-4 space-y-3">
+          {audioSections.length > 0
+            ? <AudioTimeline
+                src={src} sections={audioSections} duration={audioDur}
+                seekRef={audioSeekRef} keypointsPath={asset.absolute_path || asset.file_path}
+                onTime={(t) => setAudioTime(t)}
+              />
+            : <audio ref={videoRef as any} src={src} controls className="w-full" />}
+          {/* full-width detailed beat chart, aligned under the waveform (no
+              horizontal padding so its plot area lines up with the wave) */}
+          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] py-2">
+            <AudioKeypointsChart
+              path={asset.absolute_path || asset.file_path}
+              duration={audioDur} onSeek={seek} playhead={audioTime}
+            />
+          </div>
+          {/* annotation overview */}
+          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3.5">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-slate-300">
+              <ClipboardList className="h-3.5 w-3.5 text-cyan-400" /> 标注总览
+            </div>
+            {hasAnn
+              ? <AnnotationTable ann={ann} />
+              : <EmptyHint>{onLocal ? "本地轨道暂无标注 — 素材卡片上点「本地」按钮" : "尚未标注 — 点右上角「重新标注」"}</EmptyHint>}
+          </div>
+          <div className="text-xs text-slate-500">
+            {asset.capture_time && <span className="text-slate-400">📅 {fmtCapture(asset.capture_time)} · </span>}
+            {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
+            {asset.file_size_mb ? `${asset.file_size_mb.toFixed(1)}MB · ` : ""}
+            {asset.absolute_path || asset.file_path}
+          </div>
+        </div>
+      )}
+
+      {/* VIDEO / IMAGE top split: player left, annotation overview right */}
+      {asset.asset_type !== "audio" && (
       <div className="mb-4 flex flex-wrap items-start gap-4">
         <div className="min-w-[360px] flex-[3] basis-[520px]">
           {asset.asset_type === "video" && <video ref={videoRef} src={src} controls className="max-h-[480px] w-full rounded-xl bg-black" />}
           {asset.asset_type === "image" && <img src={src} className="max-h-[480px] w-full rounded-xl bg-black object-contain" />}
-          {asset.asset_type === "audio" && (
-            audioSections.length > 0
-              ? <AudioTimeline
-                  src={src} sections={audioSections} duration={audioDur}
-                  seekRef={audioSeekRef} keypointsPath={asset.absolute_path || asset.file_path}
-                  onTime={(t) => setAudioTime(t)}
-                />
-              : <audio ref={videoRef as any} src={src} controls className="w-full" />
-          )}
           <div className="mt-1.5 text-xs text-slate-500">
             {asset.capture_time && <span className="text-slate-400">📅 {fmtCapture(asset.capture_time)} · </span>}
             {asset.location && <span className="text-slate-400">📍 {asset.location} · </span>}
@@ -541,8 +570,9 @@ function DetailView({
             : <EmptyHint>{onLocal ? "本地轨道暂无标注 — 素材卡片上点「本地」按钮" : "尚未标注 — 点右上角「重新标注」"}</EmptyHint>}
         </div>
       </div>
+      )}
 
-      <Tabs defaultValue={asset.asset_type === "video" ? "clips" : asset.asset_type === "audio" ? "beats" : "raw"}>
+      <Tabs defaultValue={asset.asset_type === "video" ? "clips" : "raw"}>
           <TabsList className="bg-white/[0.05]">
             {asset.asset_type === "video" && (
               <>
@@ -556,11 +586,6 @@ function DetailView({
                   <Sparkles className="h-3.5 w-3.5" />高光评分{details?.highlight_pool ? ` (${details.highlight_pool.length})` : ""}
                 </TabsTrigger>
               </>
-            )}
-            {asset.asset_type === "audio" && (
-              <TabsTrigger value="beats" className="gap-1.5 text-xs">
-                <Music2 className="h-3.5 w-3.5" />节奏关键点
-              </TabsTrigger>
             )}
             <TabsTrigger value="raw" className="gap-1.5 text-xs">
               <Code2 className="h-3.5 w-3.5" />原始标注
@@ -736,16 +761,6 @@ function DetailView({
             </>
           )}
 
-          {asset.asset_type === "audio" && (
-            <TabsContent value="beats" className="pt-3">
-              <AudioKeypointsChart
-                path={asset.absolute_path || asset.file_path}
-                duration={audioDur || asset.duration_sec} onSeek={seek}
-                playhead={audioTime}
-              />
-            </TabsContent>
-          )}
-
           <TabsContent value="raw" className="pt-3">
             <pre className="rawjson">{JSON.stringify(ann, null, 2)}</pre>
           </TabsContent>
@@ -759,6 +774,8 @@ function DetailView({
 const STAGE_LABELS: Record<string, string> = {
   shot_detection: "镜头检测", captioning: "片段理解", dense_caption: "密集描述",
   scene_merge: "场景合并", scene_analysis: "场景分析",
+  // audio annotation stages (madmom pipeline)
+  beat_detect: "节奏检测", audio_facts: "节奏事实", sectioning: "段落划分", seg_caption: "分段描述",
 };
 
 function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued, queuedLocal, annStage, annStageDetail, onAnnotate, onAnnotateLocal, annBusy, hearted, onToggleHeart }: {

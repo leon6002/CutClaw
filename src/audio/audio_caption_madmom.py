@@ -546,6 +546,7 @@ def caption_audio_with_madmom_segments(
     top_p: float = 0.95,
     max_workers: int = None,
     batch_size: int = None,  # deprecated alias for max_workers
+    progress_callback=None,  # (stage, status, detail) — live per-card UI stage line
     # Detection method selection (NEW: supports multiple methods like interactive)
     detection_methods: List[str] = None,  # ["downbeat", "pitch", "mel_energy"]
     # Madmom detection parameters (downbeat)
@@ -649,6 +650,14 @@ def caption_audio_with_madmom_segments(
     # Resolve max_workers (batch_size is a deprecated alias)
     if max_workers is None:
         max_workers = batch_size if batch_size is not None else getattr(config, 'AUDIO_BATCH_SIZE', 5)
+
+    def _pcb(stage: str, status: str, detail: str = ""):
+        """Surface the current analysis stage to the UI (annotation card)."""
+        if progress_callback:
+            try:
+                progress_callback(stage, status, detail)
+            except Exception:  # noqa: BLE001
+                pass
 
     # Detection methods (NEW: support multiple methods like interactive)
     if detection_methods is None:
@@ -812,9 +821,12 @@ def caption_audio_with_madmom_segments(
         return kps
 
     # Run selected methods and merge keypoints (using madmom_api for consistency)
+    _method_zh = {"downbeat": "节拍", "pitch": "音高", "mel_energy": "能量"}
     merged_keypoints = []
-    for method in detection_methods:
+    for _mi, method in enumerate(detection_methods):
         print(f"\n  → Running {method} detection...")
+        _pcb("beat_detect", "progress",
+             f"{_method_zh.get(method, method)}检测 {_mi + 1}/{len(detection_methods)}(madmom,CPU 密集)")
         method_keypoints = _cached_detect(method)
         merged_keypoints.extend(method_keypoints)
         print(f"    ✓ Detected {len(method_keypoints)} {method} keypoints")
@@ -828,6 +840,7 @@ def caption_audio_with_madmom_segments(
     # from signal analysis and are treated as ground truth. LLMs downstream
     # only NAME and DESCRIBE — they never emit numbers.
     print("\n[Step 1.15] Computing measured audio facts (beat grid / energy / structure)...")
+    _pcb("audio_facts", "progress", "节拍网格 / 能量曲线 / 结构边界")
     from src.audio.audio_facts import compute_audio_facts
     audio_facts = compute_audio_facts(audio_path, keypoints, audio_duration or 0.0)
     if audio_facts.get("bpm_felt"):
@@ -855,6 +868,7 @@ def caption_audio_with_madmom_segments(
     # Stage 2: Generate overall analysis (Level 1 sections) using AI model
     print("\n" + "="*80)
     print("STAGE 2: AI-based Level 1 section segmentation")
+    _pcb("sectioning", "progress", "LLM 段落划分与命名")
     print("="*80)
     print("\nUsing AI model to identify high-level sections (Intro, Verse, Chorus, etc.)...")
 
@@ -1448,6 +1462,7 @@ def caption_audio_with_madmom_segments(
     print("STAGE 4: AI-based caption generation for sub-segments")
     print("="*80)
     print(f"\nUsing AI model to caption {len(all_subsegments)} sub-segments (between keypoints)...")
+    _pcb("seg_caption", "progress", f"{len(all_subsegments)} 个子段并行描述(×{max_workers})")
 
     # Step 1: Extract all audio sub-segments
     print(f"\n{'-'*80}")
@@ -1708,6 +1723,7 @@ def caption_audio_with_madmom_segments(
         print(f"  - Debug info: _keypoints_detail, _debug_config (in JSON)")
         print(f"{'='*80}")
 
+    _pcb("seg_caption", "done", "")
     return result_data
 
 
