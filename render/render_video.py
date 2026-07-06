@@ -203,10 +203,12 @@ def get_video_dimensions(video_path: str) -> tuple:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            width, height = result.stdout.strip().split(',')
-            return (int(width), int(height))
+            # iPhone files append an empty csv field ("1920,1080,") — a strict
+            # 2-tuple unpack silently fell back to 1920x1080 for them
+            vals = [v for v in result.stdout.strip().split(',') if v.strip()]
+            return (int(vals[0]), int(vals[1]))
     except Exception as e:
-        print(f"Warning: Could not get video dimensions: {e}")
+        print(f"Warning: Could not get video dimensions ({video_path}): {e}")
     return (1920, 1080)  # Default fallback
 
 
