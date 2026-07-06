@@ -698,15 +698,24 @@ def generate_shot_plan(
             _cands = [m for m in _pool if not _rel or m.get("scene") in _rel]
             if not _cands:
                 _cands = _pool
-            _cands = sorted(_cands, key=lambda m: -m.get("score", 0))[:25]
+            # Front-loaded quota control (LOGIC.md §14): the menu itself is
+            # budgeted — same look ≤2, same source ≤4 (defaults). Any subset
+            # the model picks satisfies the quotas, so visual sameness never
+            # has to be policed (and bounced) downstream.
+            _n_slots = (len(music_detailed_structure)
+                        if isinstance(music_detailed_structure, list) and music_detailed_structure
+                        else 30)
+            from src.curation import build_anchor_budget
+            _cands = build_anchor_budget(_cands, _n_slots)
             if _cands:
                 _lines = []
                 for m in _cands:
                     _v = " | REAL VOICES" if m.get("sound") else ""
                     _t = (f" | shot at {m['capture_time'][5:16].replace('T', ' ')}"
                           if m.get("capture_time") else "")
+                    _lk = f" | look {m['cluster']}" if m.get("cluster") else ""
                     _lines.append(
-                        f"- {m['id']} | scene {m.get('scene', '?')} | "
+                        f"- {m['id']} | scene {m.get('scene', '?')}{_lk} | "
                         f"{m['start']:.1f}-{m['end']:.1f}s ({m['duration']:.1f}s) | "
                         f"quality {m.get('score', 0) * 10:.1f}/10{_v}{_t} | {m.get('desc', '')[:160]}")
                 _n_voice = sum(1 for m in _cands if m.get("sound"))
@@ -725,10 +734,10 @@ def generate_shot_plan(
                     "- Describe the CHOSEN moment's visible imagery in \"content\" and set "
                     "\"related_scene\" to the moment's scene.\n"
                     "- Never assign the same moment to two shots.\n"
-                    "- VARIETY: CONSECUTIVE shots must not use moments that are near-identical — "
-                    "avoid picking two moments from the same source within ~20s of each other "
-                    "back-to-back (slow aerial glides especially look frozen when cut together). "
-                    "Alternate scenes/sources or jump forward in time between neighboring shots.\n"
+                    "- Each moment carries a \"look\" tag (visual-composition cluster). The list is "
+                    "already de-duplicated, so pick freely — just place two moments sharing a look "
+                    "tag FAR apart (one early, one late; never in neighboring shots), and spread "
+                    "each source video across the film rather than bunching it.\n"
                     + _voice_rule +
                     "- \"anchor_id\": null is allowed ONLY when every listed moment is already used "
                     "or truly none fits the segment — scarcity is the only excuse, not preference.\n"
@@ -841,7 +850,13 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
     """Resolve each shot's anchor_id into the real moment's time range.
 
     Anchored shots skip the per-shot agent entirely — the orchestrator trims
-    deterministically inside the curated moment."""
+    deterministically inside the curated moment.
+
+    REPAIR, don't reject (LOGIC.md §14): an invalid pick (unknown id,
+    duplicate, look/source quota, same-look spacing) is replaced with the
+    best valid moment from the pool remainder — deterministic and instant.
+    Stripping back to the agent path is the LAST resort, because the agent's
+    free-range pick is not protected by the look quotas at all."""
     if not scene_folder_path or not isinstance(shot_plan, dict):
         return
     pool_path = os.path.join(os.path.dirname(scene_folder_path), "highlight_pool.json")
@@ -849,31 +864,50 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         return
     try:
         with open(pool_path, "r", encoding="utf-8") as f:
-            by_id = {m.get("id"): m for m in json.load(f).get("moments", [])}
+            moments = json.load(f).get("moments", [])
     except Exception:  # noqa: BLE001
         return
-    used = set()
-    n = 0
-    _prev = None   # (video_path, start) of the previous shot's anchor
-    for shot in shot_plan.get("shots", []) or []:
-        aid = shot.get("anchor_id")
-        m = by_id.get(str(aid)) if aid else None
-        if not m or aid in used:      # unknown or duplicated anchor → agent path
-            shot.pop("anchor_id", None)
-            continue
-        # variety guard: consecutive anchors from the SAME source within 20s
-        # look near-identical on screen (esp. slow aerials) — the film appears
-        # frozen. Strip the later anchor; the agent path + spacing rules will
-        # find something visually different.
+    by_id = {m.get("id"): m for m in moments}
+
+    cmax = int(getattr(config, "VISUAL_CLUSTER_MAX_USES", 2))
+    smax = int(getattr(config, "SOURCE_VIDEO_MAX_USES", 4))
+    min_gap = int(getattr(config, "VISUAL_CLUSTER_MIN_GAP_SHOTS", 6))
+
+    shots = shot_plan.get("shots", []) or []
+    used: set = set()
+    c_used: dict = {}
+    c_last: dict = {}   # cluster -> last shot position it appeared at
+    s_used: dict = {}
+    _prev = None        # (video_path, start) of the previous shot's anchor
+    n = repaired = stripped = 0
+
+    def _valid(m, pos) -> str | None:
+        """None = usable here; otherwise a short rejection reason."""
+        c, s = m.get("cluster"), m.get("source_hash")
+        if c is not None:
+            if c_used.get(c, 0) >= cmax:
+                return f"look {c} already used {cmax}×"
+            lp = c_last.get(c)
+            if lp is not None and pos - lp < min_gap:
+                return f"look {c} appeared {pos - lp} shot(s) ago (min gap {min_gap})"
+        if s_used.get(s or "", 0) >= smax:
+            return "source video at quota"
         if (_prev and not m.get("sound")
                 and m.get("video_path") == _prev[0]
                 and abs(float(m.get("start", 0)) - _prev[1]) < 20.0):
-            print(f"🎬 [Curation] anchor {aid} too similar to the previous shot "
-                  f"(same source, {abs(float(m.get('start', 0)) - _prev[1]):.0f}s apart) — agent will re-pick")
-            shot.pop("anchor_id", None)
-            continue
+            return "same source <20s from previous shot"
+        return None
+
+    def _commit(shot, m, pos):
+        nonlocal _prev, n
+        used.add(m.get("id"))
+        c, s = m.get("cluster"), m.get("source_hash")
+        if c is not None:
+            c_used[c] = c_used.get(c, 0) + 1
+            c_last[c] = pos
+        s_used[s or ""] = s_used.get(s or "", 0) + 1
         _prev = (m.get("video_path"), float(m.get("start", 0)))
-        used.add(aid)
+        shot["anchor_id"] = m.get("id")
         shot["anchor"] = {
             "video_path": m.get("video_path", ""),
             "start": float(m.get("start", 0.0)),
@@ -882,8 +916,62 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
             "sound": bool(m.get("sound")),
         }
         n += 1
-    if n:
-        print(f"✨ [Curation] {n}/{len(shot_plan.get('shots', []) or [])} shots anchored on real moments")
+
+    def _substitute(shot, pos):
+        rel = shot.get("related_scene")
+        try:
+            need = float(shot.get("time_duration") or 0.0)
+        except (TypeError, ValueError):
+            need = 0.0
+        cands = [m for m in moments
+                 if m.get("id") not in used and _valid(m, pos) is None]
+        if not cands:
+            return None
+        # prefer: same scene as the narrative slot → long enough to fill it
+        # without widening into unmeasured footage → highest measured score
+        cands.sort(key=lambda m: (0 if (rel is not None and m.get("scene") == rel) else 1,
+                                  0 if float(m.get("duration", 0)) >= need else 1,
+                                  -m.get("score", 0)))
+        return cands[0]
+
+    for pos, shot in enumerate(shots):
+        aid = str(shot.get("anchor_id")) if shot.get("anchor_id") else None
+        m = by_id.get(aid) if aid else None
+        if m is not None and aid not in used:
+            reason = _valid(m, pos)
+            if reason is None:
+                _commit(shot, m, pos)
+                continue
+        elif aid and aid in used:
+            reason = "duplicate anchor"
+        elif aid:
+            reason = "unknown anchor id"
+        else:
+            reason = "no anchor assigned"
+
+        sub = _substitute(shot, pos)
+        if sub is not None:
+            print(f"🔧 [Curation] shot {pos + 1}: {reason} → substituted {sub['id']} "
+                  f"(look {sub.get('cluster') or '—'}, {sub.get('score', 0) * 10:.1f}/10)")
+            # keep the narrative slot but describe the REAL footage it now shows
+            if sub.get("desc"):
+                shot["content"] = str(sub["desc"])[:200]
+            if sub.get("scene") is not None:
+                shot["related_scene"] = sub.get("scene")
+            _commit(shot, sub, pos)
+            repaired += 1
+            continue
+
+        # pool exhausted under the quotas — agent path (unprotected) as last resort
+        shot.pop("anchor_id", None)
+        stripped += 1
+        print(f"🎬 [Curation] shot {pos + 1}: {reason}, no valid substitute left — agent will pick")
+
+    if n or stripped:
+        _looks = len([c for c in c_used if c_used[c]])
+        print(f"✨ [Curation] {n}/{len(shots)} shots anchored "
+              f"({repaired} repaired, {stripped} to agent) · {_looks} distinct looks, "
+              f"max reuse {max(c_used.values()) if c_used else 0}×")
 
 
 def generate_shot_plan_with_retry(

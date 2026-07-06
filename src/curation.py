@@ -20,7 +20,7 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 5   # v5: camera-roll (tilt) penalty in the measured score
+_POOL_VERSION = 6   # v6: dHash visual signature per moment (dedup clustering)
 
 # GLOBAL taste memory — user rejections apply across every project.
 REJECTIONS_PATH = os.path.join("Output", "asset_index", "rejections.json")
@@ -34,6 +34,23 @@ def load_rejections() -> list:
         return []
 
 
+def _upgrade_pool_v5(moments: list) -> list | None:
+    """Backfill dHash signatures on a v5 pool (nothing else changed in v6)."""
+    try:
+        from src.utils.stability import visual_hashes
+        for m in moments:
+            if m.get("phash"):
+                continue
+            vp = m.get("video_path") or ""
+            if vp and os.path.exists(vp):
+                m["phash"] = visual_hashes(vp, float(m.get("start", 0)), float(m.get("end", 0)))
+            else:
+                m["phash"] = []
+        return moments
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _source_pool(content_hash: str) -> list:
     """Build (or load) the scored moment list for ONE analyzed source."""
     from src.analyzer import get_analysis_path
@@ -45,6 +62,19 @@ def _source_pool(content_hash: str) -> list:
                 d = json.load(f)
             if int(d.get("version", 0)) >= _POOL_VERSION:
                 return d.get("moments", [])
+            if int(d.get("version", 0)) == 5 and d.get("moments"):
+                # v5→v6 upgrade: only the dHash signatures are new — the trims
+                # and stability measurements are expensive and unchanged, so
+                # backfill hashes instead of rebuilding the whole pool
+                up = _upgrade_pool_v5(d.get("moments", []))
+                if up is not None:
+                    try:
+                        with open(pool_path, "w", encoding="utf-8") as f:
+                            json.dump({"version": _POOL_VERSION, "moments": up}, f,
+                                      ensure_ascii=False, indent=1)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return up
         except Exception:  # noqa: BLE001
             pass
 
@@ -155,7 +185,12 @@ def _source_pool(content_hash: str) -> list:
                  + 0.15 * (1.0 if voice else 0.0)
                  + 0.05 * (1.0 if people else 0.0))
         _ct = scene_capture_time(src_capture, s)
+        _ph = []
+        if can_measure:
+            from src.utils.stability import visual_hashes
+            _ph = visual_hashes(src_path, s, e)
         moments.append({
+            "phash": _ph,
             "video_path": src_path,
             "source_hash": content_hash,
             "start": round(s, 2),
@@ -261,7 +296,121 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
         if banned_n:
             print(f"🚫 [Curation] {banned_n} moment(s) excluded by permanent bans (rejections.json)")
 
+    # ── Visual clustering (§14): near-identical compositions become one
+    # "look" — the dedup unit the viewer actually perceives. Applied at
+    # project-pool time so cross-clip (and cross-source) sameness is caught.
+    _cluster_pool(pool)
+
     pool.sort(key=lambda m: -m["score"])
+
+    # Per-look retention: a visually homogeneous source (slow aerial) floods
+    # the pool with near-identical high scorers. Keep cap+1 per cluster (one
+    # spare for assembly-time repair) — front-loaded quality control, so no
+    # downstream stage ever has to reject-and-retry over sameness.
+    from src import config
+    _keep = int(getattr(config, "VISUAL_CLUSTER_MAX_USES", 2)) + 1
+    _counts: dict = {}
+    _kept, _dropped = [], 0
+    for m in pool:
+        c = m.get("cluster")
+        if c is None:
+            _kept.append(m)
+            continue
+        _counts[c] = _counts.get(c, 0) + 1
+        if _counts[c] <= _keep:
+            _kept.append(m)
+        else:
+            _dropped += 1
+    if _dropped:
+        print(f"👁️  [Curation] {_dropped} near-duplicate moment(s) folded away "
+              f"({len(_counts)} distinct looks, keeping top {_keep} per look)")
+    pool = _kept
+
     for i, m in enumerate(pool):
         m["id"] = f"M{i}"
     return pool
+
+
+def build_anchor_budget(pool: list, n_slots: int,
+                        cluster_max: int | None = None,
+                        source_max: int | None = None) -> list:
+    """Deterministic pre-allocation: the anchor MENU the Screenwriter sees.
+
+    Quotas are consumed HERE, not policed after the pick — any subset of a
+    quota-satisfying menu also satisfies the quotas, so the LLM literally
+    cannot choose wrong (front-loaded quality control, §14 in LOGIC.md).
+
+    Voice moments are seated first (the emotional core, and scarce). When the
+    material can't fill the slots under the default caps, caps relax in a
+    FIXED order (cluster +1, then source +1, repeat) with a log line each
+    step — the only legal failure is running out of material entirely."""
+    from src import config
+    cmax = int(cluster_max or getattr(config, "VISUAL_CLUSTER_MAX_USES", 2))
+    smax = int(source_max or getattr(config, "SOURCE_VIDEO_MAX_USES", 4))
+    want = max(int(n_slots * 1.5), n_slots + 5)
+    # voices first within the greedy order; score decides the rest
+    ordered = sorted(pool, key=lambda m: (-int(bool(m.get("sound"))), -m.get("score", 0)))
+
+    def _select(cm: int, sm: int) -> list:
+        by_c: dict = {}
+        by_s: dict = {}
+        chosen = []
+        for m in ordered:
+            c, s = m.get("cluster"), m.get("source_hash")
+            if c is not None and by_c.get(c, 0) >= cm:
+                continue
+            if by_s.get(s, 0) >= sm:
+                continue
+            chosen.append(m)
+            if c is not None:
+                by_c[c] = by_c.get(c, 0) + 1
+            by_s[s] = by_s.get(s, 0) + 1
+            if len(chosen) >= want:
+                break
+        return chosen
+
+    relax = 0
+    while True:
+        chosen = _select(cmax, smax)
+        if len(chosen) >= min(want, len(pool)) or len(chosen) >= n_slots:
+            break
+        if relax % 2 == 0:
+            cmax += 1
+        else:
+            smax += 1
+        relax += 1
+        print(f"📉 [Curation] anchor budget short ({len(chosen)}/{n_slots} slots) — "
+              f"relaxing caps to look≤{cmax}, source≤{smax}")
+        if relax > 12:   # pathological pool — hand over whatever exists
+            chosen = list(ordered[:want])
+            break
+
+    chosen.sort(key=lambda m: -m.get("score", 0))
+    return chosen
+
+
+def _cluster_pool(pool: list) -> None:
+    """Greedy leader clustering on dHash — assigns m['cluster'] ('C0', …).
+
+    Distance between two moments = min pairwise hamming across their sampled
+    frame hashes; ≤ VISUAL_CLUSTER_HAMMING joins the leader's cluster.
+    Moments without hashes get cluster None (never quota-capped)."""
+    from src import config
+    from src.utils.stability import hamming_hex
+    hmax = int(getattr(config, "VISUAL_CLUSTER_HAMMING", 12))
+    leaders: list = []   # (cluster_id, leader hash list)
+    for m in sorted(pool, key=lambda x: -x.get("score", 0)):
+        hs = m.get("phash") or []
+        if not hs:
+            m["cluster"] = None
+            continue
+        cid = None
+        for lid, lh in leaders:
+            d = min(hamming_hex(a, b) for a in hs for b in lh)
+            if d <= hmax:
+                cid = lid
+                break
+        if cid is None:
+            cid = f"C{len(leaders)}"
+            leaders.append((cid, hs))
+        m["cluster"] = cid

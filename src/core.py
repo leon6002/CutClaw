@@ -2150,6 +2150,41 @@ class ParallelShotOrchestrator:
         need = float(shot.get('time_duration') or 0.0) or 2.0
         floor = float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0))
 
+        # Curation-first rescue (LOGIC.md §14): before free-ranging over scene
+        # windows, try an UNUSED measured pool moment — pool entries are
+        # quality-measured and look-deduplicated, so even rescues stay inside
+        # the curated set instead of reintroducing sameness/blur.
+        try:
+            _pp = os.path.join(os.path.dirname(self.video_scene_path or ""), "highlight_pool.json")
+            with open(_pp, "r", encoding="utf-8") as _f:
+                _pool = json.load(_f).get("moments", [])
+        except Exception:  # noqa: BLE001
+            _pool = []
+        if _pool:
+            _rs0 = shot.get('related_scene', [])
+            _rel0 = set(_rs0 if isinstance(_rs0, list) else [_rs0])
+            _pool.sort(key=lambda m: (0 if m.get("scene") in _rel0 else 1,
+                                      0 if float(m.get("duration", 0)) >= need else 1,
+                                      -m.get("score", 0)))
+            for _m in _pool:
+                _src = _m.get("video_path") or ""
+                if not _src:
+                    continue
+                _c = (float(_m.get("start", 0)) + float(_m.get("end", 0))) / 2.0
+                _s = max(0.0, _c - need / 2.0)
+                _e = _s + need
+                _clash = False
+                for fr in forbidden_ranges:
+                    r_src, r_s, r_e = _norm_range(fr)
+                    if _same_source(r_src or (self.video_path or ""), _src) \
+                            and _s < (r_e or 0.0) + gap and _e > (r_s or 0.0) - gap:
+                        _clash = True
+                        break
+                if not _clash:
+                    print(f"🛟 [Fallback] rescuing with curated moment {_m.get('id')} "
+                          f"(look {_m.get('cluster') or '—'}, {_m.get('score', 0) * 10:.1f}/10)")
+                    return self._build_fallback_result(shot, sec_idx, shot_idx, _src, _s, _e)
+
         wins = []   # (scene_idx, src, window_start, window_end)
         for f in _g.glob(os.path.join(self.video_scene_path or "", "scene_*.json")):
             m = re.search(r"scene_(\d+)\.json$", os.path.basename(f))

@@ -318,7 +318,7 @@ AUDIO_MIN_SEGMENT_DURATION = 3
 # Fastest cut (seconds) — reached at the track's most energetic moments.
 # Below ~1s a shot is too brief to read.
 
-AUDIO_MAX_SEGMENT_DURATION = 10
+AUDIO_MAX_SEGMENT_DURATION = 7
 # Longest hold (seconds) — reached at the track's calmest moments.
 # Above ~8s a montage shot starts to drag.
 
@@ -398,8 +398,8 @@ AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 70.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 80.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 175.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 185.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3
@@ -451,6 +451,24 @@ STABILITY_CHECK_ENABLED = True
 STABILITY_MIN_SCORE = 3.5
 # Commits with measured quality below this are rejected (except on the final
 # lenient attempt). 0-10; calibrated: drone tilt-correction ≈ 1, smooth ≈ 9-10.
+
+# ----- Visual dedup / front-loaded quality control (LOGIC.md §14) -----
+VISUAL_CLUSTER_MAX_USES = 2
+# Max appearances of one visual "look" (dHash cluster) per film. A slow
+# aerial reads as the same photo across its whole runtime — cap the look,
+# not the timestamps.
+
+SOURCE_VIDEO_MAX_USES = 4
+# Max shots drawn from one source video per film (a visually diverse source
+# legitimately yields more distinct looks than a homogeneous one).
+
+VISUAL_CLUSTER_HAMMING = 12
+# dHash hamming distance (0-64) at or below which two moments count as the
+# same look. Bigger = more aggressive folding of similar compositions.
+
+VISUAL_CLUSTER_MIN_GAP_SHOTS = 6
+# Minimum shot spacing between two appearances of the same look — kills the
+# A-B-A-B interleave feel even when the quota allows a second appearance.
 
 PARALLEL_SHOT_ENABLED = True
 # Whether to enable parallel shot selection (ParallelShotOrchestrator) in film mode.

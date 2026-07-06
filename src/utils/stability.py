@@ -80,6 +80,53 @@ def measure_stability(video_path: str, start_sec: float, end_sec: float,
     return out
 
 
+_HASH_CACHE: dict = {}
+
+
+def _dhash64(frame) -> int:
+    """64-bit difference hash of one RGB frame — a composition fingerprint."""
+    g = cv2.resize(_gray(frame), (9, 8), interpolation=cv2.INTER_AREA)
+    bits = 0
+    for r in range(8):
+        for c in range(8):
+            bits = (bits << 1) | (1 if int(g[r, c]) > int(g[r, c + 1]) else 0)
+    return bits
+
+
+def visual_hashes(video_path: str, start_sec: float, end_sec: float, n: int = 3) -> list:
+    """dHash fingerprints of n frames across a range (hex strings).
+
+    The visual-sameness signature for clustering near-identical moments: a
+    slow aerial reads as 'the same photo' even 60s apart, so time distance
+    is a useless dedup proxy — composition distance is what the viewer sees."""
+    key = ("vh", os.path.normpath(video_path or ""), round(float(start_sec), 1),
+           round(float(end_sec), 1), int(n))
+    with _LOCK:
+        if key in _HASH_CACHE:
+            return _HASH_CACHE[key]
+        try:
+            vr = _reader(video_path)
+            fps = float(vr.get_avg_fps() or 24.0)
+            nf = len(vr)
+            dur = max(0.0, float(end_sec) - float(start_sec))
+            idx = sorted({min(nf - 1, max(0, int((float(start_sec) + dur * (i + 0.5) / n) * fps)))
+                          for i in range(n)})
+            frames = vr.get_batch(idx).asnumpy()
+            out = [f"{_dhash64(frames[i]):016x}" for i in range(len(frames))]
+        except Exception:  # noqa: BLE001
+            out = []
+        _HASH_CACHE[key] = out
+        return out
+
+
+def hamming_hex(a: str, b: str) -> int:
+    """Bit distance between two hex dHashes (0 identical … 64 unrelated)."""
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except (TypeError, ValueError):
+        return 64
+
+
 def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) -> dict:
     base = _baseline(video_path)
     with _LOCK:
