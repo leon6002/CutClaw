@@ -159,7 +159,72 @@ def _fallback_plan(infos: list, target_sec: float) -> list:
     return picks
 
 
-def plan_bgm_mix(paths: list, target_sec: float = 180.0) -> tuple:
+def footage_brief(video_paths: list) -> str:
+    """Compact MEASURED description of the footage a BGM mix must serve:
+    moods/tags from annotations, motion mix + voice-moment count + trip span
+    from the highlight pools. Empty string when nothing is known."""
+    if not video_paths:
+        return ""
+    try:
+        from src.asset_manager.scanner import compute_content_hash
+        from src.analyzer import get_analysis_path
+        try:
+            with open(os.path.join("Output", "asset_index", "annotations.json"),
+                      "r", encoding="utf-8") as f:
+                idx = json.load(f)
+        except Exception:  # noqa: BLE001
+            idx = {}
+        moods: dict = {}
+        motion: dict = {}
+        voice_n = 0
+        n_clips = 0
+        times: list = []
+        for p in video_paths:
+            try:
+                h = compute_content_hash(os.path.abspath(p))
+            except Exception:  # noqa: BLE001
+                continue
+            n_clips += 1
+            ann = (idx.get(h) or {}).get("annotation") or {}
+            for t in list(ann.get("tags") or []) + list(ann.get("visual_tags") or []) \
+                    + ([ann.get("emotion")] if ann.get("emotion") else []):
+                k = str(t).strip().lower()
+                if k:
+                    moods[k] = moods.get(k, 0) + 1
+            try:
+                with open(os.path.join(get_analysis_path(h), "highlight_pool.json"),
+                          "r", encoding="utf-8") as f:
+                    for m in json.load(f).get("moments", []):
+                        mt = (m.get("motion") or {}).get("type")
+                        if mt and mt not in ("unmeasured",):
+                            motion[mt] = motion.get(mt, 0) + 1
+                        if m.get("sound"):
+                            voice_n += 1
+                        if m.get("capture_time"):
+                            times.append(str(m["capture_time"])[:10])
+            except Exception:  # noqa: BLE001
+                pass
+        if n_clips == 0:
+            return ""
+        top_moods = ", ".join(k for k, _ in sorted(moods.items(), key=lambda x: -x[1])[:8])
+        motion_txt = ", ".join(f"{k}×{v}" for k, v in sorted(motion.items(), key=lambda x: -x[1]))
+        span = f"{min(times)} → {max(times)}" if times else "unknown"
+        return (
+            "\nFOOTAGE THIS MIX MUST SERVE (measured from the selected videos):\n"
+            f"- {n_clips} source clips, shot {span}\n"
+            + (f"- moods/subjects: {top_moods}\n" if top_moods else "")
+            + (f"- measured camera moves across highlight moments: {motion_txt}\n" if motion_txt else "")
+            + f"- {voice_n} highlight moment(s) contain REAL voices/laughter — the renderer ducks "
+              "the music there, so sparser/softer passages leave room for them\n"
+            "Match the musical arc to this footage: calm scenery suits the opening, place the "
+            "musical peak where the footage has energy to match, and keep the mix breathable "
+            "if voices are plentiful.\n"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tuple:
     """AI arrangement over MEASURED segments → ordered picks + rationale.
 
     The LLM chooses WHICH measured sections of WHICH track fill each role of
@@ -181,7 +246,8 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0) -> tuple:
 
     prompt = (
         "You are a music editor arranging a seamless BGM mix for a travel-memory montage.\n"
-        f"Target total duration: about {target_sec:.0f}s (within ±15%).\n\n"
+        f"Target total duration: about {target_sec:.0f}s (within ±15%).\n"
+        + (brief or "") + "\n"
         "Tracks with their MEASURED sections (energy 0-1, trend building/steady/falling):\n"
         + "\n".join(lines) + "\n\n"
         "Arrange 2-4 CONTIGUOUS section runs (each from one track) into an emotional arc: "

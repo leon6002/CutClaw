@@ -3067,6 +3067,7 @@ class BgmStitchRequest(BaseModel):
     name: str = ""
     mode: str = "manual"     # "manual" | "ai" (AI picks the best sections per track)
     target_sec: float = 180.0  # ai mode: desired total duration
+    video_paths: list = []   # ai mode: the footage this mix must serve (arc matching)
 
 
 @app.post("/api/bgm/stitch")
@@ -3089,8 +3090,11 @@ def bgm_stitch(body: BgmStitchRequest):
     plan_why, plan_view = "", []
     if body.mode == "ai":
         try:
+            from src.audio.bgm_stitch import footage_brief
+            _brief = footage_brief([_resolve(str(v)) for v in (body.video_paths or []) if v])
             picks, plan_why = plan_bgm_mix([t["path"] for t in tracks],
-                                           target_sec=float(body.target_sec or 180.0))
+                                           target_sec=float(body.target_sec or 180.0),
+                                           brief=_brief)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, f"AI 编排失败: {e}")
         tracks = [{"path": p["path"], "start": p.get("start"), "end": p.get("end")}

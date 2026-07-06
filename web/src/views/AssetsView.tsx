@@ -1129,8 +1129,10 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
 // ── BGM stitch panel: join favorite tracks WITHOUT running the pipeline ─────
 // The result is written into the imports dir as a normal audio file — scan
 // and it becomes a selectable BGM (the pipeline treats it as one song).
-function BgmStitchPanel({ tracks, hearts, onClose }: {
+function BgmStitchPanel({ tracks, hearts, onClose, videoPaths = [] }: {
   tracks: Asset[]; hearts: Set<string>; onClose: () => void;
+  /** ai mode arranges the musical arc to serve THIS footage (project videos) */
+  videoPaths?: string[];
 }) {
   const [order, setOrder] = useState<string[]>([]);
   const [ranges, setRanges] = useState<Record<string, { start?: string; end?: string }>>({});
@@ -1153,6 +1155,7 @@ function BgmStitchPanel({ tracks, hearts, onClose }: {
         name,
         mode,
         target_sec: Number(targetSec) || 180,
+        video_paths: mode === "ai" ? videoPaths : [],
         tracks: order.map((h) => {
           const a = tracks.find((t) => t.content_hash === h)!;
           const r = ranges[h] ?? {};
@@ -1390,6 +1393,8 @@ export default function AssetsView({
           body: JSON.stringify({
             mode: "ai", target_sec: target,
             tracks: pickedAudioAssets.map((a) => ({ path: assetPath(a) })),
+            // the fusion arranges the musical arc to SERVE this footage
+            video_paths: pickedVideos.map(assetPath),
           }),
         });
         audioPath = r.path;
@@ -1631,6 +1636,7 @@ export default function AssetsView({
           <BgmStitchPanel
             tracks={assets.filter((a) => a.asset_type === "audio")}
             hearts={hearts}
+            videoPaths={pickedVideos.length > 0 ? pickedVideos.map(assetPath) : project.videos}
             onClose={() => setStitchOpen(false)}
           />
         </div>
