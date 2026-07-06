@@ -128,8 +128,10 @@ function decorativePeaks(seed: string, n: number): number[] {
   return out.map((v) => Math.min(1, v / peak));
 }
 
-export default function AudioTimeline({ src, sections, duration, seekRef, keypointsPath, onTime }: {
+export default function AudioTimeline({ src, sections, duration, seekRef, keypointsPath, onTime, autoPlay = false }: {
   src: string; sections: Section[]; duration: number;
+  /** start playing as soon as the audio can (inline previews) */
+  autoPlay?: boolean;
   /** filled with a seek(sec) fn so external UI (e.g. the beats chart) can drive
    *  this player's internal <audio> — it has no exposed DOM ref otherwise. */
   seekRef?: React.MutableRefObject<((s: number) => void) | null>;
@@ -233,7 +235,7 @@ export default function AudioTimeline({ src, sections, duration, seekRef, keypoi
   return (
     <div className="rounded-xl border border-violet-500/20 bg-gradient-to-b from-violet-500/[0.06] to-slate-900/40 p-3">
       <audio
-        ref={audioRef} src={src} preload="metadata"
+        ref={audioRef} src={src} preload="metadata" autoPlay={autoPlay}
         onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
         onTimeUpdate={(e) => { const t = e.currentTarget.currentTime; setCur(t); onTime?.(t, e.currentTarget.duration || total); }}
         onLoadedMetadata={(e) => { const d = e.currentTarget.duration; if (isFinite(d) && d > 0) setDur(d); }}

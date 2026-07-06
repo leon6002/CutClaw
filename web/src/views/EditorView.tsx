@@ -14,6 +14,8 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { api, fmtDuration, mediaUrl, type JobState } from "../api";
+import MiniVideoPlayer from "../components/MiniVideoPlayer";
+import AudioTimeline, { attachInstruments, parseSectionTimes } from "../components/flow/AudioTimeline";
 import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
@@ -74,6 +76,14 @@ export default function EditorView({
   const [preview, setPreview] = useState<{ kind: "video" | "audio"; path: string } | null>(null);
   const previewToggle = (kind: "video" | "audio", path: string) =>
     setPreview((cur) => (cur?.path === path ? null : { kind, path }));
+  // annotated sections for the previewed track → colored bands on the waveform
+  const previewSections = (() => {
+    if (preview?.kind !== "audio") return [];
+    const norm = (x: string) => x.replace(/\//g, "\\").toLowerCase();
+    const ann = assets.find((a) => norm(a.path) === norm(preview.path))?.annotation ?? {};
+    return typeof ann.sections_summary === "string"
+      ? attachInstruments(parseSectionTimes(ann.sections_summary), ann.sections_detail) : [];
+  })();
 
   const p = project;
   const job = pipelineJob;
@@ -104,12 +114,12 @@ export default function EditorView({
   // Resolve the project's selected assets to their cached annotations so the
   // pipeline canvas can show which videos/audio are in play + open each's标注.
   useEffect(() => {
-    const paths = [...p.videos, p.audio].filter(Boolean);
+    const paths = Array.from(new Set([...p.videos, p.audio, ...(p.audios ?? [])].filter(Boolean)));
     if (paths.length === 0) { setAssets([]); return; }
     api<{ assets: AssetInfo[] }>("/api/assets/by_paths", {
       method: "POST", body: JSON.stringify({ paths }),
     }).then((r) => setAssets(r.assets ?? [])).catch(() => setAssets([]));
-  }, [p.videos, p.audio]);
+  }, [p.videos, p.audio, p.audios]);
 
   // Poll the final selected shots (shot_point.json) so the canvas can show each
   // shot's chosen source + time slice and preview it. Grows during the run.
@@ -266,12 +276,12 @@ export default function EditorView({
                 ))}
               </ScrollArea>
               {preview?.kind === "video" && (
-                <div className="mt-2 rounded-lg border border-cyan-500/25 bg-black/40 p-2">
+                <div className="mt-2">
                   <div className="mb-1 flex items-center text-[11px] text-slate-400">
                     <span className="min-w-0 truncate">▶ {basename(preview.path)}</span>
                     <button className="ml-auto shrink-0 text-slate-500 hover:text-slate-300" onClick={() => setPreview(null)}>✕</button>
                   </div>
-                  <video src={mediaUrl(preview.path)} controls autoPlay className="max-h-[240px] w-full rounded bg-black" />
+                  <MiniVideoPlayer src={mediaUrl(preview.path)} />
                 </div>
               )}
               <div className="mt-2 flex gap-2">
@@ -370,10 +380,19 @@ export default function EditorView({
                 </div>
               )}
               {preview?.kind === "audio" && (
-                <div className="mt-2 flex items-center gap-2 rounded-lg border border-violet-500/25 bg-black/40 p-2">
-                  <span className="min-w-0 shrink truncate text-[11px] text-slate-400">🎵 {basename(preview.path)}</span>
-                  <audio src={mediaUrl(preview.path)} controls autoPlay className="h-8 min-w-0 flex-1" />
-                  <button className="shrink-0 text-slate-500 hover:text-slate-300" onClick={() => setPreview(null)}>✕</button>
+                <div className="mt-2">
+                  <div className="mb-1 flex items-center text-[11px] text-slate-400">
+                    <span className="min-w-0 truncate">🎵 {basename(preview.path)}</span>
+                    <button className="ml-auto shrink-0 text-slate-500 hover:text-slate-300" onClick={() => setPreview(null)}>✕</button>
+                  </div>
+                  <AudioTimeline
+                    key={preview.path}
+                    src={mediaUrl(preview.path)}
+                    sections={previewSections}
+                    duration={0}
+                    keypointsPath={preview.path}
+                    autoPlay
+                  />
                 </div>
               )}
             </div>
