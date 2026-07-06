@@ -546,9 +546,11 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
             boundaries.append({
                 "cut_index": k,
                 "outgoing": {"content": a.get("content", ""), "emotion": a.get("emotion", ""),
-                             "visual_beat": a.get("visual_beat", "")},
+                             "visual_beat": a.get("visual_beat", ""),
+                             "camera_motion": (a.get("camera_motion") or {}).get("type", "")},
                 "incoming": {"content": b.get("content", ""), "emotion": b.get("emotion", ""),
-                             "visual_beat": b.get("visual_beat", "")},
+                             "visual_beat": b.get("visual_beat", ""),
+                             "camera_motion": (b.get("camera_motion") or {}).get("type", "")},
             })
 
         palette_desc = "\n".join(f"- {k}: {v}" for k, v in TRANSITION_PALETTE.items())
@@ -572,6 +574,11 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
             "- Stylized accents (zoomin, radial, circleopen, hlslice, distance, smoothleft/right): "
             "1-2 in the WHOLE video, never on quiet moments.\n"
             "- Never use the same non-cut transition twice in a row.\n"
+            "- MOTION MATCHING: camera_motion gives each side's measured move. When both sides "
+            "continue the same direction (pan_left → pan_left, push_in → push_in) the flow is "
+            "already seamless — a plain cut or gentle fade preserves it. smoothleft/smoothright "
+            "may ONLY move WITH the shots' shared direction, never against it. Between two "
+            "static/calm shots, fade or dissolve carries the stillness.\n"
             "- duration: 0.3-0.6 seconds (0.5-0.6 for calm dissolves, 0.3-0.4 for accents).\n\n"
             f"Cuts to decide (between consecutive shots):\n{json.dumps(boundaries, ensure_ascii=False, indent=1)}\n\n"
             'Reply with ONLY a JSON array, one entry per cut, e.g.: '
@@ -678,6 +685,34 @@ def _dims_cached(path: str) -> tuple:
     if path not in _DIMS_CACHE:
         _DIMS_CACHE[path] = get_video_dimensions(path)
     return _DIMS_CACHE[path]
+
+
+_NVENC_OK = None
+
+
+def _video_codec_args() -> list:
+    """['-c:v', encoder, quality args…] — NVENC (GPU) when the driver accepts
+    a session, else libx264. Probed once per process with a REAL tiny encode:
+    the encoder being listed proves nothing, the driver must open a session
+    (this exact mismatch cost a driver-version hunt: API 13.1 vs 13.0)."""
+    global _NVENC_OK
+    if _NVENC_OK is None:
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                 'testsrc=duration=0.1:size=320x180:rate=30',
+                 '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+                capture_output=True, timeout=20)
+            _NVENC_OK = (r.returncode == 0)
+        except Exception:  # noqa: BLE001
+            _NVENC_OK = False
+        print(f"🎛️  Video encoder: {'h264_nvenc (GPU)' if _NVENC_OK else 'libx264 (CPU)'}")
+    if _NVENC_OK:
+        # p5 + vbr cq19 ≈ libx264 crf18 visually; -b:v 0 lets cq govern.
+        # profile high matches what libx264 emitted before (concat-friendly).
+        return ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr',
+                '-cq', '19', '-b:v', '0', '-profile:v', 'high']
+    return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
 
 
 def _source_has_audio(path: str) -> bool:
@@ -883,7 +918,7 @@ def _build_video_join_cmd(concat_file, clip_files, clips, out_path, video_fps, t
             'ffmpeg', '-y', *inputs,
             '-filter_complex', ";".join(parts),
             *maps,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
+            *_video_codec_args(), '-pix_fmt', 'yuv420p',
             *acodec,
             '-r', str(video_fps), out_path,
         ]
@@ -1075,9 +1110,7 @@ def render_video_ffmpeg(
                     '-i', f'anullsrc=channel_layout=stereo:sample_rate={audio_ar}',
                     '-vf', ending_filter,
                     '-r', str(video_fps),
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '18',
+                    *_video_codec_args(),
                     '-c:a', 'aac',
                     '-ar', str(audio_ar),
                     '-ac', '2',
@@ -1267,17 +1300,15 @@ def render_video_ffmpeg(
                     '-t', str(duration),
                     '-vf', video_filter,
                     '-r', str(video_fps),
-                    '-c:v', 'libx264',  # Re-encode for consistent format
+                    *_video_codec_args(),  # NVENC when driver allows, else libx264
                     # 8-bit is REQUIRED: 10-bit sources (e.g. DJI D-Log) would
-                    # otherwise make x264 emit High10, and a concat-copy stream
-                    # that switches profile mid-file kills every hardware
+                    # otherwise emit High10, and a concat-copy stream that
+                    # switches profile mid-file kills every hardware
                     # decoder (browser/NVDEC) exactly at that clip boundary.
                     '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac',
                     '-ar', str(audio_ar),
                     '-ac', '2',
-                    '-preset', 'fast',
-                    '-crf', '18',  # High quality
                     '-avoid_negative_ts', 'make_zero',
                     clip_file
                 ]
@@ -1339,13 +1370,11 @@ def render_video_ffmpeg(
                         # segments play at the wrong speed and the total duration
                         # inflates. Every extraction branch must emit the same -r.
                         '-r', str(video_fps),
-                        '-c:v', 'libx264',  # Re-encode for consistent format
+                        *_video_codec_args(),  # NVENC when driver allows, else libx264
                         '-pix_fmt', 'yuv420p',  # force 8-bit (10-bit source → High10 breaks hw decoders)
                         '-c:a', 'aac',
                         '-ar', str(audio_ar),
                         '-ac', '2',
-                        '-preset', 'fast',
-                        '-crf', '18',  # High quality
                         '-avoid_negative_ts', 'make_zero',
                         clip_file
                     ]
@@ -1357,13 +1386,11 @@ def render_video_ffmpeg(
                         '-i', source_video,
                         '-t', str(duration),
                         '-r', str(video_fps),
-                        '-c:v', 'libx264',  # Re-encode for consistent format
+                        *_video_codec_args(),  # NVENC when driver allows, else libx264
                         '-pix_fmt', 'yuv420p',  # force 8-bit (10-bit source → High10 breaks hw decoders)
                         '-c:a', 'aac',
                         '-ar', str(audio_ar),
                         '-ac', '2',
-                        '-preset', 'fast',
-                        '-crf', '18',  # High quality
                         '-avoid_negative_ts', 'make_zero',
                         clip_file
                     ]
@@ -1607,7 +1634,7 @@ def render_video_ffmpeg(
 
                 # Use re-encode when ending clip is present so -t can cut precisely
                 # (copy mode can only cut at keyframe boundaries, truncating the ending).
-                video_codec = ['libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
+                video_codec = [*_video_codec_args()[1:], '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
                 cmd = [
                     'ffmpeg',
                     '-y',
@@ -1655,7 +1682,7 @@ def render_video_ffmpeg(
                 )
                 filter_complex = ";".join(filter_parts)
 
-                video_codec = ['libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
+                video_codec = [*_video_codec_args()[1:], '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
                 cmd = [
                     'ffmpeg',
                     '-y',
