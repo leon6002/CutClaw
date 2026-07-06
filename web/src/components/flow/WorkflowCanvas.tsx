@@ -102,13 +102,15 @@ function useJobTraces(jobId: string | null) {
 const COL_W = 265;
 const LANE_H = 125;
 const LANE_TOP = 130;
-const X_ROOT = 900;          // shot-root column — pushed right to make room for the
+const X_ROOT = 1000;         // shot-root column — pushed right to make room for the
                              // asset column + screenwriter + editor hub on the left
 
-// ── pipeline columns (left → right): assets → screenwriter → editor → shots ──
-const ASSET_X = 10, ASSET_ROW = 184;   // input asset column (poster + name per row)
-const SW_X = 286, SW_Y = 6;            // "AI 编剧" timeline node
-const EDITOR_X = 640;                  // editor hub, between screenwriter and shots
+// ── pipeline columns (left → right): audio sources → assets/mix → screenwriter
+//    → editor → shots. Gaps widened per user feedback (nodes felt glued).
+const AUDIO_SRC_X = -290;              // original music tracks (feed the BGM mix)
+const ASSET_X = 10, ASSET_ROW = 196;   // input asset column (poster + name per row)
+const SW_X = 380, SW_Y = 6;            // "AI 编剧" timeline node
+const EDITOR_X = 740;                  // editor hub, between screenwriter and shots
 
 interface RoundInfo {
   seq: number; section: number; round: number;
@@ -191,8 +193,9 @@ function buildGraph(opts: {
   shots?: ShotInfo[];
   onOpenClip?: (s: ShotInfo) => void;
   assetLive?: Record<string, string>;   // basename → live analysis state (r/d)
+  bgmUsedPaths?: string[];              // source tracks actually used in the BGM mix
 }): { nodes: Node[]; edges: Edge[]; latestActiveId: string | null } {
-  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive } = opts;
+  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive, bgmUsedPaths } = opts;
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   let latestActiveId: string | null = null;
@@ -257,15 +260,26 @@ function buildGraph(opts: {
     if (swActive) latestActiveId = "sw";
   }
 
-  // Input asset column: the source videos (视频理解) + audio (音乐分析) feeding
-  // the screenwriter. Each shows its cached annotation and opens it on click.
+  // Input assets. Videos form the main column feeding the screenwriter. Music
+  // gets FUSION semantics: when the project audio is an AI mix, the original
+  // tracks sit in their own column further left, and ONLY the tracks that
+  // actually made it into the mix get a violet edge into the mix node —
+  // unused tracks are dimmed and unconnected, so "谁进了最终 BGM" reads at
+  // a glance. The mix node alone feeds the screenwriter.
   const assetList = assets ?? [];
   if (assetList.length > 0) {
-    const startY = SW_Y + 150 - (assetList.length * ASSET_ROW) / 2;
-    assetList.forEach((a, i) => {
-      const id = `asset-${i}`;
+    const _normP = (s: string) => (s || "").replace(/\//g, "\\").toLowerCase();
+    const _base = (s: string) => _normP(s).split("\\").pop() ?? "";
+    const isMix = (a: AssetInfo) => /bgmmix/i.test(a.file_name || "");
+    const mix = assetList.find((a) => a.asset_type === "audio" && isMix(a));
+    const audioSrcs = mix ? assetList.filter((a) => a.asset_type === "audio" && !isMix(a)) : [];
+    const mainCol = assetList.filter((a) => !audioSrcs.includes(a));
+    const usedSet = new Set((bgmUsedPaths ?? []).map(_base));
+
+    const pushAsset = (a: AssetInfo, id: string, x: number, y: number, dimmed = false) => {
       nodes.push({
-        id, type: "asset", position: { x: ASSET_X, y: startY + i * ASSET_ROW },
+        id, type: "asset", position: { x, y },
+        style: dimmed ? { opacity: 0.4 } : undefined,
         data: {
           path: a.path, fileName: a.file_name, assetType: a.asset_type,
           annotated: a.annotated, annotation: a.annotation, contentHash: a.content_hash ?? "",
@@ -273,12 +287,39 @@ function buildGraph(opts: {
           onOpen: () => onOpenAsset?.(a),
         },
       });
+    };
+
+    const startY = SW_Y + 150 - (mainCol.length * ASSET_ROW) / 2;
+    mainCol.forEach((a, i) => {
+      const gi = assetList.indexOf(a);      // stable id ↔ assetIndexByPath
+      const id = `asset-${gi}`;
+      pushAsset(a, id, ASSET_X, startY + i * ASSET_ROW);
       const live = assetLive?.[(a.file_name || "").toLowerCase()];
       edges.push({
         id: `e-${id}-sw`, source: id, target: "sw",
         ...edgeStyle(live === "r" ? "active" : (a.annotated || live === "d") ? "done" : "pending"),
       });
     });
+
+    if (mix && audioSrcs.length > 0) {
+      const mixIdx = assetList.indexOf(mix);
+      const mixNodeId = `asset-${mixIdx}`;
+      const mixPos = nodes.find((n) => n.id === mixNodeId)?.position;
+      const mixY = mixPos?.y ?? startY;
+      const srcStartY = mixY + 90 - (audioSrcs.length * ASSET_ROW) / 2;
+      audioSrcs.forEach((a, i) => {
+        const gi = assetList.indexOf(a);
+        const id = `asset-${gi}`;
+        const used = usedSet.size === 0 || usedSet.has(_base(a.path));
+        pushAsset(a, id, AUDIO_SRC_X, srcStartY + i * ASSET_ROW, !used);
+        if (used) {
+          edges.push({
+            id: `e-${id}-mix`, source: id, target: mixNodeId, targetHandle: "in-l",
+            animated: false, style: { stroke: "rgba(167,139,250,0.75)", strokeWidth: 1.8 },
+          });
+        }
+      });
+    }
   }
 
   // AI Editor stage node — an explicit anchor for the editor stage: the fan-out
@@ -489,7 +530,7 @@ function buildGraph(opts: {
 
 function CanvasInner({
   jobId, tasks, onOpenScreenwriter, fullscreen, onToggleFullscreen, jobRunning, onRetryShot,
-  assets, onOpenAsset, shots, onOpenClip,
+  assets, onOpenAsset, shots, onOpenClip, bgmUsedPaths,
 }: {
   jobId: string;
   tasks: Record<string, TaskInfo>;
@@ -502,6 +543,7 @@ function CanvasInner({
   onOpenAsset?: (a: AssetInfo) => void;
   shots?: ShotInfo[];
   onOpenClip?: (s: ShotInfo) => void;
+  bgmUsedPaths?: string[];
 }) {
   const traces = useJobTraces(jobId);
   const [expanded, setExpanded] = useState<{ unit: number; ord: number } | null>(null);
@@ -563,9 +605,9 @@ function CanvasInner({
     () => buildGraph({
       shotTask: shotTask ?? undefined, traces, expanded, fullEntries, onToggle, onOpenScreenwriter,
       jobRunning, onRetryShot, swStage, assets: assetsStable ?? undefined, onOpenAsset,
-      shots: shotsStable ?? undefined, onOpenClip, assetLive,
+      shots: shotsStable ?? undefined, onOpenClip, assetLive, bgmUsedPaths,
     }),
-    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive],
+    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive, bgmUsedPaths],
   );
 
   // React Flow v12 controlled mode REQUIRES onNodesChange: node dimension
@@ -727,6 +769,7 @@ export default function WorkflowCanvas(props: {
   onOpenAsset?: (a: AssetInfo) => void;
   shots?: ShotInfo[];
   onOpenClip?: (s: ShotInfo) => void;
+  bgmUsedPaths?: string[];
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);

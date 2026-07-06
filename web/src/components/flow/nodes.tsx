@@ -266,8 +266,10 @@ export const AssetNode = memo(({ data }: NodeProps) => {
         </span>
         <span className="truncate text-[11.5px] font-medium text-slate-200" title={d.fileName}>{d.fileName}</span>
       </div>
-      {/* source → screenwriter; target = faint back-links from clip result nodes */}
+      {/* source → screenwriter; right target = faint back-links from clip result
+          nodes; left target = original music tracks feeding a BGM mix node */}
       <Handle type="target" position={H.r} className={handleCls()} />
+      <Handle id="in-l" type="target" position={H.l} className={handleCls()} />
       <Handle type="source" position={H.r} className={handleCls()} />
     </div>
   );

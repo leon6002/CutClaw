@@ -76,6 +76,9 @@ export default function EditorView({
   const [preview, setPreview] = useState<{ kind: "video" | "audio"; path: string } | null>(null);
   const previewToggle = (kind: "video" | "audio", path: string) =>
     setPreview((cur) => (cur?.path === path ? null : { kind, path }));
+  // which source tracks actually made it into the BGM mix (from the recipe
+  // sidecar) — the canvas draws source→mix edges only for these
+  const [bgmUsedPaths, setBgmUsedPaths] = useState<string[]>([]);
   // annotated sections for the previewed track → colored bands on the waveform
   const previewSections = (() => {
     if (preview?.kind !== "audio") return [];
@@ -120,6 +123,18 @@ export default function EditorView({
       method: "POST", body: JSON.stringify({ paths }),
     }).then((r) => setAssets(r.assets ?? [])).catch(() => setAssets([]));
   }, [p.videos, p.audio, p.audios]);
+
+  // When the project audio is an AI mix, pull its recipe so the canvas can
+  // connect ONLY the tracks that were actually arranged into it.
+  useEffect(() => {
+    if (!/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "")) { setBgmUsedPaths([]); return; }
+    api<{ recipe: { segments?: { path: string }[] } | null }>(
+      `/api/bgm/recipe?path=${encodeURIComponent(p.audio)}`,
+    ).then((r) => {
+      const paths = (r.recipe?.segments ?? []).map((s) => s.path).filter(Boolean);
+      setBgmUsedPaths(Array.from(new Set(paths)));
+    }).catch(() => setBgmUsedPaths([]));
+  }, [p.audio, fusion?.state]);
 
   // Poll the final selected shots (shot_point.json) so the canvas can show each
   // shot's chosen source + time slice and preview it. Grows during the run.
@@ -609,6 +624,7 @@ export default function EditorView({
                   assets={assets}
                   onOpenAsset={(a) => { setAssetView(a); setWb(null); setClipView(null); }}
                   shots={shots}
+                  bgmUsedPaths={bgmUsedPaths}
                   onOpenClip={(s) => { setClipView(s); setAssetView(null); setWb(null); }}
                   onOpenScreenwriter={() => { setWb({ task: "screenwriter_llm" }); setAssetView(null); setClipView(null); }}
                   onRetryShot={retryShot}
