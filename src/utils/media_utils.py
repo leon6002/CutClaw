@@ -221,15 +221,18 @@ def natural_sort_key(s: str) -> List:
 # Screenwriter helpers
 # ---------------------------------------------------------------------------
 
-def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
+def load_scene_summaries(scene_folder_path: str) -> tuple[str, list[int]]:
     """Load scene_caption.scene_summary from all scene JSON files in a folder.
 
     Skips non-usable scenes and scenes with importance_score < 3.
 
     Returns:
-        (concatenated scene summaries, number of loaded scenes)
+        (concatenated scene summaries, sorted list of USABLE scene FILE ids).
+        The ids are what ``related_scenes`` / ``scene_{idx}.json`` resolve
+        against and may be SPARSE (skipped scenes leave gaps, e.g. [1, 2]).
     """
     scene_summaries = []
+    usable_ids: list[int] = []   # FILE ids of scenes actually shown to the model
 
     scene_files = [f for f in os.listdir(scene_folder_path)
                    if f.startswith('scene_') and f.endswith('.json')]
@@ -285,7 +288,12 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
             if not scene_summary:
                 continue
 
-            scene_id = scene_data.get('scene_id', 'Unknown')
+            # Use the FILE number as the scene id shown to the model — that is
+            # what `related_scenes` / `scene_{idx}.json` resolve against. The
+            # in-file `scene_id` is NOT renumbered by the merge (every merged
+            # scene keeps scene_id=0), so using it showed the model several
+            # indistinguishable "Scene 0" entries it couldn't reference.
+            scene_id = _scene_number(filename)
             time_range = scene_data.get('time_range', {})
             start_time = time_range.get('start_seconds', 'N/A')
             end_time = time_range.get('end_seconds', 'N/A')
@@ -336,13 +344,15 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
                 f"Narrative: {narrative}\n"
             )
             scene_summaries.append(summary_text)
+            usable_ids.append(_scene_number(filename))
 
         except Exception as e:
             print(f"Warning: Failed to read {filename}: {e}")
             continue
 
     total_scene_files = len(scene_files)
-    print(f"Loaded {len(scene_summaries)} scene summaries (out of {total_scene_files} files) from {scene_folder_path}")
+    print(f"Loaded {len(scene_summaries)} usable scenes {usable_ids} "
+          f"(out of {total_scene_files} files) from {scene_folder_path}")
 
     budget_header = (
         "SCENE CAPACITY BUDGET: each scene lists how many non-overlapping shots its "
@@ -361,7 +371,10 @@ def load_scene_summaries(scene_folder_path: str) -> tuple[str, int]:
             "explicitly demands another narrative order. Scenes without capture data "
             "may be placed freely.\n\n"
         )
-    return budget_header + "\n".join(scene_summaries), total_scene_files
+    # Return the USABLE scene file ids (sparse — skipped scenes leave gaps), not
+    # the raw file count: callers must not tell the model about / require scenes
+    # it was never shown, or it burns retries chasing non-existent scenes.
+    return budget_header + "\n".join(scene_summaries), usable_ids
 
 
 def parse_structure_proposal_output(output: str) -> Optional[Dict]:

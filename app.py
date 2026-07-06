@@ -5,6 +5,7 @@ import os
 
 import streamlit as st
 
+import src.utils.litellm_local  # noqa: F401  — local cost map, before any litellm import
 from src.ui.styles import inject_styles
 from src.ui.helpers import (PROJECT_ROOT, cfg, save_config, status_badge,
                              resolve_hook_subtitle_path)

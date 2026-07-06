@@ -1,3 +1,4 @@
+import src.utils.litellm_local  # noqa: F401  — local cost map, before any litellm import
 import src.config as config
 import os
 import json
@@ -175,15 +176,24 @@ def main():
     # Per-file analysis: each source video is analyzed independently and cached
     # by content hash. Merging is deferred to render time.
     from src.analyzer import analyze_video, analyze_audio, merge_scene_summaries, get_scene_summaries_dir, get_analysis_path
+    from src.utils.progress import emit_progress as _emit_prog
 
+    # Per-video "which one is analyzing now" signal for the canvas asset nodes
+    # (label = basename so the UI matches it to the right node). Cached videos
+    # flip to done instantly; only the un-analyzed ones dwell in "分析中".
     video_hashes: list[str] = []
-    for vp in _video_inputs:
+    _emit_prog("video_analysis", len(_video_inputs), -1, "reset")
+    for _i, vp in enumerate(_video_inputs):
+        _emit_prog("video_analysis", len(_video_inputs), _i, "start", label=os.path.basename(vp))
         vh = analyze_video(vp, video_type=config.VIDEO_TYPE)
         video_hashes.append(vh)
+        _emit_prog("video_analysis", len(_video_inputs), _i, "done", label=os.path.basename(vp))
 
     audio_hash: str = ""
     if Audio_Path:
+        _emit_prog("audio_analysis_asset", 1, 0, "start", label=os.path.basename(Audio_Path))
         audio_hash = analyze_audio(Audio_Path)
+        _emit_prog("audio_analysis_asset", 1, 0, "done", label=os.path.basename(Audio_Path))
 
     # Use the first video's hash as the primary project identifier
     primary_hash = video_hashes[0][:12] if video_hashes else "unknown"

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import os
 import subprocess
 import sys
+import threading
 from typing import Callable, Optional
 
 from .models import (
@@ -285,6 +287,76 @@ def probe_audio_metadata(file_path: str, file_size_bytes: int) -> AudioAssetMeta
     )
 
 
+# ── Metadata cache (path → probed metadata, keyed by size+mtime) ────────────
+#
+# Probing every file on every scan is the slow part: SHA-256 of 1 MB plus
+# ~8 ffprobe subprocess spawns per video (≈0.5-1s each on Windows). Files are
+# immutable in practice, so we cache the fully-probed metadata keyed by
+# (size, mtime) and skip all of it when a file is unchanged. First scan is
+# still full cost; every scan after is near-instant for unchanged files.
+
+_CACHE_VERSION = 1
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SCAN_CACHE_PATH = os.path.join(_PROJECT_ROOT, "Output", "asset_index", "scan_cache.json")
+_cache_lock = threading.Lock()
+
+_META_CLASSES = {
+    "video": VideoAssetMetadata,
+    "image": ImageAssetMetadata,
+    "audio": AudioAssetMetadata,
+}
+
+
+def _load_scan_cache() -> dict:
+    try:
+        with open(_SCAN_CACHE_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("version") != _CACHE_VERSION:
+        return {}
+    entries = raw.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_scan_cache(entries: dict) -> None:
+    with _cache_lock:
+        os.makedirs(os.path.dirname(_SCAN_CACHE_PATH), exist_ok=True)
+        tmp = _SCAN_CACHE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": _CACHE_VERSION, "entries": entries},
+                          fh, ensure_ascii=False)
+            os.replace(tmp, _SCAN_CACHE_PATH)
+        except OSError:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
+def _dump_meta(meta) -> dict:
+    """Serialize a typed metadata object to a JSON-safe dict."""
+    if hasattr(meta, "model_dump"):
+        return meta.model_dump(mode="json")
+    return meta.dict()
+
+
+def _meta_from_cache(entry: dict):
+    """Rebuild a typed metadata object from a cached dict, or None if invalid."""
+    meta = entry.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    cls = _META_CLASSES.get(meta.get("asset_type"))
+    if cls is None:
+        return None
+    try:
+        return cls(**meta)
+    except Exception:
+        return None
+
+
 # ── Main scan function ─────────────────────────────────────────────────────
 
 def _classify_ext(ext: str) -> str | None:
@@ -301,12 +373,16 @@ def _classify_ext(ext: str) -> str | None:
 def scan_asset_directory(
     asset_root: str,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    use_cache: bool = True,
 ) -> list[AssetMetadataUnion]:
     """Walk *asset_root*, discover media files, compute hashes and metadata.
 
     Args:
         asset_root: Absolute path to scan.
         progress_callback: Optional (current, total, file_name) callback for UI.
+        use_cache: Reuse cached metadata for files whose (size, mtime) are
+            unchanged, skipping hashing + ffprobe. Pass ``False`` to force a
+            full re-probe of every file.
 
     Returns:
         List of typed metadata objects, each with *file_path* set to the
@@ -314,6 +390,10 @@ def scan_asset_directory(
     """
     if not os.path.isdir(asset_root):
         return []
+
+    cache = _load_scan_cache() if use_cache else {}
+    fresh_cache: dict = {}
+    cache_dirty = False
 
     # Collect all relevant files
     file_paths: list[str] = []
@@ -339,26 +419,48 @@ def scan_asset_directory(
             progress_callback(i + 1, total, fn)
 
         try:
-            file_size = os.path.getsize(abs_path)
+            st = os.stat(abs_path)
         except OSError:
             continue
+        file_size = st.st_size
+        mtime = int(st.st_mtime)
 
-        content_hash = compute_content_hash(abs_path)
         ext = os.path.splitext(abs_path)[1].lower()
         kind = _classify_ext(ext)
+        if kind is None:
+            continue
         rel_path = os.path.relpath(abs_path, asset_root)
 
+        # Cache hit: file unchanged since last scan → skip hash + ffprobe.
+        cached = cache.get(abs_path)
+        if (cached and cached.get("size") == file_size
+                and cached.get("mtime") == mtime):
+            meta = _meta_from_cache(cached)
+            if meta is not None:
+                meta.file_path = rel_path            # root may have moved
+                results.append(meta)
+                fresh_cache[abs_path] = cached
+                continue
+
+        # Cache miss / changed file → full probe.
+        content_hash = compute_content_hash(abs_path)
         if kind == "video":
             meta = probe_video_metadata(abs_path, file_size)
         elif kind == "image":
             meta = probe_image_metadata(abs_path, file_size)
-        elif kind == "audio":
+        else:  # audio
             meta = probe_audio_metadata(abs_path, file_size)
-        else:
-            continue
 
         meta.file_path = rel_path
         meta.content_hash = content_hash
         results.append(meta)
+        fresh_cache[abs_path] = {
+            "size": file_size, "mtime": mtime, "meta": _dump_meta(meta),
+        }
+        cache_dirty = True
+
+    # Persist if anything changed or stale entries were dropped (files removed).
+    if use_cache and (cache_dirty or len(fresh_cache) != len(cache)):
+        _save_scan_cache(fresh_cache)
 
     return results
