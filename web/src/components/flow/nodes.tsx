@@ -33,6 +33,7 @@ export interface ShotRootData {
   state: string; // p/r/d/f
   iters?: string;
   onRetry?: () => void;   // present only when the shot can be re-generated
+  onFold?: () => void;    // present when this row was pinned open from a group
   [key: string]: unknown;
 }
 
@@ -61,7 +62,16 @@ export const ShotRootNode = memo(({ data }: NodeProps) => {
             <RotateCcw className="h-2.5 w-2.5" />{d.state === "f" ? "重试" : "换一个"}
           </button>
         )}
-        {d.iters && <span className={cn("shrink-0 font-mono text-[9px] text-slate-600", !d.onRetry && "ml-auto")}>{d.iters}</span>}
+        {d.onFold && (
+          <button
+            onClick={(ev) => { ev.stopPropagation(); d.onFold!(); }}
+            title="折叠回镜头分组"
+            className={cn("flex shrink-0 items-center rounded-md border border-white/15 bg-white/[0.05] px-1 py-0.5 text-[9px] text-slate-400 hover:bg-white/10", !d.onRetry && "ml-auto")}
+          >
+            <X className="h-2.5 w-2.5" />
+          </button>
+        )}
+        {d.iters && <span className={cn("shrink-0 font-mono text-[9px] text-slate-600", !d.onRetry && !d.onFold && "ml-auto")}>{d.iters}</span>}
       </div>
       <div className="px-3 pb-2 text-[11px] leading-snug text-slate-300" style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
         {d.label}
@@ -563,6 +573,56 @@ function GroupThumb({ it }: { it: AssetGroupItem }) {
   );
 }
 
+// ── D3. Shot Group Node (folded quiet shots as a chip grid) ─────────────────
+// Anchored shots are mostly zero-LLM instants — a full 125px row each stacked
+// the column absurdly high. Quiet shots (done/waiting, nothing expanded)
+// collapse into this card; clicking a chip pins that shot open as a full row.
+
+export interface ShotGroupChip { idx: number; state: string; label: string }
+export interface ShotGroupData {
+  chips: ShotGroupChip[];
+  onOpenShot?: (idx: number) => void;
+  [key: string]: unknown;
+}
+
+const CHIP_DOT: Record<string, string> = {
+  d: "bg-emerald-400", r: "bg-cyan-400 animate-pulse", f: "bg-red-400", p: "bg-white/20",
+};
+
+export const ShotGroupNode = memo(({ data }: NodeProps) => {
+  const d = data as ShotGroupData;
+  const chips = d.chips ?? [];
+  const dn = chips.filter((c) => c.state === "d").length;
+  const first = chips[0]?.idx ?? 0, last = chips[chips.length - 1]?.idx ?? 0;
+  return (
+    <div className={cn(
+      "w-[230px] rounded-xl border bg-slate-900/90 px-2.5 py-2 shadow-lg",
+      dn === chips.length ? "border-emerald-500/35" : "border-white/10",
+    )}>
+      <div className="flex items-baseline gap-1.5 pb-1.5">
+        <Scissors className="h-3 w-3 shrink-0 self-center text-cyan-400/70" />
+        <span className="text-[11px] font-semibold text-slate-300">镜头 #{first + 1}–#{last + 1}</span>
+        <span className="ml-auto font-mono text-[9.5px] text-slate-500">✓{dn}/{chips.length}</span>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {chips.map((c) => (
+          <button
+            key={c.idx}
+            onClick={(ev) => { ev.stopPropagation(); d.onOpenShot?.(c.idx); }}
+            title={`${c.label || `镜头 ${c.idx + 1}`} — 点击展开该镜头`}
+            className="flex h-[21px] items-center gap-1 rounded-md border border-white/10 bg-white/[0.04] px-1.5 font-mono text-[9.5px] text-slate-400 transition-colors hover:border-cyan-400/50 hover:text-slate-200"
+          >
+            <span className={cn("h-1.5 w-1.5 rounded-full", CHIP_DOT[c.state] ?? CHIP_DOT.p)} />
+            {c.idx + 1}
+          </button>
+        ))}
+      </div>
+      <Handle type="target" position={H.l} className={handleCls()} />
+      <Handle type="source" position={H.r} className={handleCls()} />
+    </div>
+  );
+});
+
 // ── E. Stage Node (batch analysis phases as first-class canvas citizens) ────
 // The per-file/per-segment grids (视频片段理解 / 密集片段描述 / …) used to live
 // under the canvas; each is now ONE node in an analysis chain between the
@@ -659,4 +719,5 @@ export const nodeTypes = {
   orchestrator: OrchestratorNode,
   stage: StageNode,
   assetGroup: AssetGroupNode,
+  shotGroup: ShotGroupNode,
 };

@@ -205,8 +205,10 @@ function buildGraph(opts: {
   bgmUsedPaths?: string[];              // source tracks actually used in the BGM mix
   batchTasks?: Record<string, TaskInfo>; // analysis-phase tasks → stage nodes
   onOpenTask?: (task: string) => void;   // open the workbench for a stage
+  openShots?: number[];                  // user-pinned shots (kept as full rows)
+  onToggleShot?: (i: number) => void;    // pin/unpin a shot row
 }): { nodes: Node[]; edges: Edge[]; latestActiveId: string | null } {
-  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask } = opts;
+  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask, openShots, onToggleShot } = opts;
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   let latestActiveId: string | null = null;
@@ -453,13 +455,45 @@ function buildGraph(opts: {
     }
   }
 
+  // ── shot column layout: fold uneventful shots into compact group cards ──
+  // 66 anchored shots are mostly zero-LLM instants; giving each a full 125px
+  // row stacked the column a mile high. Only shots that are running, failed,
+  // trace-expanded or user-pinned get a full row — consecutive quiet ones
+  // (done or waiting) collapse into a chip-grid card; clicking a chip pins
+  // that shot open.
+  const openSet = new Set(openShots ?? []);
+  const isFullShot = (i: number) => {
+    const st = states[String(i)] ?? "p";
+    return st === "r" || st === "f" || expanded?.unit === i || openSet.has(i);
+  };
+  const shotGroupH = (n: number) => 40 + Math.ceil(n / 5) * 25;
+  type ShotRow = { kind: "shot"; i: number; y: number } | { kind: "group"; items: number[]; y: number };
+  const shotRows: ShotRow[] = [];
+  let shotColBottom = LANE_TOP;
+  if (total > 0) {
+    let yc = LANE_TOP;
+    let buf: number[] = [];
+    const flush = () => {
+      if (!buf.length) return;
+      shotRows.push({ kind: "group", items: buf, y: yc });
+      yc += shotGroupH(buf.length) + 24;
+      buf = [];
+    };
+    for (let i = 0; i < total; i++) {
+      if (isFullShot(i)) { flush(); shotRows.push({ kind: "shot", i, y: yc }); yc += LANE_H; }
+      else buf.push(i);
+    }
+    flush();
+    shotColBottom = yc;
+  }
+
   // AI Editor stage node — an explicit anchor for the editor stage: the fan-out
   // hub between the Screenwriter and the per-shot lanes (the lanes ARE the
   // EditorCoreAgent's per-shot selection). Shown from the screenwriter phase on.
   const doneN = Object.values(states).filter((v) => v === "d").length;
   const failN = Object.values(states).filter((v) => v === "f").length;
   const editorRunning = Object.values(states).some((v) => v === "r");
-  const editorY = total > 0 ? LANE_TOP + ((total - 1) * LANE_H) / 2 : LANE_TOP;
+  const editorY = total > 0 ? (LANE_TOP + shotColBottom) / 2 - 40 : LANE_TOP;
   nodes.push({
     id: "editor", type: "orchestrator", position: { x: EDITOR_X, y: editorY },
     data: {
@@ -509,25 +543,55 @@ function buildGraph(opts: {
   const CLIP_COL = shotList.length > 0 ? 250 : 0;
   const clipX = cursor + COL_W * 0.2;
   const mergeX = clipX + CLIP_COL;
-  const centerY = LANE_TOP + ((total - 1) * LANE_H) / 2;
+  const centerY = (LANE_TOP + shotColBottom) / 2 - 40;
 
-  // shot roots + collapsed iteration lanes (one lane per round-segment)
-  const lastNodeOfShot: (string | null)[] = [];
-  for (let i = 0; i < total; i++) {
+  // folded shots → compact chip-grid cards (click a chip to pin it open)
+  for (const row of shotRows) {
+    if (row.kind !== "group") continue;
+    const gid = `shotgrp-${row.items[0]}`;
+    const chips = row.items.map((i) => ({
+      idx: i,
+      state: states[String(i)] ?? "p",
+      label: shotTask?.labels?.[String(i)] ?? "",
+    }));
+    const dn = chips.filter((c) => c.state === "d").length;
+    nodes.push({
+      id: gid, type: "shotGroup", position: { x: X_ROOT, y: row.y },
+      data: { chips, onOpenShot: (i: number) => onToggleShot?.(i) },
+    });
+    edges.push({
+      id: `e-editor-${gid}`, source: "editor", target: gid,
+      ...edgeStyle(dn > 0 ? "done" : "pending"),
+    });
+    edges.push({
+      id: `e-${gid}-merge`, source: gid, target: "merge",
+      ...edgeStyle(dn === chips.length ? "done" : "pending"),
+    });
+  }
+
+  // full rows (running / failed / expanded / pinned): root + iteration lanes
+  const lastNodeOfShot = new Map<number, string>();
+  const yOfShot = new Map<number, number>();
+  for (const row of shotRows) {
+    if (row.kind !== "shot") continue;
+    const i = row.i;
     const st = states[String(i)] ?? "p";
-    const y = LANE_TOP + i * LANE_H;
+    const y = row.y;
+    yOfShot.set(i, y);
     const rootId = `shot-${i}`;
     const label = shotTask?.labels?.[String(i)] ?? "";
     // labels look like "S1·Shot3·…" — parse the (1-indexed) section/shot so a
     // retry can target the right entry in shot_point.json
     const m = /S(\d+)\D+Shot(\d+)/i.exec(label);
     const canRetry = !jobRunning && !!onRetryShot && (st === "d" || st === "f") && !!m;
+    const canFold = openSet.has(i) && st !== "r" && st !== "f" && expanded?.unit !== i;
     nodes.push({
       id: rootId, type: "shotRoot", position: { x: X_ROOT, y },
       data: {
         idx: i, state: st, label,
         iters: shotTask?.iters?.[String(i)],
         onRetry: canRetry ? () => onRetryShot!(Number(m![1]) - 1, Number(m![2]) - 1) : undefined,
+        onFold: canFold ? () => onToggleShot?.(i) : undefined,
       },
     });
     // fan out from the AI Editor stage node
@@ -598,7 +662,7 @@ function buildGraph(opts: {
         prevId = cid;
       }
     });
-    lastNodeOfShot.push(prevId);
+    lastNodeOfShot.set(i, prevId);
   }
 
   // merge node
@@ -612,12 +676,10 @@ function buildGraph(opts: {
       state: doneCount === total ? "d" : "r",
     },
   });
-  for (let i = 0; i < total; i++) {
+  for (const [i, src] of lastNodeOfShot) {
     const st = states[String(i)] ?? "p";
-    const src = lastNodeOfShot[i];
-    if (!src) continue;
     const noSteps = src === `shot-${i}`;
-    const y = LANE_TOP + i * LANE_H;
+    const y = yOfShot.get(i) ?? LANE_TOP;
 
     // final selected clip (source + time slice) between this shot and the merge
     const label = shotTask?.labels?.[String(i)] ?? "";
@@ -680,6 +742,11 @@ function CanvasInner({
 }) {
   const traces = useJobTraces(jobId);
   const [expanded, setExpanded] = useState<{ unit: number; ord: number } | null>(null);
+  // shots the user pinned open from a folded group card
+  const [openShots, setOpenShots] = useState<number[]>([]);
+  const onToggleShot = useCallback((i: number) => {
+    setOpenShots((prev) => prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i]);
+  }, []);
   const follow = useRef(true);
   const rf = useReactFlow();
   const lastCentered = useRef<string | null>(null);
@@ -744,8 +811,9 @@ function CanvasInner({
       shotTask: shotTask ?? undefined, traces, expanded, fullEntries, onToggle, onOpenScreenwriter,
       jobRunning, onRetryShot, swStage, assets: assetsStable ?? undefined, onOpenAsset,
       shots: shotsStable ?? undefined, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask,
+      openShots, onToggleShot,
     }),
-    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask],
+    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive, bgmUsedPaths, batchTasks, onOpenTask, openShots, onToggleShot],
   );
 
   // React Flow v12 controlled mode REQUIRES onNodesChange: node dimension
