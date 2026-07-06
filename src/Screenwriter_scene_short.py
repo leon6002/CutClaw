@@ -366,6 +366,13 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
         sec_start = _to_audio_seconds(sec.get('Start_Time', 0))
         sec_end = _to_audio_seconds(sec.get('End_Time', 0))
         sec_dur = max(0.0, sec_end - sec_start)
+        _track_end = max((_to_audio_seconds(s.get('End_Time', 0)) for s in sections), default=sec_end)
+        if _track_end + 0.5 < min_dur:
+            # never silently ship a short film — this is how a 150s target once
+            # became a 79s video (the BGM mix itself was only 79.7s long)
+            print(f"⚠️ [Audio] 音乐总长只有 {_track_end:.1f}s，低于目标下限 {min_dur:.0f}s——"
+                  f"成片最多只能到音乐长度。请换更长的音乐，或重新融合 BGM（融合目标=项目时长+15s）",
+                  flush=True)
         if min_dur <= sec_dur <= max_dur:
             return str(sec.get('Start_Time', _seconds_to_mmss(sec_start))), str(sec.get('End_Time', _seconds_to_mmss(sec_end)))
         track_end = max((_to_audio_seconds(s.get('End_Time', 0)) for s in sections), default=sec_end)

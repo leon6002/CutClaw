@@ -345,16 +345,29 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
     return picks, why
 
 
+def _pick_dur(p) -> float:
+    return max(0.0, float(p.get("end") or 0) - float(p.get("start") or 0))
+
+
+def _single_pick_cap(n_picks: int, target_sec: float) -> float:
+    """Max seconds one pick may occupy. 45% keeps 4+ track mixes balanced,
+    but with few tracks it makes the target INFEASIBLE (2 tracks × 45% = 90%
+    of target at best — a 165s ask once shipped 84s): the cap relaxes so the
+    picks can always cover the target with headroom."""
+    n = max(1, n_picks)
+    return max(0.45, 1.0 / n + 0.2) * target_sec
+
+
 def _enforce_bounds(picks: list, infos: list, target_sec: float) -> None:
     """Deterministic corrections the LLM cannot be trusted with (measured
-    boundaries only): total duration ≤ target+12%, and no single pick over
-    ~45% of the target. Trimming walks whole measured sections off a pick —
-    the LAST pick trims from its START (its landing/outro must survive),
-    everything else trims from the END."""
+    boundaries only): total duration in [target−5%, target+12%], and no single
+    pick over the per-track cap. Trimming walks whole measured sections off a
+    pick — the LAST pick trims from its START (its landing/outro must
+    survive), everything else trims from the END. UNDER-length plans (the LLM
+    under-picks: asked 165s, planned 84s) are EXTENDED across neighboring
+    measured sections — forward for most picks, backward for the last one."""
     segs_by_path = {i["path"]: i["segments"] for i in infos}
-
-    def _dur(p) -> float:
-        return max(0.0, float(p.get("end") or 0) - float(p.get("start") or 0))
+    _dur = _pick_dur
 
     def _trim(p, from_start: bool) -> bool:
         """Drop one measured section from this pick. False when impossible."""
@@ -368,11 +381,50 @@ def _enforce_bounds(picks: list, infos: list, target_sec: float) -> None:
             p["end"] = inside[-2]["end"]
         return True
 
-    cap = 0.45 * target_sec
+    def _extend(p, backward: bool) -> float:
+        """Widen this pick by one adjacent measured section; returns gained s."""
+        segs = segs_by_path.get(p["path"]) or []
+        if not segs:
+            return 0.0
+        if backward:
+            prevs = [s for s in segs if s["start"] < float(p["start"]) - 0.01]
+            if not prevs:
+                return 0.0
+            gained = float(p["start"]) - prevs[-1]["start"]
+            p["start"] = prevs[-1]["start"]
+            return max(0.0, gained)
+        nxts = [s for s in segs if s["end"] > float(p["end"]) + 0.01]
+        if not nxts:
+            return 0.0
+        gained = nxts[0]["end"] - float(p["end"])
+        p["end"] = nxts[0]["end"]
+        return max(0.0, gained)
+
+    cap = _single_pick_cap(len(picks), target_sec)
     for k, p in enumerate(picks):
         while _dur(p) > cap:
             if not _trim(p, from_start=(k == len(picks) - 1)):
                 break
+
+    # UNDER-length: extend picks round-robin (shortest first, respecting the
+    # cap) until ≥95% of target or the selected tracks' material runs out.
+    floor = target_sec * 0.95
+    guard = 64
+    while sum(_dur(p) for p in picks) < floor and guard > 0:
+        guard -= 1
+        order = sorted(range(len(picks)), key=lambda i: _dur(picks[i]))
+        gained = 0.0
+        for k in order:
+            if _dur(picks[k]) >= cap:
+                continue
+            gained = _extend(picks[k], backward=(k == len(picks) - 1))
+            if gained > 0:
+                break
+        if gained <= 0:
+            total = sum(_dur(p) for p in picks)
+            print(f"⚠️ [BGMmix] 素材不足：编排总长 {total:.0f}s 低于目标 {target_sec:.0f}s，"
+                  f"所选曲目的段落已用尽——请增加曲目或降低目标时长", flush=True)
+            break
 
     limit = target_sec * 1.12
     guard = 24

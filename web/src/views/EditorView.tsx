@@ -165,8 +165,23 @@ export default function EditorView({
     // apply time once produced a 51s track for a 220s film). The fused mp3
     // becomes the project audio; re-running with the same set+target reuses
     // the previous fusion (audio already points at a BGMmix file).
-    const needFuse = (p.audios?.length ?? 0) > 1
-      && !/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "");
+    const isMix = /BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "");
+    let needFuse = (p.audios?.length ?? 0) > 1 && !isMix;
+    // STALE-MIX GUARD: an existing mix is only reusable if its length still
+    // matches the CURRENT target. A 165s mix reused after the target moved
+    // (or an under-delivered fusion — 165s asked, 79.7s shipped) silently
+    // caps the film at the music's length.
+    if (!needFuse && isMix && (p.audios?.length ?? 0) > 1) {
+      try {
+        const rec = await api<any>(`/api/bgm/recipe?path=${encodeURIComponent(p.audio)}`);
+        const total = Number(rec?.recipe?.total ?? 0);
+        const want = p.targetLength + 15;
+        if (total > 0 && Math.abs(total - want) > want * 0.15) {
+          setFusion({ state: "running", detail: `现有合成 BGM ${Math.round(total)}s 与目标 ${Math.round(want)}s 不符 — 自动重新融合…` });
+          needFuse = true;
+        }
+      } catch { /* recipe unavailable → keep the mix as-is */ }
+    }
     if (needFuse) {
       setFusion({ state: "running", detail: `AI 正在把 ${p.audios!.length} 首音乐按目标 ${Math.round(p.targetLength + 15)}s 融合…` });
       try {
