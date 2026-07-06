@@ -413,6 +413,8 @@ CONFIG_KEYS = [
     # visual dedup / anchor budget (LOGIC.md §14)
     "VISUAL_CLUSTER_MAX_USES", "SOURCE_VIDEO_MAX_USES",
     "VISUAL_CLUSTER_HAMMING", "VISUAL_CLUSTER_MIN_GAP_SHOTS",
+    # voice-highlight ducking (render mix)
+    "DUCK_BGM_LEVEL", "DUCK_VOICE_LEVEL", "DUCK_MERGE_GAP_SEC",
 ]
 
 

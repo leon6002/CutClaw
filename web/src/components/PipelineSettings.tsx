@@ -68,6 +68,17 @@ const GROUPS: { title: string; items: Item[] }[] = [
         hint: "长镜头的时长上限（平静段的呼吸镜头）" },
     ],
   },
+  {
+    title: "人声闪避（渲染混音）",
+    items: [
+      { k: "DUCK_BGM_LEVEL", label: "人声段音乐保留量", type: "float", min: 0.1, max: 1,
+        hint: "人声出现时 BGM 保留的音量比例。0.65 = 音乐轻轻让位（默认）；越小压得越狠" },
+      { k: "DUCK_VOICE_LEVEL", label: "人声抬升量", type: "float", min: 0.1, max: 1,
+        hint: "人声段原声升到的音量。0.8 = 浮在音乐上（默认）；1 = 拉满会显得突兀" },
+      { k: "DUCK_MERGE_GAP_SEC", label: "人声窗合并间隔 (秒)", type: "float", min: 0, max: 6,
+        hint: "两段人声间隔小于此值时合并成一段，音乐中间不回弹（防音量泵动），默认 2" },
+    ],
+  },
 ];
 
 function Field({ item, value, onSave }: {
