@@ -838,7 +838,7 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
         )} />
         {onTogglePick && (
           <button
-            title={picked ? "取消选择" : a.asset_type === "audio" ? "选为项目音乐" : "加入项目素材"}
+            title={picked ? "取消选择" : a.asset_type === "audio" ? "选为项目音乐(可多选,应用时 AI 自动融合)" : "加入项目素材"}
             className={cn(
               "absolute top-2.5 left-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold transition-all",
               picked
@@ -1315,8 +1315,11 @@ export default function AssetsView({
   const [detail, setDetail] = useState<Asset | null>(null);
   // manual selection: video/image hashes (multi) + audio hash (single)
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [pickedAudio, setPickedAudio] = useState("");
+  // audio picks are an ORDERED list: >1 selection auto-fuses via the AI BGM
+  // mixer on apply (the pipeline itself consumes exactly one music track)
+  const [pickedAudios, setPickedAudios] = useState<string[]>([]);
   const [pickApplied, setPickApplied] = useState(false);
+  const [fusing, setFusing] = useState(false);
   // command-bar popovers
   const [modelsOpen, setModelsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -1350,14 +1353,16 @@ export default function AssetsView({
     const inProj = new Set(project.videos.map(normPath));
     setPicked(new Set(assets.filter((a) => a.asset_type !== "audio" && inProj.has(normPath(assetPath(a)))).map((a) => a.content_hash)));
     const audio = assets.find((a) => a.asset_type === "audio" && project.audio && normPath(assetPath(a)) === normPath(project.audio));
-    setPickedAudio(audio?.content_hash ?? "");
+    setPickedAudios(audio ? [audio.content_hash] : []);
     setPickApplied(false);
   }, [assets, project.id]);
 
   const togglePick = (a: Asset) => {
     setPickApplied(false);
     if (a.asset_type === "audio") {
-      setPickedAudio((h) => (h === a.content_hash ? "" : a.content_hash));
+      setPickedAudios((l) => (l.includes(a.content_hash)
+        ? l.filter((h) => h !== a.content_hash)
+        : [...l, a.content_hash]));
     } else {
       setPicked((s) => {
         const n = new Set(s);
@@ -1368,13 +1373,42 @@ export default function AssetsView({
   };
 
   const pickedVideos = assets.filter((a) => picked.has(a.content_hash));
-  const pickedAudioAsset = assets.find((a) => a.content_hash === pickedAudio);
+  const pickedAudioAssets = pickedAudios
+    .map((h) => assets.find((a) => a.content_hash === h))
+    .filter(Boolean) as Asset[];
 
-  const applyPick = () => {
+  const applyPick = async () => {
+    let audioPath = pickedAudioAssets[0] ? assetPath(pickedAudioAssets[0]) : "";
+    if (pickedAudioAssets.length > 1) {
+      // more than one song → auto-fuse into ONE track (the pipeline's music
+      // engine consumes a single timeline); AI arranges measured sections
+      setFusing(true);
+      try {
+        const target = Math.round((project.targetLength || 60) * 1.25 + 20);
+        const r = await api<any>("/api/bgm/stitch", {
+          method: "POST",
+          body: JSON.stringify({
+            mode: "ai", target_sec: target,
+            tracks: pickedAudioAssets.map((a) => ({ path: assetPath(a) })),
+          }),
+        });
+        audioPath = r.path;
+        const planTxt = (r.plan ?? [])
+          .map((p: any, i: number) => `${i + 1}. [${p.role || "段"}] ${p.track} ${Math.round(p.start)}–${Math.round(p.end)}s`)
+          .join("\n");
+        window.alert(
+          `已自动融合 ${pickedAudioAssets.length} 首为一条 BGM(${Math.round(r.meta?.total ?? 0)}s):\n${planTxt}`
+          + (r.why ? `\nAI:${r.why}` : "")
+          + `\n\n已设为项目音乐:${r.path}`);
+      } catch (e: any) {
+        window.alert(`多首音乐自动融合失败:${e.message}\n将改用第一首「${pickedAudioAssets[0].file_name}」作为项目音乐。`);
+      }
+      setFusing(false);
+    }
     setProject((p) => ({
       ...p,
       videos: pickedVideos.map(assetPath),
-      audio: pickedAudioAsset ? assetPath(pickedAudioAsset) : p.audio,
+      audio: audioPath || p.audio,
       selectionRationale: "手动选材",
     }));
     setPickApplied(true);
@@ -1974,7 +2008,7 @@ export default function AssetsView({
               {shown.map((a, i) => (
                 <AssetCard
                   key={a.content_hash} a={a} index={i} onOpen={() => setDetail(a)}
-                  picked={a.asset_type === "audio" ? a.content_hash === pickedAudio : picked.has(a.content_hash)}
+                  picked={a.asset_type === "audio" ? pickedAudios.includes(a.content_hash) : picked.has(a.content_hash)}
                   onTogglePick={a.asset_type === "image" ? undefined : () => togglePick(a)}
                   hearted={hearts.has(a.content_hash)}
                   onToggleHeart={() => toggleHeart(a)}
@@ -2003,7 +2037,7 @@ export default function AssetsView({
           )}
 
           {/* manual selection apply bar */}
-          {(pickedVideos.length > 0 || pickedAudioAsset) && (
+          {(pickedVideos.length > 0 || pickedAudioAssets.length > 0) && (
             <div className="sticky bottom-3 z-20 mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-slate-900/95 px-4 py-2.5 shadow-[0_0_24px_rgba(0,0,0,0.5)]">
               <span className="text-sm font-semibold text-cyan-300">手动选材：</span>
               {pickedVideos.map((a) => (
@@ -2011,28 +2045,32 @@ export default function AssetsView({
                   <Film className="mr-1 h-3 w-3" />{a.file_name || a.file_path}
                 </Badge>
               ))}
-              {pickedAudioAsset && (
-                <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
-                  <Music2 className="mr-1 h-3 w-3" />{pickedAudioAsset.file_name || pickedAudioAsset.file_path}
+              {pickedAudioAssets.map((a, i) => (
+                <Badge key={a.content_hash} variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
+                  <Music2 className="mr-1 h-3 w-3" />{pickedAudioAssets.length > 1 ? `${i + 1}. ` : ""}{a.file_name || a.file_path}
                 </Badge>
-              )}
+              ))}
               <div className="ml-auto flex items-center gap-2">
                 {pickApplied ? (
                   <span className="text-xs text-emerald-400">✓ 已写入项目 — 切到「项目编辑」运行流水线</span>
                 ) : (
                   <span className="text-[11px] text-slate-500">
-                    {pickedVideos.length} 视频{pickedAudioAsset ? " · 1 音乐" : " · 未选音乐"}
+                    {pickedVideos.length} 视频
+                    {pickedAudioAssets.length === 0 ? " · 未选音乐"
+                      : pickedAudioAssets.length === 1 ? " · 1 音乐"
+                        : ` · ${pickedAudioAssets.length} 音乐(应用时 AI 自动融合成一条)`}
                   </span>
                 )}
                 <Button variant="outline" size="sm" className="h-7 border-white/10 bg-white/[0.04] text-xs"
-                  onClick={() => { setPicked(new Set()); setPickedAudio(""); setPickApplied(false); }}>
+                  onClick={() => { setPicked(new Set()); setPickedAudios([]); setPickApplied(false); }}>
                   清空
                 </Button>
                 <Button size="sm"
                   className="h-7 gap-1 bg-cyan-500 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
-                  disabled={pickedVideos.length === 0}
+                  disabled={pickedVideos.length === 0 || fusing}
                   onClick={applyPick}>
-                  <Pin className="h-3 w-3" /> 应用到项目
+                  {fusing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pin className="h-3 w-3" />}
+                  {fusing ? "AI 融合音乐中…" : "应用到项目"}
                 </Button>
               </div>
             </div>
