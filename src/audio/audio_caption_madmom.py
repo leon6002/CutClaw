@@ -111,7 +111,8 @@ Output ONLY valid JSON (no markdown, no explanation):
   "summary": "Description of genre, instrumentation, and overall mood",
   "emotion": "Primary emotional tone (e.g., energetic, melancholic, uplifting, tense, romantic, triumphant, mysterious, nostalgic)",
   "energy": "Energy character in words (e.g., 'building intensity', 'calm and steady', 'explosive climax', 'gradually fading')",
-  "rhythm": "Rhythmic feel in words (e.g., 'driving electronic beat', 'relaxed groove', 'slow ambient pulse', 'free tempo, atmospheric')"
+  "rhythm": "Rhythmic feel in words (e.g., 'driving electronic beat', 'relaxed groove', 'slow ambient pulse', 'free tempo, atmospheric')",
+  "instruments": ["2-5 dominant instruments/sound sources actually heard, lowercase english (e.g. 'piano', 'strings', 'female vocals', 'electronic drums', 'synth pad')"]
 }"""
 
 AUDIO_SECTION_NAMING_PROMPT = """You are a professional music analyst. The track's structural sections

@@ -465,6 +465,27 @@ def annotate_audio_asset(
                     sec_lines.append(f"{name} {start}-{end}")
             sections_summary = ", ".join(sec_lines) if sec_lines else ""
 
+            # Per-section instruments, aggregated from the sub-segment captions
+            # (each sub-segment lists what it actually HEARS; the section keeps
+            # the most frequent ones) — rendered under the section labels.
+            sections_detail = []
+            for sec in sections:
+                _subs = (sec.get("detailed_analysis") or {}).get("sections") or []
+                _cnt: dict = {}
+                for _ss in _subs:
+                    for _ins in (_ss.get("instruments") or []):
+                        _k = str(_ins).strip().lower()
+                        if _k:
+                            _cnt[_k] = _cnt.get(_k, 0) + 1
+                sections_detail.append({
+                    "name": sec.get("name", ""),
+                    "start": sec.get("Start_Time", ""),
+                    "end": sec.get("End_Time", ""),
+                    "instruments": [k for k, _ in sorted(_cnt.items(), key=lambda x: -x[1])[:4]],
+                })
+            if not any(d["instruments"] for d in sections_detail):
+                sections_detail = []   # pre-instruments caches: omit the field
+
             # Ask LLM to distill the analysis into our compact format
             import litellm
             distill_prompt = AUDIO_ANNOTATION_PROMPT.format(
@@ -510,6 +531,8 @@ def annotate_audio_asset(
                             parsed["structure_notes"] = _llm_sections
                         if sections_summary:
                             parsed["sections_summary"] = sections_summary
+                        if sections_detail:
+                            parsed["sections_detail"] = sections_detail
                         return AudioAnnotation(**parsed)
                 except Exception:
                     if attempt == 1:
@@ -524,6 +547,7 @@ def annotate_audio_asset(
                 energy_level="medium",
                 bpm=_measured_bpm_from_caption(caption_data, metadata.content_hash) or 0.0,
                 sections_summary=sections_summary,
+                sections_detail=sections_detail,
                 tags=[],
                 quality_score=5.0,
                 suggested_use="",

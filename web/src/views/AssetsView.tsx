@@ -22,7 +22,7 @@ import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import { AudioKeypointsChart, QualityCurve } from "../components/Charts";
-import AudioTimeline, { parseSectionTimes, SectionsBar } from "../components/flow/AudioTimeline";
+import AudioTimeline, { attachInstruments, parseSectionTimes, SectionsBar } from "../components/flow/AudioTimeline";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
 import LocalGpuPanel from "../components/LocalGpuPanel";
@@ -158,7 +158,9 @@ function ColorSwatches({ colors }: { colors: any[] }) {
 }
 
 function AnnotationTable({ ann }: { ann: Record<string, any> }) {
-  const entries = Object.entries(ann).filter(([, v]) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0));
+  const entries = Object.entries(ann).filter(([k, v]) =>
+    k !== "sections_detail"   // rendered on the waveform timeline labels
+    && v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0));
   const known = entries.filter(([k]) => FIELD_LABELS[k]);
   const unknown = entries.filter(([k]) => !FIELD_LABELS[k]);
   const rows = [...known, ...unknown];
@@ -396,9 +398,10 @@ function DetailView({
   const onLocal = track === "local";
   const ann = (onLocal ? asset.annotation_local : asset.annotation) ?? {};
   const hasAnn = onLocal ? !!asset.annotated_local : asset.annotated;
-  // timed sections for the waveform player (parsed from sections_summary)
+  // timed sections for the waveform player (parsed from sections_summary),
+  // enriched with per-section instruments when the annotation carries them
   const audioSections = asset.asset_type === "audio" && typeof ann.sections_summary === "string"
-    ? parseSectionTimes(ann.sections_summary) : [];
+    ? attachInstruments(parseSectionTimes(ann.sections_summary), ann.sections_detail) : [];
   const audioDur = typeof ann.duration_sec === "number" && ann.duration_sec > 0
     ? ann.duration_sec
     : (asset.duration_sec || (audioSections.length ? audioSections[audioSections.length - 1].end : 0));

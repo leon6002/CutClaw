@@ -6,7 +6,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { mediaUrl } from "../../api";
 import type { AssetInfo } from "./WorkflowCanvas";
-import AudioTimeline, { parseSectionTimes, SectionsBar } from "./AudioTimeline";
+import AudioTimeline, { attachInstruments, parseSectionTimes, SectionsBar } from "./AudioTimeline";
 
 const FIELD_LABELS: Record<string, string> = {
   summary: "摘要", emotion: "情绪", tags: "标签", visual_tags: "视觉标签",
@@ -72,9 +72,10 @@ export default function AssetPanel({ asset, onClose }: { asset: AssetInfo; onClo
   const isAudio = asset.asset_type === "audio";
   const ann = asset.annotation ?? {};
   const src = mediaUrl(asset.path);
-  // timed sections for the audio timeline (parsed from sections_summary)
+  // timed sections for the audio timeline (parsed from sections_summary),
+  // with per-section instruments when the annotation carries them
   const sectionTimes = isAudio && typeof ann.sections_summary === "string"
-    ? parseSectionTimes(ann.sections_summary) : [];
+    ? attachInstruments(parseSectionTimes(ann.sections_summary), ann.sections_detail) : [];
   const audioDur = typeof ann.duration_sec === "number" && ann.duration_sec > 0
     ? ann.duration_sec : (sectionTimes.length ? sectionTimes[sectionTimes.length - 1].end : 0);
   // Show only populated fields — same rule as the library's AnnotationTable, so
@@ -84,6 +85,7 @@ export default function AssetPanel({ asset, onClose }: { asset: AssetInfo; onClo
   const entries = Object.entries(ann).filter(([k, v]) => {
     if (k === "key_colors") return false;   // rendered as swatches above
     if (k === "sections_summary" && sectionTimes.length > 0) return false;
+    if (k === "sections_detail") return false;   // rendered on the timeline labels
     const empty = v === null || v === undefined || v === "" || (Array.isArray(v) && v.length === 0);
     return !empty;
   });

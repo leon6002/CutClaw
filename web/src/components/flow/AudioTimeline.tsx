@@ -6,7 +6,7 @@ import { Loader2, Pause, Play, Volume2, VolumeX } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "../../api";
 
-export interface Section { name: string; start: number; end: number }
+export interface Section { name: string; start: number; end: number; instruments?: string[] }
 
 // beat/energy/pitch keypoint lanes — color + Chinese label per madmom method
 const KP_META: Record<string, { color: string; label: string }> = {
@@ -50,6 +50,18 @@ export function parseSectionTimes(text: string): Section[] {
     if (isFinite(start) && isFinite(end) && end > start) out.push({ name: m[1].trim(), start, end });
   }
   return out;
+}
+
+/** Merge annotation.sections_detail (per-section instruments) into parsed
+ *  sections — same source order, so index-matched with a name sanity check. */
+export function attachInstruments(secs: Section[], detail: any[] | undefined): Section[] {
+  if (!Array.isArray(detail) || detail.length === 0) return secs;
+  return secs.map((s, i) => {
+    const d = detail[i];
+    const ok = d && (!d.name || !s.name || String(d.name).toLowerCase() === s.name.toLowerCase());
+    const inst = ok && Array.isArray(d.instruments) ? d.instruments.filter(Boolean) : [];
+    return inst.length > 0 ? { ...s, instruments: inst } : s;
+  });
 }
 
 const N_BARS = 150;
@@ -162,12 +174,19 @@ export default function AudioTimeline({ src, sections, duration, seekRef, keypoi
         const block = Math.max(1, Math.floor(data.length / N_BARS));
         const out: number[] = [];
         for (let i = 0; i < N_BARS; i++) {
-          let max = 0;
-          for (let j = 0; j < block; j++) { const v = Math.abs(data[i * block + j] || 0); if (v > max) max = v; }
-          out.push(max);
+          // RMS, not per-block PEAK: modern masters are limited, so peaks sit
+          // at the ceiling for every loud passage and the middle of the song
+          // rendered as a flat wall — loudness (what the ear tracks) has far
+          // more shape.
+          let sum = 0;
+          for (let j = 0; j < block; j++) { const v = data[i * block + j] || 0; sum += v * v; }
+          out.push(Math.sqrt(sum / block));
         }
-        const peak = Math.max(...out, 0.01);
-        if (!cancelled) setPeaks(out.map((v) => Math.min(1, (v / peak) ** 0.85)));
+        // normalize by the 95th percentile (a single hit shouldn't flatten
+        // the rest), gentle gamma for visibility of quiet parts
+        const sorted = [...out].sort((a, b) => a - b);
+        const ref = sorted[Math.floor(sorted.length * 0.95)] || 0.01;
+        if (!cancelled) setPeaks(out.map((v) => Math.min(1, (v / ref) ** 0.7)));
         ctx.close();
       } catch { if (!cancelled) setPeaks(decorativePeaks(src, N_BARS)); }
       finally { if (!cancelled) setDecoding(false); }
@@ -206,8 +225,10 @@ export default function AudioTimeline({ src, sections, duration, seekRef, keypoi
     return () => { seekRef.current = null; };
   }, [total]);
 
-  // bilingual labels stack on two lines → reserve more room at the bottom.
-  const labelPx = showZh ? 30 : 20;
+  // bilingual labels stack on two lines → reserve more room at the bottom;
+  // an instruments line (when annotated) adds one more.
+  const hasInstruments = sections.some((s) => (s.instruments?.length ?? 0) > 0);
+  const labelPx = (showZh ? 30 : 20) + (hasInstruments ? 12 : 0);
 
   return (
     <div className="rounded-xl border border-violet-500/20 bg-gradient-to-b from-violet-500/[0.06] to-slate-900/40 p-3">
@@ -283,10 +304,22 @@ export default function AudioTimeline({ src, sections, duration, seekRef, keypoi
                     <span className="block truncate text-[8.5px] leading-[12px] text-slate-500">
                       {s.name}
                     </span>
+                    {(s.instruments?.length ?? 0) > 0 && (
+                      <span className="block truncate text-[8px] leading-[11px] text-slate-600" title={s.instruments!.join(", ")}>
+                        🎹 {s.instruments!.join(" · ")}
+                      </span>
+                    )}
                   </span>
                 ) : (
-                  <span className="block truncate px-1 text-[9.5px] leading-5"
-                    style={{ color: secColors[i] }}>{s.name}</span>
+                  <span className="block px-1">
+                    <span className="block truncate text-[9.5px] leading-5"
+                      style={{ color: secColors[i] }}>{s.name}</span>
+                    {(s.instruments?.length ?? 0) > 0 && (
+                      <span className="block truncate text-[8px] leading-[11px] text-slate-600" title={s.instruments!.join(", ")}>
+                        🎹 {s.instruments!.join(" · ")}
+                      </span>
+                    )}
+                  </span>
                 )}
               </div>
             );

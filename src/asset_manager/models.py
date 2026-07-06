@@ -97,6 +97,7 @@ class AudioAnnotation(BaseModel):
     bpm: float = Field(default=0.0, description="Estimated BPM")
     sections_summary: str = Field(default="", description="MEASURED section list 'Name start-end, …' (drives the UI timeline; never LLM-written)")
     structure_notes: str = Field(default="", description="LLM prose narrative of the musical journey (complements the measured list)")
+    sections_detail: list = Field(default_factory=list, description="Per-section detail [{name,start,end,instruments:[…]}] — instruments aggregated from sub-segment captions")
     tags: list[str] = Field(default_factory=list)
     quality_score: float = Field(default=5.0, ge=0.0, le=10.0, description="Subjective quality 0-10")
     suggested_use: str = Field(default="", description="e.g. 'climax sequence', 'intro build-up', 'montage'")
