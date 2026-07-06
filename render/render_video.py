@@ -1588,18 +1588,21 @@ def render_video_ffmpeg(
                 )
             else:
                 bgm_outro_fade_expr = "1.0"
-            # voice-highlight ducking: inside each window the BGM drops to
-            # DUCK_BGM_LEVEL (default 50% — 25% felt like the music vanished,
-            # user feedback) and the ORIGINAL audio fades in, with 0.3s ramps
-            # on both sides — voices/laughter play over softened music
+            # voice-highlight ducking: inside each window the BGM eases to
+            # DUCK_BGM_LEVEL (default 65%) and the ORIGINAL audio fades in to
+            # DUCK_VOICE_LEVEL (default 80%), 0.3s ramps on both sides — the
+            # voices sit ON TOP of the music instead of replacing it (25%/100%
+            # felt like the music vanished and the voices jumped out)
             _DUCK_R = 0.3
-            _duck_level = 0.5
+            _duck_level = 0.65   # BGM keeps 65% under voices (50% still dipped too hard)
+            _voice_level = 0.8   # voices ride ON TOP of the music, not replace it
             try:
                 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 if _root not in sys.path:
                     sys.path.insert(0, _root)
                 from src import config as _dcfg
-                _duck_level = min(1.0, max(0.1, float(getattr(_dcfg, "DUCK_BGM_LEVEL", 0.5))))
+                _duck_level = min(1.0, max(0.1, float(getattr(_dcfg, "DUCK_BGM_LEVEL", 0.65))))
+                _voice_level = min(1.0, max(0.1, float(getattr(_dcfg, "DUCK_VOICE_LEVEL", 0.8))))
             except Exception:  # noqa: BLE001
                 pass
             duck_env = None
@@ -1644,8 +1647,10 @@ def render_video_ffmpeg(
 
                 orig_volume_expr = f"if(lt(t,{hook_dialogue_duration}),1.0,{original_audio_volume})"
                 if duck_env:
-                    # original audio rises to full inside duck windows
-                    orig_volume_expr = f"min(1,({orig_volume_expr})+{duck_env})"
+                    # original audio rises to DUCK_VOICE_LEVEL (not full) inside duck
+                    # windows — full-volume voices jumped out of the mix (user
+                    # feedback); the hook-dialogue region stays at 1.0 untouched
+                    orig_volume_expr = f"min(1,({orig_volume_expr})+{_voice_level:.2f}*{duck_env})"
                 filter_parts = []
 
                 orig_input_label = "0:a"
