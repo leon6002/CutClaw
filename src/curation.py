@@ -20,7 +20,9 @@ the project step only merges them and maps moments onto merged scene indices.
 import json
 import os
 
-_POOL_VERSION = 7   # v7: camera-motion signature (direction/push/chaos) per moment
+_POOL_VERSION = 8   # v8: long-take chains — contiguous segments merge into ≤12s
+                    # candidates so slow-pacing slots (5-9s) have real supply
+                    # (v7: camera-motion signature per moment)
 
 # GLOBAL positive taste memory — user likes apply across every project.
 LIKES_PATH = os.path.join("Output", "asset_index", "likes.json")
@@ -57,28 +59,6 @@ def load_rejections() -> list:
         return []
 
 
-def _upgrade_pool_v5(moments: list) -> list | None:
-    """Backfill dHash (v6) + camera-motion (v7) signatures on an older pool."""
-    try:
-        from src.utils.stability import visual_hashes, measure_stability
-        for m in moments:
-            vp = m.get("video_path") or ""
-            here = bool(vp and os.path.exists(vp))
-            if not m.get("phash"):
-                m["phash"] = (visual_hashes(vp, float(m.get("start", 0)), float(m.get("end", 0)))
-                              if here else [])
-            if not m.get("motion"):
-                if here:
-                    _st = measure_stability(vp, float(m.get("start", 0)), float(m.get("end", 0)),
-                                            samples=3)
-                    m["motion"] = _st.get("motion") or {"type": "unmeasured"}
-                else:
-                    m["motion"] = {"type": "unmeasured"}
-        return moments
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _source_pool(content_hash: str) -> list:
     """Build (or load) the scored moment list for ONE analyzed source."""
     from src.analyzer import get_analysis_path
@@ -90,19 +70,10 @@ def _source_pool(content_hash: str) -> list:
                 d = json.load(f)
             if int(d.get("version", 0)) >= _POOL_VERSION:
                 return d.get("moments", [])
-            if int(d.get("version", 0)) in (5, 6) and d.get("moments"):
-                # v5/v6 → v7 upgrade: only dHash + motion signatures are new —
-                # the trims and quality scores are expensive and unchanged, so
-                # backfill signatures instead of rebuilding the whole pool
-                up = _upgrade_pool_v5(d.get("moments", []))
-                if up is not None:
-                    try:
-                        with open(pool_path, "w", encoding="utf-8") as f:
-                            json.dump({"version": _POOL_VERSION, "moments": up}, f,
-                                      ensure_ascii=False, indent=1)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return up
+            # v8 adds long-take CHAIN candidates — they only exist by re-scanning
+            # the captioned segments, so older pools (incl. v5-v7) fully rebuild.
+            # (The v5/v6 signature-backfill shortcut is retired: it would stamp
+            # a chain-less pool as current.)
         except Exception:  # noqa: BLE001
             pass
 
@@ -133,7 +104,16 @@ def _source_pool(content_hash: str) -> list:
     if not os.path.isdir(ckpt_dir):
         return []
 
-    # gather candidate segments first so progress has a real total
+    # gather candidate segments first so progress has a real total.
+    # LONG-TAKE CHAINS (pool v8): contiguous captioned segments WITHIN one
+    # detected shot merge into longer candidates (≤12s). Single segments cap
+    # at their own span (median ~4s in practice), so slow-pacing slots (5-9s)
+    # had NO supply — 25/29 anchors once came up shorter than their slot and
+    # the film drifted off the beat grid. Chains never cross ckpt files: a
+    # file boundary IS a detected hard cut, and a "moment" must not contain
+    # one. The per-second clean-run scan below still trims wobble inside a
+    # chain; description comes from the chain's first segment.
+    _CHAIN_CAP = 12.0
     seen = set()
     candidates = []
     for fn in sorted(os.listdir(ckpt_dir)):
@@ -144,6 +124,7 @@ def _source_pool(content_hash: str) -> list:
                 d = json.load(f)
         except Exception:  # noqa: BLE001
             continue
+        file_cands = []
         for seg in d.get("dense_segments") or []:
             try:
                 s = float(seg.get("start_sec_abs"))
@@ -153,7 +134,24 @@ def _source_pool(content_hash: str) -> list:
             if e - s < 1.6 or (round(s, 1), round(e, 1)) in seen:
                 continue
             seen.add((round(s, 1), round(e, 1)))
-            candidates.append((s, e, seg))
+            file_cands.append((s, e, seg))
+        file_cands.sort(key=lambda c: c[0])
+        chains = []
+        for i, (s0, e0, seg0) in enumerate(file_cands):
+            # only chain from HEAD segments (nothing contiguous right before)
+            if any(0.0 <= s0 - e2 <= 0.25 for (_s2, e2, _g) in file_cands if e2 <= s0):
+                continue
+            cur_e = e0
+            for (s1, e1, _g) in file_cands[i + 1:]:
+                if s1 - cur_e > 0.25 or e1 - s0 > _CHAIN_CAP:
+                    break
+                cur_e = max(cur_e, e1)
+            if cur_e - e0 > 0.5:                   # chain actually adds length
+                key = (round(s0, 1), round(cur_e, 1))
+                if key not in seen:
+                    seen.add(key)
+                    chains.append((s0, cur_e, seg0))
+        candidates.extend(file_cands + chains)
 
     # live progress for the UI (polled via the details endpoint). No model
     # calls happen here — VLM scores are read from the annotation cache;
@@ -357,13 +355,14 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
                 m["hearted_source"] = True
 
     # Blogger-gem bonus (user-calibrated): a steady, coherent camera move
-    # (glide/pan/push — NOT chaotic) at the pro travel-reel length of 3-6s
-    # is exactly the material worth surfacing first.
+    # (glide/pan/push — NOT chaotic) at pro travel-reel length. Upper bound
+    # follows the v8 chains: a clean 8s glide is exactly what slow-pacing
+    # slots (5-9s) need surfaced first.
     for m in pool:
         _mo = m.get("motion") or {}
         if (float(m.get("stability", -1)) >= 7.0
                 and _mo.get("type") not in (None, "chaotic", "unmeasured")
-                and 3.0 <= float(m.get("duration", 0)) <= 6.0):
+                and 3.0 <= float(m.get("duration", 0)) <= 9.0):
             m["score"] = round(m["score"] + 0.06, 3)
             m["gem"] = True
 

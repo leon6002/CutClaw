@@ -2506,11 +2506,27 @@ class ParallelShotOrchestrator:
                     except Exception as e:
                         print(f"Worker failed for shot {k}: {e}")
                         res = None
+                # DURATION FUSE: a committed clip shorter than the floor is a
+                # flash frame, not a shot (an agent once shipped 0.78s against
+                # a 6.5s slot and it sailed straight into the render). Too
+                # short → discard, let the deterministic fallback find a real
+                # window; a fallback that is also too short means FAILED.
+                _floor = max(1.0, float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)))
+                if res and float(res.get('total_duration') or 0.0) < _floor - 1e-6:
+                    print(f"⚠️ [DurationFuse] shot {k}: committed "
+                          f"{float(res.get('total_duration') or 0.0):.2f}s < floor {_floor:.1f}s "
+                          f"— discarded, deterministic fallback takes over", flush=True)
+                    res = None
                 if not res:
                     # 100%-success guarantee: an agent failure must not leave a
                     # hole — take a free window on the assigned footage instead
                     res = self._fallback_pick(shot, s_idx, shot_idx,
                                               base_forbidden + local_ranges)
+                    if res and float(res.get('total_duration') or 0.0) < _floor - 1e-6:
+                        print(f"⚠️ [DurationFuse] shot {k}: fallback also below floor "
+                              f"({float(res.get('total_duration') or 0.0):.2f}s) — marked FAILED "
+                              f"instead of shipping a flash frame", flush=True)
+                        res = None
                     if res:
                         self._append_result_to_output(k, res)
                 out[k] = res

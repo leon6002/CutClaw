@@ -199,6 +199,16 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
 - **断点续跑**：编剧三步（选音乐段落/结构提案/分镜脚本）逐步写 `{output}.progress.json`（按 instruction 键控，换指令自动失效）；失败后重跑零成本跳过已完成步骤，成功后删除（最终 shot_plan.json 即检查点）。实测：分镜步失败→重跑，前两步零 API 复用。
 - **实现**：`_call_agent_litellm`（错误分类+抛错）、`generate_shot_plan_with_retry`（空回复抛错）、`generate_structure_proposal_with_retry`（异常不再吞掉盲重试）、`Screenwriter.run`（progress checkpoint）。
 
+### 槽长-供给匹配：长镜链 + 时长保险丝（2026-07-06）
+- **症状**：节奏参数调到 5-9s 后，180s 项目 29 镜中 25 个锚点比槽短（池时刻中位 4.0s、最长 <6.4s），实际镜头平均 6.02s vs 计划 6.4s，累计漂移 ~19s——切点从第 3 镜起全面脱离节拍网格；另有 agent 提交过 0.78s 闪帧镜头（目标 6.5s）无人拦截。
+- **根因**：池的时刻长度天花板 = 单个密集描述段的跨度，与节奏参数（槽长）没有联动；agent/兜底路径没有时长下限校验。
+- **修法**：
+  1. **长镜链（池 v8）**：同一检测镜头（同 ckpt 文件）内连续的密集段合并成 ≤12s 的链候选，逐秒干净扫描照常裁边；**绝不跨 ckpt 文件**——文件边界就是检测到的硬切，"时刻"里不能包含剪辑点。旧池（≤v7）全量重建（v5/v6 只补签名的捷径已废除，否则会把无链池标成当前版）。
+  2. **精华加分带宽 3-6s → 3-9s**（稳定运动的长镜正是慢节奏槽要的）。
+  3. **编剧菜单 LENGTH FIT 规则**：优先选时长 ≥ 槽长的时刻（菜单本就展示时长），不够长才接受短时刻+未实测补边。
+  4. **时长保险丝（orchestrator）**：任何路径（agent/锚定/兜底）提交的镜头 < `MIN_ACCEPTABLE_SHOT_DURATION` 即弃用转确定性兜底；兜底也短则标 FAILED——宁可画布上亮红灯也不出 0.8s 闪帧。
+- **顺带**：AI 转场 prompt 明确 hblur 是速度特效，平静曲目几乎只用 fade/dissolve/cut（用户口味）。
+
 ### 编排器（`ParallelShotOrchestrator.run_parallel`，src/core.py）
 - **按源分组**：同源镜头串行（前面的选择进后面的禁选区 → 结构上杜绝同源重叠），不同源并行（`PARALLEL_SHOT_MAX_WORKERS`）。
 - **容量守卫**：派发前按"每源需求 vs 供给"重平衡，把超订源上最小的镜头挪到最空的源（解决"最后一个镜头只剩边角料"）。大镜头先选（长窗口优先）。
