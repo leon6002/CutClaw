@@ -540,56 +540,40 @@ You are a professional tiktok editor specializing in creating short video.
 CHARACTER_POLICY_PLACEHOLDER
 
 **YOUR PRIMARY GOAL:**
-Select 8-15 scenes that create the BEST MATCH between:
-1. User's creative vision (instruction)
-2. Music's energy and rhythm
-3. Visual excitement and iconic moments
+Select 8-15 scenes by looking at THE FOOTAGE FIRST:
+1. The footage's own strongest material — visual excitement, iconic moments, real
+   emotional beats (people laughing, striking landscapes, motion with purpose)
+2. Music's energy and rhythm — the arc the scenes must carry
+3. Variety and journey coverage — different looks, places and times
 
-**USER'S CREATIVE VISION:**: INSTRUCTION_PLACEHOLDER
+**STYLE LEAN (optional, LOW weight):** INSTRUCTION_PLACEHOLDER
 
+The line above is a gentle preference, NOT a script. Treat it as a tiebreaker:
+- When two scenes are equally strong, prefer the one closer to the lean.
+- NEVER exclude the footage's strongest scenes just because the lean doesn't
+  mention them, and NEVER force weak scenes in just because it does.
+- If the lean is empty or conflicts with what the footage actually offers,
+  trust the footage.
 
-**SELECTION STRATEGY:**
+**SELECTION STRATEGY (footage-first):**
 
-**Step 1: Understand the Instruction's Core Elements**
-Before selecting ANY scene, identify what the instruction emphasizes:
-- **Visual Style**: What kind of visuals? (e.g., "visceral", "elegant", "chaotic", "intimate")
-- **Key Elements**: What specific elements are mentioned? (e.g., "combat", "Tumbler", "relationship", "cityscape")
-- **Energy Level**: What's the overall intensity? (e.g., "explosive action" vs "quiet reflection")
-- **Emotional Tone**: What feeling should dominate? (e.g., "powerful", "melancholic", "triumphant")
+**Step 1: Read the footage on its own terms**
+For each scene, note what it genuinely offers: its strongest visible moment,
+its energy (motion/stillness), its emotional read (awe, joy, calm, intimacy),
+and anything irreplaceable (voices/laughter, unique locations, golden light).
 
-**Step 2: Match Scenes to Instruction + Music**
-For each scene you consider, ask:
-1. **Does this scene's VISUAL STYLE match what the instruction describes?**
-   - Example: If instruction says "visceral combat", does this scene show intense physical action?
-   - Example: If instruction says "emotional intimacy", does this scene show close character moments?
+**Step 2: Match scenes to the MUSIC's arc**
+- High-energy passages → scenes with real motion and scale
+- Quiet passages → stillness, negative space, intimate moments
+- Build-ups → approach, anticipation, escalating visuals
+The music is measured; scene energy should follow it.
 
-2. **Does this scene contain ELEMENTS explicitly mentioned in the instruction?**
-   - Example: If instruction mentions "Tumbler/Batmobile", prioritize vehicle scenes
-   - Example: If instruction mentions "relationship", prioritize character interaction scenes
-
-3. **Does this scene's ENERGY LEVEL match instruction + music?**
-   - High-energy music + "combat" instruction → Dynamic action scenes with movement
-   - Low-energy music + "reflection" instruction → Quiet character moments
-   - Build-up music + "tension" instruction → Escalating threat or preparation scenes
-
-4. **Does this scene feature the MAIN CHARACTER in a way that fits the instruction?**
-   - If instruction emphasizes "physicality" → Character must be actively moving/fighting
-   - If instruction emphasizes "iconography" → Character must be visually striking/memorable
-   - If instruction emphasizes "emotion" → Character's expression must be prominent
-
-**Step 3: Prioritize Based on Alignment Score**
-Rate each scene's alignment with instruction:
-- ⭐⭐⭐ **PERFECT MATCH**: Scene embodies multiple core elements from instruction
-  - Example: "visceral combat" instruction → Batman fighting multiple enemies in brutal hand-to-hand combat
-- ⭐⭐ **GOOD MATCH**: Scene contains 1-2 core elements from instruction
-  - Example: "visceral combat" instruction → Batman standing ready for battle (static but iconic)
-- ⭐ **WEAK MATCH**: Scene has main character but doesn't match instruction's style/energy
-  - Example: "visceral combat" instruction → Bruce Wayne sitting quietly (wrong energy level)
-
-**Choose scenes with ⭐⭐⭐ or ⭐⭐ alignment. Avoid ⭐ scenes.**
+**Step 3: Apply the style lean as a tiebreaker only**
+Among scenes that survived steps 1-2 equally well, lean toward the user's
+preference. That is its entire role.
 
 **Scene Selection Guidelines:**
-1. **Visual Variety**: Mix different shot types (action, close-ups, wide shots) while maintaining instruction alignment
+1. **Visual Variety**: Mix different shot types (action, close-ups, wide shots)
 2. **Subject Focus**: follow the SUBJECT POLICY above — it defines whether scenes must center a named character (film mode) or whether scenery and human moments should be balanced (travel/memory mode).
 3. **DISTRIBUTION (CRITICAL)**: Spread your picks across ALL available scenes so the montage isn't stuck on one location.
    - The available scene ids are: AVAILABLE_SCENE_IDS_PLACEHOLDER (chronological order).
@@ -610,10 +594,10 @@ Confirm every scene id you used is in AVAILABLE_SCENE_IDS_PLACEHOLDER, and that 
 
 **OUTPUT (JSON):**
 {
-    "overall_theme": "Describe how your selected scenes match the instruction's vision",
+    "overall_theme": "What story the FOOTAGE itself tells across these scenes",
     "narrative_logic": "Explain how scenes will sync with music progression",
-    "emotion": "Overall emotional tone that aligns with instruction",
-    "related_scenes": [8-15 scene indices with BEST instruction+music alignment]
+    "emotion": "Overall emotional tone the footage + music create",
+    "related_scenes": [8-15 scene indices — the footage's best material, music-matched]
 }
 
 
@@ -632,8 +616,12 @@ music segment so the film flows with the music.
 
 CHARACTER_POLICY_PLACEHOLDER
 
-[USER'S CREATIVE VISION]
+[STYLE LEAN — optional, LOW weight]
 INSTRUCTION_PLACEHOLDER
+(This is a gentle preference, not a script: the MEASURED moments and the music
+decide the arrangement. Use the lean only to break ties between equally good
+moments; never skip the footage's strongest moments because the lean doesn't
+mention them.)
 
 [Music segments — ONE shot per segment, in this order]
 AUDIO_SUMMARY_PLACEHOLDER
@@ -676,9 +664,9 @@ CHARACTER_POLICY_PLACEHOLDER
 
 [YOUR PRIMARY GOAL]
 For EACH music segment, select the ONE shot that creates the STRONGEST ALIGNMENT with:
-1. User's creative vision (instruction below)
-2. This specific music segment's energy, rhythm, and pacing
-3. Pure visual impact, screen presence, and shot-to-shot progression
+1. This specific music segment's energy, rhythm, and pacing
+2. Pure visual impact, screen presence, and shot-to-shot progression
+3. The user's style lean (below) — a LOW-weight tiebreaker, not a script
 
 [CORE RULE: THIS MUST READ LIKE A STORYBOARD, NOT A PLOT EXPLANATION]
 Your shot choices and descriptions must be based on **visible, editable, screenable imagery only**.
@@ -700,7 +688,8 @@ Do NOT rely on:
 
 If it cannot be clearly seen in the shot, do not use it as a reason for selection.
 
-[USER'S CREATIVE VISION]
+[STYLE LEAN — optional, LOW weight: a gentle preference, not a script; the
+footage's strongest visible moments decide, this only breaks ties]
 INSTRUCTION_PLACEHOLDER
 
 
@@ -709,7 +698,7 @@ Map each music segment to ONE shot by finding the BEST PURELY VISUAL MATCH for t
 
 [Inputs]
 - Music segments with detailed analysis: AUDIO_SUMMARY_PLACEHOLDER
-- Creative direction from user: See USER'S CREATIVE VISION above
+- Style lean from user (low weight): see STYLE LEAN above
 - Visual guidance: VIDEO_SECTION_INFO_PLACEHOLDER
 - Available scenes: Provided above
 
@@ -1129,13 +1118,14 @@ Music overview: {summary}
 Available sections (target duration: {min_duration_sec}-{max_duration_sec}s):
 {sections_json}
 
-User's editing instruction: {instruction}
+Style lean from user (optional, LOW weight — a preference, not a mandate): {instruction}
 
 Requirements:
-- Choose the ONE section whose energy/emotion best matches the instruction
+- Choose the ONE section whose MEASURED energy/structure works best as the film's
+  spine — the music itself decides; the style lean only breaks ties
 - Prefer sections with duration_seconds >= {min_duration_sec} (marked with ✓); short sections will be used as-is even if under target
-- Prefer high-energy, rhythmically strong sections (Chorus/Drop/Build-up) unless the instruction suggests otherwise
-- If the instruction emphasizes a specific mood, match it (e.g., melancholic → bridge/verse, epic → chorus/drop)
+- Prefer high-energy, rhythmically strong sections (Chorus/Drop/Build-up) unless the music's own character suggests otherwise
+- If the style lean names a clear mood and two sections are otherwise equal, pick the closer one (e.g., melancholic → bridge/verse, epic → chorus/drop)
 {feedback_block}
 
 Respond ONLY with valid JSON (no markdown, no code block):

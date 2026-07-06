@@ -432,10 +432,10 @@ export default function EditorView({
             </div>
 
             <div>
-              <FieldLabel>剪辑指令</FieldLabel>
+              <FieldLabel>创作倾向<span className="ml-1.5 text-[10px] font-normal text-slate-500">轻量提示 — AI 以素材实测为主,此处只在同等素材间倾斜偏好</span></FieldLabel>
               <Textarea
                 rows={3} value={p.instruction} disabled={running}
-                placeholder="描述你想要的剪辑效果…"
+                placeholder="一句风格/情绪偏好即可,如「宁静自然,空灵人声」— 不必详细指定内容,AI 会自己读素材…"
                 className="border-white/10 bg-black/25"
                 onChange={(e) => set({ instruction: e.target.value })}
               />
@@ -568,7 +568,7 @@ export default function EditorView({
             <div className="flex gap-2">
               <Button
                 className="flex-1 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_18px_rgba(34,211,238,0.35)] hover:bg-cyan-400"
-                disabled={running || fusion?.state === "running" || p.videos.length === 0 || !p.audio || !p.instruction.trim()}
+                disabled={running || fusion?.state === "running" || p.videos.length === 0 || !p.audio}
                 onClick={start}
               >
                 {fusion?.state === "running" ? <Loader2 className="h-4 w-4 animate-spin" />
@@ -580,11 +580,10 @@ export default function EditorView({
                 <Square className="h-3.5 w-3.5" /> 停止
               </Button>
             </div>
-            {(p.videos.length === 0 || !p.audio || !p.instruction.trim()) && (
+            {(p.videos.length === 0 || !p.audio) && (
               <div className="mt-2 text-xs text-slate-500">
                 {p.videos.length === 0 ? "请先选择视频素材（或在素材库中「智能选材」）。"
-                  : !p.audio ? "请选择一首音乐。"
-                  : "请填写剪辑指令。"}
+                  : "请选择一首音乐。"}
               </div>
             )}
           </CardContent>
