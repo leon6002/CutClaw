@@ -68,6 +68,8 @@ export default function EditorView({
   const [paramSug, setParamSug] = useState<{ target_length: number; shot_length: number; rationale: string } | null>(null);
   const [paramSugLoading, setParamSugLoading] = useState(false);
   const [paramSugError, setParamSugError] = useState("");
+  // multi-music fusion pre-step status (runs right before the pipeline)
+  const [fusion, setFusion] = useState<{ state: "running" | "done" | "error"; detail: string } | null>(null);
 
   const p = project;
   const job = pipelineJob;
@@ -128,11 +130,43 @@ export default function EditorView({
 
   const start = async () => {
     setError("");
+    let audioPath = p.audio;
+    // WORKFLOW PRE-STEP: multiple songs were selected → fuse them into ONE
+    // BGM HERE, where the target length is actually known (fusing at asset-
+    // apply time once produced a 51s track for a 220s film). The fused mp3
+    // becomes the project audio; re-running with the same set+target reuses
+    // the previous fusion (audio already points at a BGMmix file).
+    const needFuse = (p.audios?.length ?? 0) > 1
+      && !/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "");
+    if (needFuse) {
+      setFusion({ state: "running", detail: `AI 正在把 ${p.audios!.length} 首音乐按目标 ${Math.round(p.targetLength * 1.25 + 20)}s 融合…` });
+      try {
+        const r = await api<any>("/api/bgm/stitch", {
+          method: "POST",
+          body: JSON.stringify({
+            mode: "ai",
+            target_sec: Math.round(p.targetLength * 1.25 + 20),
+            tracks: p.audios!.map((a) => ({ path: a })),
+            video_paths: p.videos,
+          }),
+        });
+        audioPath = r.path;
+        set({ audio: r.path });
+        const planTxt = (r.plan ?? [])
+          .map((x: any, i: number) => `${i + 1}.[${x.role || "段"}] ${x.track} ${Math.round(x.start)}–${Math.round(x.end)}s`)
+          .join("  ");
+        setFusion({ state: "done", detail: `已融合为 ${Math.round(r.meta?.total ?? 0)}s:${planTxt}${r.why ? " — " + r.why : ""}` });
+      } catch (e: any) {
+        setFusion({ state: "error", detail: `融合失败:${e.message} — 已改用第一首音乐` });
+        audioPath = p.audios![0];
+        set({ audio: audioPath });
+      }
+    }
     try {
       const r = await api<any>("/api/pipeline/start", {
         method: "POST",
         body: JSON.stringify({
-          video_paths: p.videos, audio_path: p.audio, instruction: p.instruction,
+          video_paths: p.videos, audio_path: audioPath, instruction: p.instruction,
           has_dialogue: p.hasDialogue, main_character: p.mainCharacter, srt_path: p.srt,
           target_length: p.targetLength, shot_length: p.shotLength,
           project_id: p.id,
@@ -373,14 +407,31 @@ export default function EditorView({
               )}
             </div>
 
+            {(p.audios?.length ?? 0) > 1 && !/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
+              <div className="mb-2 rounded-lg border border-violet-500/25 bg-violet-500/[0.06] px-3 py-2 text-[11.5px] text-violet-300/90">
+                🎵 已选 {p.audios!.length} 首音乐 — 运行时会先按目标时长(约 {Math.round(p.targetLength * 1.25 + 20)}s)AI 融合成一条 BGM,再启动流水线。
+              </div>
+            )}
+            {fusion && (
+              <div className={cn(
+                "mb-2 rounded-lg border px-3 py-2 text-[11.5px] leading-relaxed",
+                fusion.state === "running" ? "border-violet-400/40 bg-violet-500/10 text-violet-200"
+                  : fusion.state === "done" ? "border-emerald-500/30 bg-emerald-500/[0.07] text-emerald-300"
+                    : "border-amber-500/30 bg-amber-500/[0.07] text-amber-300",
+              )}>
+                {fusion.state === "running" && <Loader2 className="mr-1.5 inline h-3.5 w-3.5 animate-spin" />}
+                {fusion.state === "done" ? "✓ " : ""}步骤 0 · BGM 融合:{fusion.detail}
+              </div>
+            )}
             <div className="flex gap-2">
               <Button
                 className="flex-1 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_18px_rgba(34,211,238,0.35)] hover:bg-cyan-400"
-                disabled={running || p.videos.length === 0 || !p.audio || !p.instruction.trim()}
+                disabled={running || fusion?.state === "running" || p.videos.length === 0 || !p.audio || !p.instruction.trim()}
                 onClick={start}
               >
-                {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                {running ? "运行中…" : "运行流水线"}
+                {fusion?.state === "running" ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                {fusion?.state === "running" ? "AI 融合音乐中…" : running ? "运行中…" : "运行流水线"}
               </Button>
               <Button variant="destructive" className="gap-1.5 bg-red-500/15 text-red-400 hover:bg-red-500/25"
                 disabled={!running} onClick={stop}>

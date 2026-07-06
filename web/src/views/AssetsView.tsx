@@ -55,6 +55,8 @@ export interface Asset {
   /** journey metadata from the original recording */
   capture_time?: string | null;
   location?: string | null;
+  /** AI-synthesized BGM mix (has a .bgmmix.json recipe sidecar) */
+  bgmmix?: boolean;
 }
 
 /** "12-13 15:02" from an ISO capture time */
@@ -475,6 +477,7 @@ function DetailView({
                 onTime={(t) => setAudioTime(t)}
               />
             : <audio ref={videoRef as any} src={src} controls className="w-full" />}
+          {asset.bgmmix && <BgmRecipePanel path={asset.absolute_path || asset.file_path} />}
           {/* full-width detailed beat chart, aligned under the waveform (no
               horizontal padding so its plot area lines up with the wave) */}
           <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] py-2">
@@ -939,6 +942,12 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
                 🖥 Q {fmtVal((a.annotation_local ?? {}).quality_score)}
               </Badge>
             )}
+            {a.bgmmix && (
+              <Badge variant="outline" className="border-violet-400/50 bg-violet-500/15 text-[11px] text-violet-300"
+                title="AI 合成的 BGM(多首音乐融合)— 详情页可看成分与编排理由">
+                🤖 AI 合成
+              </Badge>
+            )}
             {tags.map((t, i) => (
               <Badge key={i} variant="outline" className={cn("text-[11px]", TAG_CLS)}>{t}</Badge>
             ))}
@@ -1122,6 +1131,58 @@ function AnnotationProgress({ meta, jobId, onOpenWorkbench }: {
 
       {/* ③ per-file segment grids (reset on every file server-side) */}
       <TaskGrids tasks={meta.tasks ?? {}} jobId={jobId} onOpenWorkbench={onOpenWorkbench} />
+    </div>
+  );
+}
+
+// ── AI-synthesized BGM: recipe panel (成分 / 编排理由 / 应用到的项目) ─────────
+function BgmRecipePanel({ path }: { path: string }) {
+  const [data, setData] = useState<{ recipe: any; used_in: string[] } | null>(null);
+  useEffect(() => {
+    setData(null);
+    api<any>(`/api/bgm/recipe?path=${encodeURIComponent(path)}`)
+      .then(setData).catch(() => setData({ recipe: null, used_in: [] }));
+  }, [path]);
+  if (!data?.recipe) return null;
+  const r = data.recipe;
+  const plan: any[] = Array.isArray(r.plan) ? r.plan : [];
+  const segs: any[] = Array.isArray(r.segments) ? r.segments : [];
+  return (
+    <div className="rounded-xl border border-violet-500/25 bg-violet-500/[0.05] p-3.5">
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-violet-300">
+        🤖 AI 合成配方
+        <span className="font-normal text-slate-500">
+          总长 {r.total?.toFixed?.(0)}s
+          {r.target_sec ? ` · 目标 ${Math.round(r.target_sec)}s` : ""}
+          {r.joins?.length ? ` · 衔接 ${r.joins.map((j: number) => `${j}s`).join("/")}` : ""}
+          {r.fade_in ? ` · 淡入 ${r.fade_in}s` : ""}{r.fade_out ? ` · 淡出 ${r.fade_out}s` : ""}
+        </span>
+        {(data.used_in?.length ?? 0) > 0 && (
+          <span className="ml-auto flex flex-wrap items-center gap-1">
+            <span className="font-normal text-slate-500">应用于:</span>
+            {data.used_in.map((n, i) => (
+              <Badge key={i} variant="outline" className="border-cyan-500/40 bg-cyan-500/10 text-[10.5px] text-cyan-300">{n}</Badge>
+            ))}
+          </span>
+        )}
+      </div>
+      <div className="space-y-1 text-[12px] text-slate-300">
+        {(plan.length > 0 ? plan : segs).map((p: any, i: number) => (
+          <div key={i} className="flex flex-wrap items-center gap-1.5">
+            <span className="font-mono text-[10.5px] text-violet-400">{i + 1}.</span>
+            {p.role && <Badge variant="outline" className="h-4 border-violet-400/40 bg-violet-500/10 px-1.5 text-[10px] text-violet-300">{p.role}</Badge>}
+            <span className="min-w-0 truncate">{p.track || p.name}</span>
+            <span className="font-mono text-[11px] text-slate-500">
+              {Math.round(p.start ?? 0)}–{Math.round(p.end ?? 0)}s
+            </span>
+          </div>
+        ))}
+      </div>
+      {r.why && (
+        <div className="mt-2 rounded-lg bg-black/25 px-2.5 py-1.5 text-[11.5px] leading-relaxed text-slate-400">
+          <span className="text-violet-300/80">AI 编排理由:</span>{r.why}
+        </div>
+      )}
     </div>
   );
 }
@@ -1322,7 +1383,6 @@ export default function AssetsView({
   // mixer on apply (the pipeline itself consumes exactly one music track)
   const [pickedAudios, setPickedAudios] = useState<string[]>([]);
   const [pickApplied, setPickApplied] = useState(false);
-  const [fusing, setFusing] = useState(false);
   // command-bar popovers
   const [modelsOpen, setModelsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
@@ -1380,40 +1440,16 @@ export default function AssetsView({
     .map((h) => assets.find((a) => a.content_hash === h))
     .filter(Boolean) as Asset[];
 
-  const applyPick = async () => {
-    let audioPath = pickedAudioAssets[0] ? assetPath(pickedAudioAssets[0]) : "";
-    if (pickedAudioAssets.length > 1) {
-      // more than one song → auto-fuse into ONE track (the pipeline's music
-      // engine consumes a single timeline); AI arranges measured sections
-      setFusing(true);
-      try {
-        const target = Math.round((project.targetLength || 60) * 1.25 + 20);
-        const r = await api<any>("/api/bgm/stitch", {
-          method: "POST",
-          body: JSON.stringify({
-            mode: "ai", target_sec: target,
-            tracks: pickedAudioAssets.map((a) => ({ path: assetPath(a) })),
-            // the fusion arranges the musical arc to SERVE this footage
-            video_paths: pickedVideos.map(assetPath),
-          }),
-        });
-        audioPath = r.path;
-        const planTxt = (r.plan ?? [])
-          .map((p: any, i: number) => `${i + 1}. [${p.role || "段"}] ${p.track} ${Math.round(p.start)}–${Math.round(p.end)}s`)
-          .join("\n");
-        window.alert(
-          `已自动融合 ${pickedAudioAssets.length} 首为一条 BGM(${Math.round(r.meta?.total ?? 0)}s):\n${planTxt}`
-          + (r.why ? `\nAI:${r.why}` : "")
-          + `\n\n已设为项目音乐:${r.path}`);
-      } catch (e: any) {
-        window.alert(`多首音乐自动融合失败:${e.message}\n将改用第一首「${pickedAudioAssets[0].file_name}」作为项目音乐。`);
-      }
-      setFusing(false);
-    }
+  const applyPick = () => {
+    // selection ONLY — fusing multiple songs happens as a pipeline pre-step
+    // in 项目编辑, where the target length is actually known (fusing here
+    // once produced a 51s BGM for a 220s film: the target wasn't set yet)
+    const audioPaths = pickedAudioAssets.map(assetPath);
     setProject((p) => ({
       ...p,
       videos: pickedVideos.map(assetPath),
-      audio: audioPath || p.audio,
+      audio: audioPaths[0] || p.audio,
+      audios: audioPaths,
       selectionRationale: "手动选材",
     }));
     setPickApplied(true);
@@ -1602,6 +1638,10 @@ export default function AssetsView({
           : (!a.annotated && !a.annotated_local))
     .filter((a) => !tagFilter || assetTags(a).includes(tagFilter))
     .sort((a, b) => {
+      // AI-synthesized mixes display FIRST in the audio wall (they're project
+      // artifacts, not raw material — keep them visually apart)
+      const gm = Number(!!b.bgmmix) - Number(!!a.bgmmix);
+      if (gm !== 0) return gm;
       if (sortBy === "time_desc") return (b.capture_time ?? "").localeCompare(a.capture_time ?? "");
       if (sortBy === "time_asc") {
         // assets without capture time sink to the end
@@ -2064,7 +2104,7 @@ export default function AssetsView({
                     {pickedVideos.length} 视频
                     {pickedAudioAssets.length === 0 ? " · 未选音乐"
                       : pickedAudioAssets.length === 1 ? " · 1 音乐"
-                        : ` · ${pickedAudioAssets.length} 音乐(应用时 AI 自动融合成一条)`}
+                        : ` · ${pickedAudioAssets.length} 音乐(运行流水线前按目标时长自动融合)`}
                   </span>
                 )}
                 <Button variant="outline" size="sm" className="h-7 border-white/10 bg-white/[0.04] text-xs"
@@ -2073,10 +2113,9 @@ export default function AssetsView({
                 </Button>
                 <Button size="sm"
                   className="h-7 gap-1 bg-cyan-500 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
-                  disabled={pickedVideos.length === 0 || fusing}
+                  disabled={pickedVideos.length === 0}
                   onClick={applyPick}>
-                  {fusing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pin className="h-3 w-3" />}
-                  {fusing ? "AI 融合音乐中…" : "应用到项目"}
+                  <Pin className="h-3 w-3" /> 应用到项目
                 </Button>
               </div>
             </div>

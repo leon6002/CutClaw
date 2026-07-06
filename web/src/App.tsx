@@ -31,6 +31,9 @@ export interface ProjectState {
   name: string;
   videos: string[];
   audio: string;
+  /** multi-music selection — fused into ONE track as a pipeline PRE-STEP
+   *  (when the target length is actually known); audio then points at it */
+  audios?: string[];
   instruction: string;
   hasDialogue: boolean;
   mainCharacter: string;

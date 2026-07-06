@@ -1302,6 +1302,15 @@ def _assets_with_annotations(assets: list) -> list:
             d["location"] = mm.get("location")
         except Exception:  # noqa: BLE001
             pass
+        # AI-synthesized BGM mixes carry a .bgmmix.json recipe sidecar —
+        # flagged so the UI shows them apart from original music
+        try:
+            _ap = d.get("absolute_path") or ""
+            if _ap and d.get("asset_type") == "audio" \
+                    and os.path.exists(os.path.splitext(_ap)[0] + ".bgmmix.json"):
+                d["bgmmix"] = True
+        except Exception:  # noqa: BLE001
+            pass
         out.append(d)
     return out
 
@@ -2851,6 +2860,36 @@ def replace_shot(body: ShotReplaceRequest):
             "moment": {"id": m.get("id"), "score": m.get("score"), "desc": m.get("desc", "")[:120]}}
 
 
+@app.get("/api/bgm/recipe")
+def bgm_recipe(path: str):
+    """Recipe of an AI-synthesized BGM (segments/roles/rationale from the
+    .bgmmix.json sidecar) + which projects currently use it."""
+    ap = _resolve(path)
+    sc = os.path.splitext(ap)[0] + ".bgmmix.json"
+    recipe = None
+    if os.path.exists(sc):
+        try:
+            with open(sc, "r", encoding="utf-8") as f:
+                recipe = json.load(f)
+        except Exception:  # noqa: BLE001
+            pass
+    used = []
+    try:
+        import glob as _g
+        for pj in _g.glob(os.path.join(PROJECTS_DIR, "*", "project.json")):
+            try:
+                with open(pj, "r", encoding="utf-8") as f:
+                    pdata = json.load(f)
+                pa = _resolve(str(pdata.get("audio") or ""))
+                if pa and os.path.normcase(os.path.normpath(pa)) == os.path.normcase(os.path.normpath(ap)):
+                    used.append(pdata.get("name") or os.path.basename(os.path.dirname(pj)))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return {"recipe": recipe, "used_in": used}
+
+
 class ShotLikeRequest(BaseModel):
     shot_point: str
     section_idx: int
@@ -3113,6 +3152,19 @@ def bgm_stitch(body: BgmStitchRequest):
         meta = stitch_bgm(tracks, out_path, crossfade=body.crossfade)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"拼接失败: {e}")
+    # enrich the recipe sidecar with the ARRANGEMENT so the asset detail page
+    # can explain the mix (which segments, what roles, the AI's rationale)
+    if plan_view or plan_why:
+        try:
+            _sc = os.path.splitext(out_path)[0] + ".bgmmix.json"
+            with open(_sc, "r", encoding="utf-8") as f:
+                _d = json.load(f)
+            _d.update({"plan": plan_view, "why": plan_why, "mode": body.mode,
+                       "target_sec": float(body.target_sec or 0)})
+            with open(_sc, "w", encoding="utf-8") as f:
+                json.dump(_d, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
     rel = os.path.relpath(out_path, PROJECT_ROOT).replace("\\", "/")
     return {"ok": True, "path": rel, "meta": meta, "plan": plan_view, "why": plan_why}
 
