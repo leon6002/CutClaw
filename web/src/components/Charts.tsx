@@ -135,12 +135,18 @@ export function AudioKeypointsChart({ path, duration, onSeek, playhead }: {
   playhead?: number;
 }) {
   const [data, setData] = useState<Record<string, any[]> | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [retryN, setRetryN] = useState(0);
 
   useEffect(() => {
     setData(null);
+    setFailed(false);
     api<Record<string, any[]>>(`/api/audio/keypoints?path=${encodeURIComponent(path)}`)
-      .then(setData).catch(() => setData({}));
-  }, [path]);
+      .then(setData)
+      // a transient fetch failure (e.g. backend mid-restart) must not render
+      // as "没有数据" forever — flag it so the user can retry
+      .catch(() => { setFailed(true); setData({}); });
+  }, [path, retryN]);
 
   const series = useMemo(() => {
     if (!data) return [];
@@ -158,6 +164,14 @@ export function AudioKeypointsChart({ path, duration, onSeek, playhead }: {
   }, [data]);
 
   if (data === null) return <Hint>加载节奏关键点…</Hint>;
+  if (failed) {
+    return (
+      <Hint>
+        节奏数据加载失败(后端可能正在重启)—{" "}
+        <button className="text-cyan-300 underline" onClick={() => setRetryN((n) => n + 1)}>重试</button>
+      </Hint>
+    );
+  }
   if (series.length === 0 || series.every((s) => s.data.length === 0)) {
     return <Hint>还没有节奏分析数据 — 标注或运行流水线后生成</Hint>;
   }
@@ -171,7 +185,9 @@ export function AudioKeypointsChart({ path, duration, onSeek, playhead }: {
         option={{
           tooltip: { ...TOOLTIP, formatter: (p: any) => `${p.seriesName}<br/>${p.value[0].toFixed(2)}s · 强度 ${p.value[1].toFixed(2)}` },
           legend: { textStyle: { color: "#94a3b8", fontSize: 11 }, top: 0 },
-          grid: { left: 34, right: 14, top: 30, bottom: 24 },
+          // left/right insets chosen to line the plot area up with the waveform
+          // player stacked above it (AudioTimeline's timeline starts ~16px in).
+          grid: { left: 26, right: 16, top: 30, bottom: 24 },
           xAxis: { type: "value", name: "s", min: 0, max: duration, axisLabel: AXIS, splitLine: SPLIT },
           yAxis: { type: "value", min: 0, max: 1, axisLabel: AXIS, splitLine: SPLIT },
           // attach a synced playhead markLine to the first series (no dummy
