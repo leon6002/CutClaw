@@ -29,6 +29,8 @@ const GROUPS: { title: string; items: Item[] }[] = [
         hint: "送 VLM 的帧数上限（运动感知选帧）；0 = 不限，更准更贵" },
       { k: "SOUND_HIGHLIGHT_THRESHOLD", label: "声音高光灵敏度", type: "float", min: 0.1, max: 0.9,
         hint: "自动标注用的 VAD 阈值：越低越灵敏、段落更宽。0.3 灵敏 / 0.5 标准 / 0.65 严格" },
+      { k: "AUDIO_BATCH_SIZE", label: "音频描述并发数", type: "int", min: 1, max: 20,
+        hint: "音乐分段 LLM 描述的并发请求数（标注与流水线共用）；越大越快，受 API 限流约束" },
     ],
   },
   {

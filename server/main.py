@@ -401,6 +401,7 @@ CONFIG_KEYS = [
     "AGENT_LITELLM_MODEL", "AGENT_LITELLM_URL", "AGENT_LITELLM_API_KEY",
     # concurrency knobs — maximize hardware/API utilization during annotation
     "ANNOTATE_VIDEO_WORKERS", "CAPTION_BATCH_SIZE", "VIDEO_CAPTION_MAX_FRAMES",
+    "AUDIO_BATCH_SIZE",
     # Immich integration
     "IMMICH_URL", "IMMICH_API_KEY", "IMMICH_PATH_MAP",
     # pipeline tuning (参数设置 UI)

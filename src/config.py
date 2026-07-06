@@ -359,8 +359,8 @@ AUDIO_WEIGHT_MEL_ENERGY = 1.0
 # Defaults use equal weighting.
 
 # ----- Keypoint caption analysis (Level-2) -----
-AUDIO_BATCH_SIZE = 8
-# Batch size for parallel audio-segment inference.
+AUDIO_BATCH_SIZE = 10
+# Batch size for parallel audio-segment inference (cloud API concurrency).
 # Larger values increase throughput but use more resources.
 
 AUDIO_KEYPOINT_TEMPERATURE = 0.7
