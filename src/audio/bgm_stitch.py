@@ -53,6 +53,36 @@ def _duration(path: str) -> float:
         return 0.0
 
 
+def _extract_json_obj(text: str):
+    """Last parseable balanced {...} in the text — reasoning models bury the
+    final answer after thinking prose that itself contains braces, so a
+    greedy first-to-last regex spans garbage."""
+    try:
+        v = json.loads(text)
+        return v if isinstance(v, dict) else None
+    except Exception:  # noqa: BLE001
+        pass
+    spans = []
+    depth, start = 0, -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, i + 1))
+    for s, e in reversed(spans):
+        try:
+            v = json.loads(text[s:e])
+            if isinstance(v, dict):
+                return v
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _snap(t: float, bar: float, lo: float, hi: float) -> float:
     """Snap a time to the nearest bar-grid line, clamped to [lo, hi]."""
     if bar and bar > 0.5:
@@ -96,21 +126,31 @@ def _fallback_plan(infos: list, target_sec: float) -> list:
     stays as given. 100%-success rule: never fail if material exists."""
     per = max(20.0, target_sec / max(1, len(infos)))
     picks = []
-    for info in infos:
+    for k, info in enumerate(infos):
         segs = info["segments"]
         if not segs:
             picks.append({"path": info["path"], "start": None, "end": None})
             continue
-        peak = max(range(len(segs)), key=lambda i: segs[i]["energy"])
-        lo = hi = peak
+        if k == 0:
+            # OPENING anchors at the track's own intro (a mid-track excerpt
+            # sounds like a radio switched on halfway)
+            lo, hi = 0, 0
+        elif k == len(infos) - 1:
+            # ENDING anchors at the track's final section (natural landing)
+            lo = hi = len(segs) - 1
+        else:
+            lo = hi = max(range(len(segs)), key=lambda i: segs[i]["energy"])
         while (segs[hi]["end"] - segs[lo]["start"]) < per:
             left = lo - 1 if lo > 0 else None
             right = hi + 1 if hi < len(segs) - 1 else None
             if left is None and right is None:
                 break
-            # expand toward the more energetic neighbor
-            if right is None or (left is not None
-                                 and segs[left]["energy"] >= segs[right]["energy"]):
+            if k == 0 and right is not None:
+                hi = right          # opening grows forward from the intro
+            elif k == len(infos) - 1 and left is not None:
+                lo = left           # ending grows backward from the outro
+            elif right is None or (left is not None
+                                   and segs[left]["energy"] >= segs[right]["energy"]):
                 lo = left
             else:
                 hi = right
@@ -148,6 +188,11 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0) -> tuple:
         "calm opening → build → peak → gentle resolve.\n"
         "Rules:\n"
         "- Reference sections ONLY by index; never invent times.\n"
+        "- OPENING must sound like a real beginning: strongly prefer a run that STARTS at "
+        "some track's section 0 (its own intro) — an excerpt from mid-track sounds like a "
+        "radio switched on halfway.\n"
+        "- ENDING must land: the last run should END on falling/low energy, ideally a track's "
+        "final section — never cut off mid-peak.\n"
         "- Neighboring picks should differ in bpm by <25% when possible.\n"
         "- Prefer joins where the outgoing run ends falling/steady and the incoming starts low "
         "and building — that is where a crossfade disappears.\n"
@@ -174,7 +219,7 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0) -> tuple:
                 # reasoning models think BEFORE replying and share the token
                 # budget; a small cap truncates the answer to empty
                 kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}],
-                              temperature=0.4, max_tokens=8000, timeout=120)
+                              temperature=0.4, max_tokens=16000, timeout=180)
                 if base:
                     kwargs["api_base"] = base
                 if key:
@@ -186,11 +231,15 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0) -> tuple:
                     content = str(getattr(msg, "reasoning_content", "") or "").strip()
                 if content.startswith("```"):
                     content = _re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", content)
-                m = _re.search(r"\{.*\}", content, _re.DOTALL)
-                parsed = json.loads(m.group(0) if m else content)
+                parsed = _extract_json_obj(content)
+                if parsed is None:
+                    raise ValueError(f"no parseable JSON object in reply (len={len(content)})")
                 if isinstance(parsed, dict) and isinstance(parsed.get("plan"), list):
                     plan, why = parsed["plan"], str(parsed.get("why", ""))[:200]
                     break
+                # parsed but shape wrong — say WHAT came back so failures are diagnosable
+                print(f"[BGMmix] {model}: JSON parsed but no plan list "
+                      f"(keys={list(parsed)[:6] if isinstance(parsed, dict) else type(parsed).__name__})")
             except Exception as e:  # noqa: BLE001
                 print(f"[BGMmix] plan via {model} failed: {str(e)[:120]}")
     except Exception:  # noqa: BLE001
@@ -268,18 +317,39 @@ def stitch_bgm(tracks: list, out_path: str, crossfade: float = 0.0) -> dict:
         cf = min(cf, segs[k]["duration"] / 2.0, segs[k + 1]["duration"] / 2.0)
         joins.append(round(cf, 2))
 
+    # Head/tail polish — the user's ear: a mix that starts mid-phrase or stops
+    # at a section boundary feels 没头没尾. When the first pick is NOT the
+    # track's own beginning, ease in over ~1 bar; when the last pick is NOT
+    # the track's natural ending, breathe out over ~2 bars.
+    _first, _last = segs[0], segs[-1]
+    fade_in = 0.0
+    if _first["start"] > 1.0:
+        fade_in = round(max(1.5, min(3.0, float(_first.get("bar_sec") or 2.0))), 2)
+    fade_out = 0.0
+    _last_dur = _duration(_last["path"])
+    if _last_dur and _last["end"] < _last_dur - 1.0:
+        fade_out = round(max(3.0, min(6.0, 2.0 * float(_last.get("bar_sec") or 2.0))), 2)
+
     cmd = ["ffmpeg", "-y", "-v", "error"]
     for sg in segs:
         cmd += ["-ss", str(sg["start"]), "-t", str(sg["duration"]), "-i", sg["path"]]
-    parts = [
-        f"[{i}:a]loudnorm=I=-18.0:LRA=11.0:TP=-1.5,aformat=sample_rates=48000:channel_layouts=stereo[n{i}]"
-        for i in range(len(segs))
-    ]
+    parts = []
+    for i in range(len(segs)):
+        _fx = f",afade=t=in:d={fade_in}" if (i == 0 and fade_in > 0) else ""
+        parts.append(
+            f"[{i}:a]loudnorm=I=-18.0:LRA=11.0:TP=-1.5,"
+            f"aformat=sample_rates=48000:channel_layouts=stereo{_fx}[n{i}]")
     prev = "[n0]"
     for k in range(1, len(segs)):
-        out = "[aout]" if k == len(segs) - 1 else f"[x{k}]"
+        out = "[xj]" if k == len(segs) - 1 else f"[x{k}]"
         parts.append(f"{prev}[n{k}]acrossfade=d={joins[k - 1]}:c1=tri:c2=tri{out}")
         prev = out
+    if fade_out > 0:
+        # expected chain length = segment sum minus crossfade overlaps
+        _exp = sum(s["duration"] for s in segs) - sum(joins)
+        parts.append(f"{prev}afade=t=out:st={max(0.0, _exp - fade_out):.2f}:d={fade_out}[aout]")
+    else:
+        parts.append(f"{prev}anull[aout]")
     cmd += ["-filter_complex", ";".join(parts), "-map", "[aout]",
             "-c:a", "libmp3lame", "-b:a", "320k", out_path]
 
@@ -289,6 +359,7 @@ def stitch_bgm(tracks: list, out_path: str, crossfade: float = 0.0) -> dict:
 
     total = _duration(out_path)
     meta = {"segments": segs, "joins": joins, "total": round(total, 2),
+            "fade_in": fade_in, "fade_out": fade_out,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     try:
         with open(os.path.splitext(out_path)[0] + ".bgmmix.json", "w", encoding="utf-8") as f:
