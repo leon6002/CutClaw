@@ -276,17 +276,54 @@ export default function EditorView({
             </div>
 
             <div className="mb-4">
-              <FieldLabel>音乐</FieldLabel>
-              <Select value={p.audio || undefined} onValueChange={(v) => set({ audio: v === NONE ? "" : v })} disabled={running}>
-                <SelectTrigger className="w-full border-white/10 bg-black/25">
-                  <SelectValue placeholder="选择音频…" />
-                </SelectTrigger>
-                <SelectContent>
-                  {allAudioOptions.map((a) => (
-                    <SelectItem key={a} value={a}>{basename(a)}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <FieldLabel>音乐{(p.audios?.length ?? 0) > 1 ? `(${p.audios!.length} 首 · 运行时 AI 融合)` : ""}</FieldLabel>
+              {(p.audios?.length ?? 0) > 1 ? (
+                <div className="rounded-lg border border-violet-500/25 bg-black/25 p-2">
+                  <div className="space-y-1">
+                    {p.audios!.map((a, i) => (
+                      <div key={a} className="flex items-center gap-2 text-xs text-slate-300">
+                        <span className="flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded-full border border-violet-400/50 bg-violet-500/15 font-mono text-[10px] text-violet-300">{i + 1}</span>
+                        <span className="min-w-0 flex-1 truncate">{basename(a)}</span>
+                        <button
+                          className="shrink-0 text-slate-600 hover:text-red-400"
+                          title="从融合列表移除"
+                          disabled={running}
+                          onClick={() => {
+                            const next = p.audios!.filter((x) => x !== a);
+                            set({ audios: next, audio: next[0] || "" });
+                          }}
+                        >✕</button>
+                      </div>
+                    ))}
+                  </div>
+                  {/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") ? (
+                    <div className="mt-1.5 flex items-center gap-2 border-t border-white/[0.06] pt-1.5 text-[10.5px] text-emerald-400/90">
+                      <span className="min-w-0 truncate">✓ 已融合:{basename(p.audio)}</span>
+                      <button
+                        className="ml-auto shrink-0 rounded border border-violet-400/40 bg-violet-500/10 px-1.5 py-0.5 text-violet-300 hover:bg-violet-500/20"
+                        disabled={running}
+                        title="丢弃这次融合结果,下次运行时按当前列表和目标时长重新融合"
+                        onClick={() => set({ audio: p.audios![0] || "" })}
+                      >重新融合</button>
+                    </div>
+                  ) : (
+                    <div className="mt-1.5 border-t border-white/[0.06] pt-1.5 text-[10.5px] text-violet-300/70">
+                      运行时会按目标时长 AI 融合成一条 BGM
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <Select value={p.audio || undefined} onValueChange={(v) => set({ audio: v === NONE ? "" : v, audios: v === NONE ? [] : [v] })} disabled={running}>
+                  <SelectTrigger className="w-full border-white/10 bg-black/25">
+                    <SelectValue placeholder="选择音频…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {allAudioOptions.map((a) => (
+                      <SelectItem key={a} value={a}>{basename(a)}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
             </div>
 
             <div>
