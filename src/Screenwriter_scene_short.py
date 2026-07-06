@@ -150,44 +150,73 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
     _sw_emit(phase="calling", iter=_n, elapsed=0)
     _t0 = _time.time()
 
-    # Transient SSL/network hiccups are common on large requests — retry with
-    # backoff instead of dying on the first failure (parity with the editor).
-    _max_retries = int(getattr(config, "AGENT_LLM_MAX_RETRIES", 3))
+    # RETRY POLICY (user directive, 2026-07-06): blind retries mask bugs and
+    # double API cost. ONLY network/service transients may retry (≤2 extra,
+    # loudly announced — each retry re-bills the whole prompt). Truncation and
+    # every other error FAIL FAST with a diagnostic; completed steps are
+    # checkpointed, so a re-run resumes from the breakpoint instead of re-paying.
+    _NET_RETRIES = 2
     resp = None
-    for _attempt in range(1, _max_retries + 1):
+    _attempt = 0
+    while True:
+        _attempt += 1
         try:
             resp = litellm.completion(**kwargs)
-            # DETERMINISTIC failure — don't blind-retry, retry CHANGED:
-            # finish_reason=length means the reply was cut off by max_tokens
-            # (reasoning models spend thinking tokens from the same budget).
-            # Re-sending the identical request loses identically; feedback
-            # loops even make it worse (longer prompt → more thinking →
-            # less output). Double the budget and go again instead.
-            _fr = getattr(resp.choices[0], "finish_reason", "") or ""
-            if _fr == "length" and kwargs.get("max_tokens", 0) < 65536:
-                kwargs["max_tokens"] = min(int(kwargs["max_tokens"] * 2), 65536)
-                print(f"⚠️ [Screenwriter] reply truncated at max_tokens "
-                      f"(finish_reason=length) — retrying with {kwargs['max_tokens']} tokens",
-                      flush=True)
-                continue
             break
         except Exception as _e:
+            _name = type(_e).__name__
             _msg = str(_e)[:300]
-            print(f"⚠️ [Screenwriter] LLM call failed (attempt {_attempt}/{_max_retries}): {_msg}", flush=True)
+            _transient = (
+                any(k in _name for k in ("Connection", "Timeout", "ServiceUnavailable",
+                                          "InternalServerError", "RateLimit", "APIError"))
+                or any(k in _msg.lower() for k in ("connection", "timeout", "temporarily",
+                                                    "ssl", "reset by peer", "503", "502", "429"))
+            )
+            if _transient and _attempt <= _NET_RETRIES:
+                _wait = min(2 ** _attempt, 10)
+                print(f"⚠️ [Screenwriter] 网络/服务暂时性错误（{_name}），{_wait}s 后重试 "
+                      f"{_attempt}/{_NET_RETRIES} —— 注意：每次重试都会重新计费整个 prompt："
+                      f"{_msg}", flush=True)
+                _sw_emit(
+                    phase="result", tool="screenwriter", iter=_n,
+                    elapsed=round(_time.time() - _t0), verdict="warn",
+                    result=f"网络暂时性错误，重试 {_attempt}/{_NET_RETRIES}（重试会产生额外 API 费用）：{_msg}",
+                )
+                _time.sleep(_wait)
+                continue
             _sw_emit(
                 phase="result", tool="screenwriter", iter=_n,
-                elapsed=round(_time.time() - _t0),
-                verdict=("warn" if _attempt < _max_retries else "fail"),
-                result=f"第 {_attempt}/{_max_retries} 次调用失败：{_msg}",
+                elapsed=round(_time.time() - _t0), verdict="fail",
+                result=f"LLM 调用失败（{_name}），按纪律不自动重试：{_msg}",
             )
-            if _attempt < _max_retries:
-                _time.sleep(min(2 ** _attempt, 15))
+            _sw_emit(phase="action", tool="screenwriter", iter=_n,
+                     elapsed=round(_time.time() - _t0), args=_prompt_text, reply="")
+            _sw_state("fail")
+            raise RuntimeError(
+                f"[Screenwriter] LLM 调用失败（{_name}）：{_msg}\n"
+                "按重试纪律不自动重试（只有网络类瞬时错误才重试，且已用尽/不适用）。"
+                "请排查模型配置/API 后重跑 —— 已完成的步骤有断点缓存，不会重复计费。"
+            ) from _e
 
-    if resp is None:
+    # Truncation is a BUG SIGNAL, not a budget problem: the decision-only shot
+    # plan is <1k tokens, so hitting max_tokens means the model is looping or
+    # misconfigured. Doubling the budget would re-bill the prompt AND hide it.
+    _fr = getattr(resp.choices[0], "finish_reason", "") or ""
+    if _fr == "length":
+        _sw_emit(
+            phase="result", tool="screenwriter", iter=_n,
+            elapsed=round(_time.time() - _t0), verdict="fail",
+            result=f"回复被 max_tokens={kwargs.get('max_tokens')} 截断 —— 这是异常信号，按纪律不翻倍重试",
+        )
         _sw_emit(phase="action", tool="screenwriter", iter=_n,
-                 elapsed=round(_time.time() - _t0), args=_prompt_text, reply="")
+                 elapsed=round(_time.time() - _t0), args=_prompt_text,
+                 reply=str(getattr(resp.choices[0].message, "content", "") or "")[:15000])
         _sw_state("fail")
-        return None
+        raise RuntimeError(
+            f"[Screenwriter] 回复被 max_tokens={kwargs.get('max_tokens')} 截断（finish_reason=length）。"
+            "决策瘦身后正常回复不足 1k token，出现截断说明有真问题（模型输出循环 / 思考不收敛 / 配置错误），"
+            "禁止翻倍重试掩盖 —— 请在工作台查看本次 prompt 与回复，排查后重跑（已完成步骤走断点缓存）。"
+        )
 
     try:
         content = resp.choices[0].message.content
@@ -596,37 +625,36 @@ def generate_structure_proposal_with_retry(
     if content is None:
         return None
 
+    # Retry discipline: retries here are REPAIR retries only — every re-ask
+    # carries feedback naming the problem, is loudly logged (it re-bills the
+    # prompt), and unexpected exceptions raise instead of hiding in a retry.
     last_feedback = None
     for retry in range(max_retries):
-        try:
-            parsed = parse_structure_proposal_output(content)
-            if parsed is None:
-                content = generate_structure_proposal(
-                    video_scene_path, audio_caption_path, user_instruction,
-                    selected_start_str, selected_end_str, last_feedback, main_character=main_character,
-                )
-                continue
+        parsed = parse_structure_proposal_output(content)
+        if parsed is None:
+            last_feedback = ("Your previous reply was not parseable JSON for the structure "
+                             "proposal. Return ONLY the JSON object, no prose.")
+            print("⚠️ [Screenwriter] 结构提案不是合法 JSON —— 带反馈修复性重试"
+                  "（会重新计费 prompt）", flush=True)
+            content = generate_structure_proposal(
+                video_scene_path, audio_caption_path, user_instruction,
+                selected_start_str, selected_end_str, last_feedback, main_character=main_character,
+            )
+            continue
 
-            passed, last_feedback = check_scene_distribution(parsed, usable_ids)
-            if passed:
-                return content
+        passed, last_feedback = check_scene_distribution(parsed, usable_ids)
+        if passed:
+            return content
 
-            if retry < max_retries - 1:
-                content = generate_structure_proposal(
-                    video_scene_path, audio_caption_path, user_instruction,
-                    selected_start_str, selected_end_str, last_feedback, main_character=main_character,
-                )
-            else:
-                return content
-
-        except Exception as e:
-            if retry < max_retries - 1:
-                content = generate_structure_proposal(
-                    video_scene_path, audio_caption_path, user_instruction,
-                    selected_start_str, selected_end_str, last_feedback, main_character=main_character,
-                )
-            else:
-                return content
+        if retry < max_retries - 1:
+            print(f"⚠️ [Screenwriter] 结构提案校验未过（{str(last_feedback)[:120]}）—— "
+                  "带反馈修复性重试（会重新计费 prompt）", flush=True)
+            content = generate_structure_proposal(
+                video_scene_path, audio_caption_path, user_instruction,
+                selected_start_str, selected_end_str, last_feedback, main_character=main_character,
+            )
+        else:
+            return content
 
     return content
 
@@ -1098,7 +1126,11 @@ def generate_shot_plan_with_retry(
             feedback=(last_error if attempt > 1 else None),
         )
         if not raw_shot_plan:
-            last_error = "empty response from shot plan request"
+            # a literally-empty reply would retry an IDENTICAL request — banned
+            # (errors/truncation raise inside _call_agent_litellm and never land here)
+            raise RuntimeError(
+                "[Screenwriter] 模型返回了空回复。按重试纪律不原样重试（重复请求=重复计费且结果不变）——"
+                "请在工作台查看该次调用，排查模型/参数后重跑（已完成步骤走断点缓存）。")
         else:
             parsed_shot_plan = parse_shot_plan_output(raw_shot_plan)
             is_valid, reason = _validate_shot_plan_result(
@@ -1132,7 +1164,8 @@ def generate_shot_plan_with_retry(
 
         if attempt < retries:
             wait_seconds = min(max_backoff, base_backoff * (2 ** (attempt - 1)))
-            print(f"🔄 [Screenwriter: Shot Plan] Retrying in {wait_seconds:.1f}s...")
+            print(f"🔄 [Screenwriter] 带反馈重试（{attempt + 1}/{retries}，问题：{last_error[:120]}）——"
+                  f"这是修复性重试，会重新计费整个 prompt，{wait_seconds:.1f}s 后发起", flush=True)
             time.sleep(wait_seconds)
 
     if best_plan is not None:
@@ -1626,9 +1659,41 @@ class Screenwriter:
                     _sw_stage("复用已有分镜")
                     return existing_output
 
+        # Per-step breakpoint cache (retry discipline, 2026-07-06): every LLM
+        # step checkpoints its result, so after a fail-fast a re-run resumes
+        # from the breakpoint instead of re-billing completed steps. Keyed to
+        # the instruction — a new instruction invalidates the cache.
+        progress_path = (self.output_path + ".progress.json") if self.output_path else None
+        progress: dict = {}
+        if progress_path and os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    progress = json.load(f)
+            except Exception:  # noqa: BLE001
+                progress = {}
+            if progress.get("instruction") != instruction:
+                progress = {}
+
+        def _save_progress():
+            if not progress_path:
+                return
+            try:
+                progress["instruction"] = instruction
+                with open(progress_path, "w", encoding="utf-8") as f:
+                    json.dump(progress, f, ensure_ascii=False, indent=1)
+            except Exception:  # noqa: BLE001
+                pass
+
         # Step 1: Select the audio segment first
         _sw_stage("选择音乐段落")
-        selected_start_str, selected_end_str = select_audio_segment(self.audio_db, instruction)
+        if progress.get("audio_segment"):
+            selected_start_str, selected_end_str = progress["audio_segment"]
+            print(f"⏩ [Screenwriter] 断点续跑：复用已选音乐段落 "
+                  f"{selected_start_str} → {selected_end_str}（零 API 调用）")
+        else:
+            selected_start_str, selected_end_str = select_audio_segment(self.audio_db, instruction)
+            progress["audio_segment"] = [selected_start_str, selected_end_str]
+            _save_progress()
 
         print(
             f"\n🎵 [Screenwriter] Audio segment selected: "
@@ -1637,15 +1702,21 @@ class Screenwriter:
 
         # Step 2: Generate structure proposal scoped to the selected audio segment
         _sw_stage("生成结构提案")
-        structure_proposal = generate_structure_proposal_with_retry(
-            self.video_scene_path, self.audio_caption_path, instruction,
-            selected_start_str=selected_start_str,
-            selected_end_str=selected_end_str,
-            main_character=self.main_character,
-        )
-        if structure_proposal is None:
-            raise RuntimeError("generate_structure_proposal_with_retry returned None — check API connectivity and model config")
-        structure_proposal = parse_structure_proposal_output(structure_proposal)
+        if progress.get("structure_proposal"):
+            structure_proposal = progress["structure_proposal"]
+            print("⏩ [Screenwriter] 断点续跑：复用结构提案（零 API 调用）")
+        else:
+            structure_proposal = generate_structure_proposal_with_retry(
+                self.video_scene_path, self.audio_caption_path, instruction,
+                selected_start_str=selected_start_str,
+                selected_end_str=selected_end_str,
+                main_character=self.main_character,
+            )
+            if structure_proposal is None:
+                raise RuntimeError("generate_structure_proposal_with_retry returned None — check API connectivity and model config")
+            structure_proposal = parse_structure_proposal_output(structure_proposal)
+            progress["structure_proposal"] = structure_proposal
+            _save_progress()
 
         audio_sections = self.audio_db.get('sections', [])
 
@@ -1683,13 +1754,20 @@ class Screenwriter:
                 break
 
         _sw_stage("生成分镜脚本")
-        shot_plan = generate_shot_plan_with_retry(
-            selected_sub_segments,
-            structure_proposal,
-            self.video_scene_path,
-            instruction,
-            main_character=self.main_character,
-        )
+        if progress.get("shot_plan"):
+            shot_plan = progress["shot_plan"]
+            print("⏩ [Screenwriter] 断点续跑：复用分镜脚本（零 API 调用）")
+        else:
+            shot_plan = generate_shot_plan_with_retry(
+                selected_sub_segments,
+                structure_proposal,
+                self.video_scene_path,
+                instruction,
+                main_character=self.main_character,
+            )
+            if shot_plan is not None:
+                progress["shot_plan"] = shot_plan
+                _save_progress()
         if shot_plan is None:
             raise RuntimeError(
                 "Failed to generate a valid shot plan after retries — "
@@ -1752,6 +1830,12 @@ class Screenwriter:
             with open(self.output_path, 'w', encoding='utf-8') as f:
                 json.dump(output_data, f, indent=2, ensure_ascii=False)
             print(f"\n💾 [Screenwriter] Complete shot plan saved to {self.output_path}")
+            # the final output IS the checkpoint now — drop the step cache
+            if progress_path and os.path.exists(progress_path):
+                try:
+                    os.remove(progress_path)
+                except OSError:
+                    pass
 
         return output_data
 

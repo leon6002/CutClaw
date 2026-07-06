@@ -190,7 +190,14 @@ merge_scene_summaries → Screenwriter（shot_plan：每镜头 content/emotion/�
   1. **决策专用 prompt**（`GENERATE_SHOT_PLAN_PROMPT`）：输出只有 `{"shots":[{"id","anchor_id","scene"}]}`，实测 66 镜头 ~730 token。音乐段落输入也改紧凑单行（`S{i} | 起-止 | tone | energy | rhythm | 描述`），不再 `indent=2` JSON。无锚点池时（curation 关闭）回落 `GENERATE_SHOT_PLAN_PROMPT_LEGACY`（旧全量 schema）。
   2. **`_backfill_shot_fields`**：`time_duration` 从音乐段落实测抄写（权威，顺带消灭抄错）；`emotion`/`visual_beat` 从段落的 `Emotional_Tone`/`energy·rhythm` 回填；`content` 先用段落描述作 agent 路径简报。数量不匹配（镜头数≠段落数）在校验层打回重试——回复很小，重试便宜。
   3. **`_attach_anchors._commit`**：锚定成功即用 moment 的实测 `desc` 覆盖 `content`、`motion.type` 写 `visuals`（`camera pan_left`）、`scene` 权威覆盖 `related_scene`——下游（转场选择器 / agent prompt / UI 焦点卡片）拿到的描述比模型复述更忠实。
-- **效果**：输出 9k→<1k token，截断机制上不可能，翻倍重试梯子保留当保险丝但预期不再触发。**规则：模型只输出决策，凡输入里已有或可实测的字段一律确定性回填，禁止让模型复述。**
+- **效果**：输出 9k→<1k token，截断机制上不可能。**规则：模型只输出决策，凡输入里已有或可实测的字段一律确定性回填，禁止让模型复述。**
+
+### 重试纪律（2026-07-06，用户定死）
+- **禁止盲重试/翻倍重试**：掩盖 bug + 成倍烧 API。旧的 `finish_reason=length → max_tokens 翻倍重试` 梯子已删——瘦身后截断=真异常信号（模型输出循环/配置错误），立即抛错并把 prompt+截断回复发到工作台。
+- **仅网络类瞬时错误可重试**（connection/timeout/5xx/429），最多 2 次，且日志高亮「每次重试都会重新计费整个 prompt」——绝不让用户以为一切正常。其余错误（认证/参数/空回复）一律快速失败，错误信息写明排查方向。
+- **修复性重试（带反馈的重发）允许但必须点名**：分镜校验失败/结构提案不合法时带具体反馈重发，日志明示「修复性重试，会重新计费」。原样重发同一请求 = 禁止（结果不变，纯烧钱）。
+- **断点续跑**：编剧三步（选音乐段落/结构提案/分镜脚本）逐步写 `{output}.progress.json`（按 instruction 键控，换指令自动失效）；失败后重跑零成本跳过已完成步骤，成功后删除（最终 shot_plan.json 即检查点）。实测：分镜步失败→重跑，前两步零 API 复用。
+- **实现**：`_call_agent_litellm`（错误分类+抛错）、`generate_shot_plan_with_retry`（空回复抛错）、`generate_structure_proposal_with_retry`（异常不再吞掉盲重试）、`Screenwriter.run`（progress checkpoint）。
 
 ### 编排器（`ParallelShotOrchestrator.run_parallel`，src/core.py）
 - **按源分组**：同源镜头串行（前面的选择进后面的禁选区 → 结构上杜绝同源重叠），不同源并行（`PARALLEL_SHOT_MAX_WORKERS`）。
