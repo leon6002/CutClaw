@@ -250,10 +250,13 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
         + (brief or "") + "\n"
         "Tracks with their MEASURED sections (energy 0-1, trend building/steady/falling):\n"
         + "\n".join(lines) + "\n\n"
-        "Arrange 2-4 CONTIGUOUS section runs (each from one track) into an emotional arc: "
+        "Arrange CONTIGUOUS section runs (each from one track) into an emotional arc: "
         "calm opening → build → peak → gentle resolve.\n"
         "Rules:\n"
         "- Reference sections ONLY by index; never invent times.\n"
+        "- BALANCE: with 4+ tracks provided use AT LEAST 3 of them; no single track may "
+        "exceed ~40% of the total — the user picked these songs to HEAR them.\n"
+        "- Total duration within ±10% of the target.\n"
         "- OPENING must sound like a real beginning: strongly prefer a run that STARTS at "
         "some track's section 0 (its own intro) — an excerpt from mid-track sounds like a "
         "radio switched on halfway.\n"
@@ -337,10 +340,51 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
             p["role"] = "auto"
             p["track_name"] = os.path.basename(p["path"])
         why = why or "LLM 编排不可用,按各曲能量峰值段确定性编排"
+
+    _enforce_bounds(picks, usable, target_sec)
     return picks, why
 
 
-def stitch_bgm(tracks: list, out_path: str, crossfade: float = 0.0) -> dict:
+def _enforce_bounds(picks: list, infos: list, target_sec: float) -> None:
+    """Deterministic corrections the LLM cannot be trusted with (measured
+    boundaries only): total duration ≤ target+12%, and no single pick over
+    ~45% of the target. Trimming walks whole measured sections off a pick —
+    the LAST pick trims from its START (its landing/outro must survive),
+    everything else trims from the END."""
+    segs_by_path = {i["path"]: i["segments"] for i in infos}
+
+    def _dur(p) -> float:
+        return max(0.0, float(p.get("end") or 0) - float(p.get("start") or 0))
+
+    def _trim(p, from_start: bool) -> bool:
+        """Drop one measured section from this pick. False when impossible."""
+        segs = segs_by_path.get(p["path"]) or []
+        inside = [s for s in segs if s["start"] >= p["start"] - 0.5 and s["end"] <= p["end"] + 0.5]
+        if len(inside) <= 1:
+            return False
+        if from_start:
+            p["start"] = inside[1]["start"]
+        else:
+            p["end"] = inside[-2]["end"]
+        return True
+
+    cap = 0.45 * target_sec
+    for k, p in enumerate(picks):
+        while _dur(p) > cap:
+            if not _trim(p, from_start=(k == len(picks) - 1)):
+                break
+
+    limit = target_sec * 1.12
+    guard = 24
+    while sum(_dur(p) for p in picks) > limit and guard > 0:
+        guard -= 1
+        longest = max(range(len(picks)), key=lambda i: _dur(picks[i]))
+        if not _trim(picks[longest], from_start=(longest == len(picks) - 1)):
+            break
+
+
+def stitch_bgm(tracks: list, out_path: str, crossfade: float = 0.0,
+               join_sfx: bool = True) -> dict:
     """Join tracks (in order) into one BGM file.
 
     tracks: [{"path": str, "start": float?, "end": float?}, ...] — start/end
@@ -410,12 +454,39 @@ def stitch_bgm(tracks: list, out_path: str, crossfade: float = 0.0) -> dict:
         out = "[xj]" if k == len(segs) - 1 else f"[x{k}]"
         parts.append(f"{prev}[n{k}]acrossfade=d={joins[k - 1]}:c1=tri:c2=tri{out}")
         prev = out
+
+    # cinematic join sweeteners: a soft pink-noise RISER swelling into each
+    # join, ducked well under the music (-22dB-ish). A bare crossfade between
+    # two unrelated songs exposes the seam — a swell masks and MOTIVATES it
+    # (the standard whoosh/riser trick, synthesized so no sample pack needed).
+    join_times = []
+    _cum = 0.0
+    for i2, sg in enumerate(segs[:-1]):
+        _cum += sg["duration"] - joins[i2]
+        join_times.append(_cum)
+    sfx_inputs = []
+    if join_sfx and join_times:
+        for j, jt in enumerate(join_times):
+            rise = min(3.0, joins[j] + 1.0)          # swell length
+            start_at = max(0.0, jt - rise * 0.7)     # peak lands ON the join
+            sfx_inputs += ["-f", "lavfi", "-t", f"{rise + 1.0:.2f}",
+                           "-i", "anoisesrc=color=pink:sample_rate=48000:amplitude=0.6"]
+            parts.append(
+                f"[{len(segs) + j}:a]highpass=f=300,lowpass=f=5000,"
+                f"afade=t=in:d={rise * 0.7:.2f},afade=t=out:st={rise * 0.7:.2f}:d={rise * 0.3 + 1.0:.2f},"
+                f"volume=0.08,aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"adelay={int(start_at * 1000)}|{int(start_at * 1000)}[sfx{j}]")
+        mix_in = "".join(f"[sfx{j}]" for j in range(len(join_times)))
+        parts.append(f"{prev}{mix_in}amix=inputs={1 + len(join_times)}:duration=first:normalize=0[xm]")
+        prev = "[xm]"
+
     if fade_out > 0:
         # expected chain length = segment sum minus crossfade overlaps
         _exp = sum(s["duration"] for s in segs) - sum(joins)
         parts.append(f"{prev}afade=t=out:st={max(0.0, _exp - fade_out):.2f}:d={fade_out}[aout]")
     else:
         parts.append(f"{prev}anull[aout]")
+    cmd += sfx_inputs
     cmd += ["-filter_complex", ";".join(parts), "-map", "[aout]",
             "-c:a", "libmp3lame", "-b:a", "320k", out_path]
 

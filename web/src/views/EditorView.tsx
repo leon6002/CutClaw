@@ -153,13 +153,15 @@ export default function EditorView({
     const needFuse = (p.audios?.length ?? 0) > 1
       && !/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "");
     if (needFuse) {
-      setFusion({ state: "running", detail: `AI 正在把 ${p.audios!.length} 首音乐按目标 ${Math.round(p.targetLength * 1.25 + 20)}s 融合…` });
+      setFusion({ state: "running", detail: `AI 正在把 ${p.audios!.length} 首音乐按目标 ${Math.round(p.targetLength + 15)}s 融合…` });
       try {
         const r = await api<any>("/api/bgm/stitch", {
           method: "POST",
           body: JSON.stringify({
             mode: "ai",
-            target_sec: Math.round(p.targetLength * 1.25 + 20),
+            // tight fit: the mix is PURPOSE-BUILT for this film — big headroom
+            // just dilutes the user's picks (a 220s target once got a 310s mix)
+            target_sec: Math.round(p.targetLength + 15),
             tracks: p.audios!.map((a) => ({ path: a })),
             video_paths: p.videos,
           }),
@@ -517,7 +519,7 @@ export default function EditorView({
 
             {(p.audios?.length ?? 0) > 1 && !/BGMmix/i.test(p.audio.split(/[\\/]/).pop() ?? "") && (
               <div className="mb-2 rounded-lg border border-violet-500/25 bg-violet-500/[0.06] px-3 py-2 text-[11.5px] text-violet-300/90">
-                🎵 已选 {p.audios!.length} 首音乐 — 运行时会先按目标时长(约 {Math.round(p.targetLength * 1.25 + 20)}s)AI 融合成一条 BGM,再启动流水线。
+                🎵 已选 {p.audios!.length} 首音乐 — 运行时会先按目标时长(约 {Math.round(p.targetLength + 15)}s)AI 融合成一条 BGM,再启动流水线。
               </div>
             )}
             {fusion && (
