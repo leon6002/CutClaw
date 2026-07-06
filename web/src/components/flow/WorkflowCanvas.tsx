@@ -7,14 +7,61 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   Background, BackgroundVariant, Controls, MiniMap, Panel, ReactFlow,
   ReactFlowProvider, useEdgesState, useNodesState, useReactFlow,
-  type Edge, type Node,
+  type Edge, type Node, type XYPosition,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Crosshair, Loader2, Maximize2, Minimize2 } from "lucide-react";
+import { Crosshair, LayoutGrid, Loader2, Maximize2, Minimize2 } from "lucide-react";
 import { api } from "../../api";
 import { cn } from "../../lib/utils";
 import { groupSteps, entryWorstVerdict, useTrace, type IterEntry, type TaskInfo, type TraceStep } from "../trace";
-import { nodeTypes } from "./nodes";
+import { nodeTypes, SW_STEPS } from "./nodes";
+
+// ── graph diffing ─────────────────────────────────────────────────────────────
+// buildGraph produces a BRAND-NEW nodes/edges array on every poll (1s). Feeding
+// those straight into setRfNodes/setRfEdges (a) clobbered any node the user had
+// dragged, and (b) swapped every object for a new reference each second, forcing
+// all memoized nodes to re-render and re-mounting the animated edge paths — which
+// made the flow animation stutter. The merge helpers below keep object identity
+// for anything whose content is unchanged, so only the nodes that actually moved
+// forward re-render. This is the Dify model: layout is computed once per topology,
+// live polling only patches data — it never touches position or churns identity.
+
+const stripFns = (_k: string, v: unknown) => (typeof v === "function" ? undefined : v);
+const nodeSig = (n: Node) => n.type + "|" + JSON.stringify(n.data, stripFns);
+const edgeSig = (e: Edge) => JSON.stringify(e);
+
+/** Merge freshly-built nodes into the live canvas without disturbing dragged
+ *  positions or re-creating unchanged node objects. */
+function mergeNodes(prev: Node[], next: Node[], pins: Map<string, XYPosition>): Node[] {
+  const prevById = new Map(prev.map((n) => [n.id, n] as const));
+  let changed = prev.length !== next.length;
+  const merged = next.map((n) => {
+    const old = prevById.get(n.id);
+    if (old?.dragging) { changed = true; return old; }   // mid-drag: never disturb
+    const pin = pins.get(n.id);
+    const pos = pin ?? n.position;
+    if (old && old.position.x === pos.x && old.position.y === pos.y && nodeSig(old) === nodeSig(n)) {
+      return old;                                          // unchanged → reuse ref
+    }
+    changed = true;
+    return pin ? { ...n, position: pos } : n;
+  });
+  return changed ? merged : prev;
+}
+
+/** Same idea for edges — reuse the old object when nothing changed so React Flow
+ *  keeps the SVG path element and its marching-ants animation running smoothly. */
+function mergeEdges(prev: Edge[], next: Edge[]): Edge[] {
+  const prevById = new Map(prev.map((e) => [e.id, e] as const));
+  let changed = prev.length !== next.length;
+  const merged = next.map((e) => {
+    const old = prevById.get(e.id);
+    if (old && edgeSig(old) === edgeSig(e)) return old;
+    changed = true;
+    return e;
+  });
+  return changed ? merged : prev;
+}
 
 // ── data polling ────────────────────────────────────────────────────────────
 
@@ -55,7 +102,13 @@ function useJobTraces(jobId: string | null) {
 const COL_W = 265;
 const LANE_H = 125;
 const LANE_TOP = 130;
-const X_ROOT = 290;
+const X_ROOT = 900;          // shot-root column — pushed right to make room for the
+                             // asset column + screenwriter + editor hub on the left
+
+// ── pipeline columns (left → right): assets → screenwriter → editor → shots ──
+const ASSET_X = 10, ASSET_ROW = 184;   // input asset column (poster + name per row)
+const SW_X = 286, SW_Y = 6;            // "AI 编剧" timeline node
+const EDITOR_X = 640;                  // editor hub, between screenwriter and shots
 
 interface RoundInfo {
   seq: number; section: number; round: number;
@@ -104,6 +157,25 @@ function segmentEntries(entries: IterEntry[]): IterEntry[][] {
 
 // ── graph builder ───────────────────────────────────────────────────────────
 
+export interface AssetInfo {
+  path: string;
+  file_name: string;
+  asset_type: "video" | "image" | "audio";
+  annotated: boolean;
+  annotation?: Record<string, any>;
+  content_hash?: string;
+}
+
+export interface ClipInfo { video_path: string; start: string; end: string; duration: number }
+export interface ShotInfo {
+  section_idx: number;
+  shot_idx: number;
+  video_path: string;
+  is_stitched: boolean;
+  fallback: boolean;
+  clips: ClipInfo[];
+}
+
 function buildGraph(opts: {
   shotTask: TaskInfo | undefined;
   traces: TracesMap;
@@ -113,8 +185,14 @@ function buildGraph(opts: {
   onOpenScreenwriter?: () => void;
   jobRunning?: boolean;
   onRetryShot?: (sectionIdx: number, shotIdx: number) => void;
+  swStage?: string;
+  assets?: AssetInfo[];
+  onOpenAsset?: (a: AssetInfo) => void;
+  shots?: ShotInfo[];
+  onOpenClip?: (s: ShotInfo) => void;
+  assetLive?: Record<string, string>;   // basename → live analysis state (r/d)
 }): { nodes: Node[]; edges: Edge[]; latestActiveId: string | null } {
-  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot } = opts;
+  const { shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assets, onOpenAsset, shots, onOpenClip, assetLive } = opts;
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   let latestActiveId: string | null = null;
@@ -133,19 +211,74 @@ function buildGraph(opts: {
     }
   };
 
-  // Screenwriter node (top lane)
+  // "AI 编剧" is a single self-drawn node rendering the whole phase as a
+  // station-and-rail timeline (选择音乐段落 → … → 保存分镜脚本), each sub-step a
+  // station with its own call data. The phase is "running" while no shots exist
+  // yet (total === 0) — more reliable than peeking the last trace phase, which
+  // goes quiet BETWEEN sub-steps.
   const swSteps = traces["screenwriter_llm"]?.["0"] ?? [];
-  const swRunning = swSteps.length > 0 && swSteps[swSteps.length - 1].phase === "calling";
-  if (swSteps.length > 0) {
+  const swFailed = swSteps.some((s) => s.verdict === "fail");
+  const swStarted = swSteps.length > 0 || !!swStage;   // has the phase begun?
+  const swActive = total === 0 && swStarted;
+  // Always render the screenwriter node (like the editor node) so the pipeline
+  // topology is visible from the start — a dim "待开始" placeholder before the
+  // phase begins, rather than an absent node that looks like something's missing.
+  {
+    const swEntries = groupSteps(swSteps);
+    const calls = swEntries.filter((e) => !e.calling).length;
+    const curIdx = swStage ? SW_STEPS.indexOf(swStage) : -1;
+    // per-sub-step call data: how many LLM calls + total seconds each step used,
+    // grouped by the `stage` stamped on every call event by the backend.
+    const byStage: Record<string, { calls: number; elapsed: number }> = {};
+    for (const e of swEntries) {
+      if (e.calling) continue;
+      const b = byStage[e.stage || ""] ?? (byStage[e.stage || ""] = { calls: 0, elapsed: 0 });
+      b.calls += 1; b.elapsed += e.elapsed ?? 0;
+    }
+    // state per sub-step: not started → all pending; before current = done,
+    // current = running, after = pending; all done once the editor stage started.
+    const stepState = (i: number) => total > 0 ? "d"
+      : !swStarted ? "p"
+        : curIdx < 0 ? "d"
+          : i < curIdx ? "d" : i === curIdx ? (swFailed ? "f" : "r") : "p";
+    const steps = SW_STEPS.map((label, i) => ({
+      label, state: stepState(i),
+      calls: byStage[label]?.calls ?? 0,
+      elapsed: Math.round(byStage[label]?.elapsed ?? 0),
+    }));
     nodes.push({
-      id: "sw", type: "screenwriter", position: { x: 10, y: 6 },
+      id: "sw", type: "screenwriter", position: { x: SW_X, y: SW_Y },
       data: {
-        calls: groupSteps(swSteps).filter((e) => !e.calling).length,
-        state: swSteps.some((s) => s.verdict === "fail") ? "f" : "d",
-        running: swRunning, onOpen: onOpenScreenwriter,
+        title: "AI 编剧", running: swActive, started: swStarted,
+        state: !swStarted ? "p" : swFailed ? "f" : swActive ? "r" : "d",
+        calls, steps, onOpen: onOpenScreenwriter,
       },
     });
-    if (swRunning) latestActiveId = "sw";
+    if (swActive) latestActiveId = "sw";
+  }
+
+  // Input asset column: the source videos (视频理解) + audio (音乐分析) feeding
+  // the screenwriter. Each shows its cached annotation and opens it on click.
+  const assetList = assets ?? [];
+  if (assetList.length > 0) {
+    const startY = SW_Y + 150 - (assetList.length * ASSET_ROW) / 2;
+    assetList.forEach((a, i) => {
+      const id = `asset-${i}`;
+      nodes.push({
+        id, type: "asset", position: { x: ASSET_X, y: startY + i * ASSET_ROW },
+        data: {
+          path: a.path, fileName: a.file_name, assetType: a.asset_type,
+          annotated: a.annotated, annotation: a.annotation, contentHash: a.content_hash ?? "",
+          liveState: assetLive?.[(a.file_name || "").toLowerCase()],
+          onOpen: () => onOpenAsset?.(a),
+        },
+      });
+      const live = assetLive?.[(a.file_name || "").toLowerCase()];
+      edges.push({
+        id: `e-${id}-sw`, source: id, target: "sw",
+        ...edgeStyle(live === "r" ? "active" : (a.annotated || live === "d") ? "done" : "pending"),
+      });
+    });
   }
 
   // AI Editor stage node — an explicit anchor for the editor stage: the fan-out
@@ -156,19 +289,19 @@ function buildGraph(opts: {
   const editorRunning = Object.values(states).some((v) => v === "r");
   const editorY = total > 0 ? LANE_TOP + ((total - 1) * LANE_H) / 2 : LANE_TOP;
   nodes.push({
-    id: "editor", type: "orchestrator", position: { x: 40, y: editorY },
+    id: "editor", type: "orchestrator", position: { x: EDITOR_X, y: editorY },
     data: {
       kind: "editor", title: "AI 编辑",
       detail: total > 0
         ? `${doneN}/${total} 镜头已选${failN ? ` · ${failN} 失败` : ""}`
-        : "等待编剧完成…",
+        : swStage ? `编剧中 · ${swStage}` : "等待编剧完成…",
       state: total === 0 ? "p" : doneN === total ? "d" : editorRunning ? "r" : "p",
     },
   });
   if (nodes.some((n) => n.id === "sw")) {
     edges.push({
       id: "e-sw-editor", source: "sw", target: "editor",
-      ...edgeStyle(total > 0 ? "done" : swRunning ? "active" : "pending"),
+      ...edgeStyle(total > 0 ? "done" : swActive ? "active" : "pending"),
     });
   }
 
@@ -191,7 +324,19 @@ function buildGraph(opts: {
     regionStart.push(cursor);
     cursor += COL_W + CONFLICT_GAP;
   }
-  const mergeX = cursor + COL_W * 0.2;
+  // reserve a column for the per-shot "clip result" nodes just before merge
+  const shotList = shots ?? [];
+  const shotByKey = new Map<string, ShotInfo>();
+  for (const s of shotList) shotByKey.set(`${s.section_idx}-${s.shot_idx}`, s);
+  const assetList2 = assets ?? [];
+  const baseOf = (p: string) => (p || "").split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  const assetIndexByPath = (p: string) => {
+    const b = baseOf(p);
+    return assetList2.findIndex((a) => baseOf(a.file_name) === b || baseOf(a.path) === b);
+  };
+  const CLIP_COL = shotList.length > 0 ? 250 : 0;
+  const clipX = cursor + COL_W * 0.2;
+  const mergeX = clipX + CLIP_COL;
   const centerY = LANE_TOP + ((total - 1) * LANE_H) / 2;
 
   // shot roots + collapsed iteration lanes (one lane per round-segment)
@@ -300,10 +445,40 @@ function buildGraph(opts: {
     const src = lastNodeOfShot[i];
     if (!src) continue;
     const noSteps = src === `shot-${i}`;
+    const y = LANE_TOP + i * LANE_H;
+
+    // final selected clip (source + time slice) between this shot and the merge
+    const label = shotTask?.labels?.[String(i)] ?? "";
+    const m = /S(\d+)\D+Shot(\d+)/i.exec(label);
+    const shot = m ? shotByKey.get(`${Number(m[1]) - 1}-${Number(m[2]) - 1}`) : undefined;
+    let mergeSrc = src;
+    if (shot && shot.clips.length > 0) {
+      const clipId = `clip-${i}`;
+      nodes.push({
+        id: clipId, type: "clip", position: { x: clipX, y },
+        data: { clips: shot.clips, fallback: shot.fallback, state: st, onOpen: () => onOpenClip?.(shot) },
+      });
+      edges.push({
+        id: `e-${src}-${clipId}`, source: src, target: clipId, targetHandle: "in",
+        ...edgeStyle(st === "d" ? (noSteps ? "skip" : "done") : st === "f" ? "fail" : "pending"),
+        ...(noSteps && st === "d" ? { label: "缓存跳过", labelStyle: { fill: "#64748b", fontSize: 9 } } : {}),
+      });
+      // thin, faint curve back to the source asset (leaves the clip's LEFT via
+      // the "back" handle, enters the asset's right — a clean leftward arc)
+      const ai = assetIndexByPath(shot.clips[0].video_path);
+      if (ai >= 0) {
+        edges.push({
+          id: `e-${clipId}-asset-${ai}`, source: clipId, sourceHandle: "back",
+          target: `asset-${ai}`, animated: false,
+          style: { stroke: "rgba(148,163,184,0.16)", strokeWidth: 1 },
+        });
+      }
+      mergeSrc = clipId;
+    }
     edges.push({
-      id: `e-${src}-merge-${i}`, source: src, target: "merge",
-      ...edgeStyle(st === "d" ? (noSteps ? "skip" : "done") : st === "f" ? "fail" : "pending"),
-      ...(noSteps && st === "d" ? { label: "缓存跳过", labelStyle: { fill: "#64748b", fontSize: 9 } } : {}),
+      id: `e-${mergeSrc}-merge-${i}`, source: mergeSrc, target: "merge",
+      ...(mergeSrc.startsWith("clip-") ? { sourceHandle: "out" } : {}),
+      ...edgeStyle(st === "d" ? "done" : st === "f" ? "fail" : "pending"),
     });
   }
 
@@ -314,6 +489,7 @@ function buildGraph(opts: {
 
 function CanvasInner({
   jobId, tasks, onOpenScreenwriter, fullscreen, onToggleFullscreen, jobRunning, onRetryShot,
+  assets, onOpenAsset, shots, onOpenClip,
 }: {
   jobId: string;
   tasks: Record<string, TaskInfo>;
@@ -322,6 +498,10 @@ function CanvasInner({
   onToggleFullscreen: () => void;
   jobRunning?: boolean;
   onRetryShot?: (sectionIdx: number, shotIdx: number) => void;
+  assets?: AssetInfo[];
+  onOpenAsset?: (a: AssetInfo) => void;
+  shots?: ShotInfo[];
+  onOpenClip?: (s: ShotInfo) => void;
 }) {
   const traces = useJobTraces(jobId);
   const [expanded, setExpanded] = useState<{ unit: number; ord: number } | null>(null);
@@ -346,13 +526,46 @@ function CanvasInner({
   // graph every second.
   const shotTaskJson = JSON.stringify(tasks["editor_shots"] ?? null);
   const shotTask = useMemo(() => JSON.parse(shotTaskJson) as TaskInfo | null, [shotTaskJson]);
+  // current screenwriter sub-step label (选择音乐段落 → 生成分镜脚本 → …)
+  const swStage = ((tasks["screenwriter_llm"] as any)?.stage_label as string) || "";
+
+  // live per-asset analysis state (视频理解/音乐分析): basename → r/d, so the
+  // asset nodes can show "分析中" on the video currently being analyzed.
+  const analyzeJson = JSON.stringify([tasks["video_analysis"] ?? null, tasks["audio_analysis_asset"] ?? null]);
+  const assetLive = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const t of JSON.parse(analyzeJson) as any[]) {
+      if (!t) continue;
+      const states = t.states ?? {}, labels = t.labels ?? {};
+      for (const k of Object.keys(states)) {
+        const name = String(labels[k] || "").toLowerCase();
+        if (name) m[name] = states[k];
+      }
+    }
+    return m;
+  }, [analyzeJson]);
+  const analyzingName = useMemo(() => {
+    for (const t of JSON.parse(analyzeJson) as any[]) {
+      if (!t) continue;
+      const states = t.states ?? {}, labels = t.labels ?? {};
+      for (const k of Object.keys(states)) if (states[k] === "r") return String(labels[k] || "");
+    }
+    return "";
+  }, [analyzeJson]);
+
+  // stabilize the assets/shots identity so polling doesn't rebuild every tick
+  const assetsJson = JSON.stringify(assets ?? null);
+  const assetsStable = useMemo(() => JSON.parse(assetsJson) as AssetInfo[] | null, [assetsJson]);
+  const shotsJson = JSON.stringify(shots ?? null);
+  const shotsStable = useMemo(() => JSON.parse(shotsJson) as ShotInfo[] | null, [shotsJson]);
 
   const { nodes, edges, latestActiveId } = useMemo(
     () => buildGraph({
       shotTask: shotTask ?? undefined, traces, expanded, fullEntries, onToggle, onOpenScreenwriter,
-      jobRunning, onRetryShot,
+      jobRunning, onRetryShot, swStage, assets: assetsStable ?? undefined, onOpenAsset,
+      shots: shotsStable ?? undefined, onOpenClip, assetLive,
     }),
-    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot],
+    [shotTask, traces, expanded, fullEntries, onToggle, onOpenScreenwriter, jobRunning, onRetryShot, swStage, assetsStable, onOpenAsset, shotsStable, onOpenClip, assetLive],
   );
 
   // React Flow v12 controlled mode REQUIRES onNodesChange: node dimension
@@ -364,8 +577,26 @@ function CanvasInner({
   // measurement changes properly.
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<Node>([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  useEffect(() => { setRfNodes(nodes); }, [nodes, setRfNodes]);
-  useEffect(() => { setRfEdges(edges); }, [edges, setRfEdges]);
+
+  // positions the user has hand-placed — these survive the per-poll re-layout
+  // until they hit "重新排列". Ref (not state) so recording a drag doesn't itself
+  // trigger a re-render.
+  const pinned = useRef<Map<string, XYPosition>>(new Map());
+  const onNodeDragStart = useCallback(() => { follow.current = false; }, []);
+  const onNodeDragStop = useCallback((_: unknown, node: Node) => {
+    pinned.current.set(node.id, node.position);
+  }, []);
+  const relayout = useCallback(() => {
+    pinned.current.clear();
+    setRfNodes((prev) => prev.map((n) => {
+      const fresh = nodes.find((x) => x.id === n.id);
+      return fresh ? { ...n, position: fresh.position } : n;
+    }));
+    window.setTimeout(() => rf.fitView({ duration: 300 }), 30);
+  }, [nodes, setRfNodes, rf]);
+
+  useEffect(() => { setRfNodes((prev) => mergeNodes(prev, nodes, pinned.current)); }, [nodes, setRfNodes]);
+  useEffect(() => { setRfEdges((prev) => mergeEdges(prev, edges)); }, [edges, setRfEdges]);
 
   // re-fit the graph when the container resizes between inline / fullscreen
   const firstFs = useRef(true);
@@ -378,14 +609,15 @@ function CanvasInner({
   // Initial fit: nodes stream in AFTER mount (rfNodes starts empty), so the
   // built-in `fitView` prop fires on an empty canvas and the graph appears
   // tiny in a corner. Fit when content first arrives, and again when the
-  // topology jumps from the 2-node skeleton (sw + editor) to the full
-  // shot-lane graph.
+  // topology jumps from the pre-editor skeleton (assets + screenwriter + editor)
+  // to the full shot-lane graph.
+  const SW_SKELETON = 2 + (assetsStable?.length ?? 0);
   const prevCount = useRef(0);
   useEffect(() => {
     const prev = prevCount.current;
     prevCount.current = nodes.length;
     if (nodes.length === 0) return;
-    if (prev === 0 || (prev <= 3 && nodes.length > 3)) {
+    if (prev === 0 || (prev <= SW_SKELETON && nodes.length > SW_SKELETON)) {
       // small delay so React Flow has measured the freshly-added nodes
       const id = window.setTimeout(() => rf.fitView({ duration: 300, maxZoom: 0.95 }), 80);
       return () => window.clearTimeout(id);
@@ -414,6 +646,8 @@ function CanvasInner({
       maxZoom={1.75}
       proOptions={{ hideAttribution: true }}
       onMoveStart={(ev) => { if (ev) follow.current = false; }}
+      onNodeDragStart={onNodeDragStart}
+      onNodeDragStop={onNodeDragStop}
       onPaneClick={() => setExpanded(null)}
       nodesConnectable={false}
       deleteKeyCode={null}
@@ -454,6 +688,13 @@ function CanvasInner({
           >
             <Crosshair className="h-3 w-3" /> 回到最新
           </button>
+          <button
+            className="flex items-center gap-1.5 rounded-lg border border-cyan-500/30 bg-slate-900/85 px-2.5 py-1.5 text-[11px] text-cyan-300 backdrop-blur hover:bg-cyan-500/10"
+            onClick={relayout}
+            title="清除手动摆放，恢复自动布局"
+          >
+            <LayoutGrid className="h-3 w-3" /> 重新排列
+          </button>
         </div>
       </Panel>
       {/* No shot data yet (job switching, or screenwriter phase before the
@@ -463,7 +704,11 @@ function CanvasInner({
         <Panel position="top-center">
           <div className="mt-10 flex items-center gap-2 rounded-lg border border-white/10 bg-slate-900/85 px-4 py-2.5 text-xs text-slate-400 backdrop-blur">
             <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-cyan-400" />
-            正在等待编辑阶段生成镜头…编剧完成后，各镜头会在这里展开。
+            {analyzingName
+              ? <span>正在分析素材：<span className="text-sky-300">{analyzingName}</span> —— 左侧素材列实时显示进度。</span>
+              : swStage
+                ? <span>AI 编剧进行中：<span className="text-amber-300">{swStage}</span> —— 完成后各镜头会在这里展开。</span>
+                : "正在等待编剧阶段…编剧完成后，各镜头会在这里展开。"}
           </div>
         </Panel>
       )}
@@ -478,6 +723,10 @@ export default function WorkflowCanvas(props: {
   jobRunning?: boolean;
   onRetryShot?: (sectionIdx: number, shotIdx: number) => void;
   overlay?: ReactNode;
+  assets?: AssetInfo[];
+  onOpenAsset?: (a: AssetInfo) => void;
+  shots?: ShotInfo[];
+  onOpenClip?: (s: ShotInfo) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);

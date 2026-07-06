@@ -1,9 +1,9 @@
 /** Custom React Flow nodes for the agent workflow canvas. */
-import { memo } from "react";
+import { memo, useState } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
-  Check, GitMerge, Loader2, MessageSquareText, PenLine,
-  RotateCcw, Scissors, TriangleAlert, X,
+  Check, Film, GitMerge, Loader2, MessageSquareText, Music2, PenLine,
+  Play, RotateCcw, Scissors, TriangleAlert, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { VERDICT_META, entryWorstVerdict, splitReasoning, tryPretty, type IterEntry } from "../trace";
@@ -193,32 +193,272 @@ export const ShotLaneNode = memo(({ data }: NodeProps) => {
   );
 });
 
-// ── C. Screenwriter Node ────────────────────────────────────────────────────
+// ── B2. Asset Node (source video / audio + its analysis annotation) ─────────
 
-export interface ScreenwriterData {
-  calls: number;
-  state: string;
-  running: boolean;
+export interface AssetNodeData {
+  path: string;
+  fileName: string;
+  assetType: "video" | "image" | "audio";
+  annotated: boolean;
+  annotation?: Record<string, any>;
+  contentHash?: string;
+  liveState?: string;   // live pipeline analysis state: "r" 分析中 / "d" 已分析
   onOpen?: () => void;
   [key: string]: unknown;
 }
 
-export const ScreenwriterNode = memo(({ data }: NodeProps) => {
-  const d = data as ScreenwriterData;
+const fmtQ = (q: any) => (typeof q === "number" ? (q % 1 ? q.toFixed(1) : String(q)) : String(q));
+
+/** Source asset: a cheap ffmpeg poster thumbnail (never a live <video>) for
+ *  videos, a waveform for audio — click to open the full annotation + player. */
+export const AssetNode = memo(({ data }: NodeProps) => {
+  const d = data as AssetNodeData;
+  const isAudio = d.assetType === "audio";
+  const q = (d.annotation ?? {}).quality_score;
+  const live = d.liveState;   // "r" 分析中 / "d" 已分析
+  const [thumbFailed, setThumbFailed] = useState(false);
+  const thumbUrl = `/api/assets/thumb?hash=${encodeURIComponent(d.contentHash || "")}&path=${encodeURIComponent(d.path)}`;
   return (
     <div
       className={cn(
-        "w-[210px] cursor-pointer rounded-xl border bg-slate-900/90 px-3 py-2.5 shadow-lg",
-        d.running ? "border-amber-400/70 node-breathe" : d.state === "f" ? "border-red-500/50" : "border-amber-500/40",
+        "group w-[236px] cursor-pointer overflow-hidden rounded-xl border bg-slate-900/85 shadow-lg transition-colors",
+        live === "r" ? "border-sky-400/70 node-breathe"
+          : isAudio ? "border-violet-500/30 hover:border-violet-400/60"
+            : "border-sky-500/30 hover:border-sky-400/60",
       )}
       onClick={(ev) => { ev.stopPropagation(); d.onOpen?.(); }}
-      title="点击查看编剧的提示词与回复"
+      title="点击查看该素材的标注与预览"
     >
-      <div className="flex items-center gap-1.5 text-[12px] font-semibold text-amber-300">
-        <PenLine className="h-3.5 w-3.5" />AI 编剧
-        {d.running && <Loader2 className="ml-auto h-3 w-3 animate-spin" />}
+      {/* poster: cheap cached JPEG for video, decorative waveform for audio */}
+      <div className="relative flex aspect-video w-full items-center justify-center overflow-hidden bg-gradient-to-br from-slate-800 to-slate-950">
+        {isAudio
+          ? <Waveform seed={d.path} />
+          : !thumbFailed
+            ? <img src={thumbUrl} loading="lazy" className="h-full w-full object-cover" onError={() => setThumbFailed(true)} />
+            : <Film className="h-8 w-8 text-slate-700" />}
+        {/* analyzing pulse overlay */}
+        {live === "r" && <span className="pointer-events-none absolute inset-0 animate-pulse bg-sky-500/15" />}
+        {/* quality / status badge */}
+        <span className="absolute top-1.5 right-1.5 rounded bg-black/65 px-1.5 py-0.5 text-[10px] font-semibold backdrop-blur-sm">
+          {live === "r"
+            ? <span className="flex items-center gap-1 text-sky-300"><Loader2 className="h-2.5 w-2.5 animate-spin" />分析中</span>
+            : d.annotated ? <span className="text-emerald-300">Q {fmtQ(q)}</span>
+              : live === "d" ? <span className="text-sky-300">已分析</span>
+                : <span className="text-amber-300">未标注</span>}
+        </span>
+        {/* stage tag */}
+        <span className={cn("absolute bottom-1.5 left-1.5 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm",
+          isAudio ? "bg-violet-500/25 text-violet-200" : "bg-sky-500/25 text-sky-100")}>
+          {isAudio ? "音乐分析" : "视频理解"}
+        </span>
+        {/* hover play hint */}
+        <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-opacity group-hover:bg-black/25 group-hover:opacity-100">
+          <span className="flex h-8 w-8 items-center justify-center rounded-full border border-white/25 bg-black/60">
+            <Play className="ml-0.5 h-3.5 w-3.5 text-white" />
+          </span>
+        </span>
       </div>
-      <div className="mt-0.5 text-[10px] text-slate-500">{d.calls} 次 LLM 调用 · 点击查看提示词/回复</div>
+      {/* filename */}
+      <div className="flex items-center gap-2 px-2.5 py-1.5">
+        <span className={cn("flex h-4 w-4 shrink-0 items-center justify-center rounded",
+          isAudio ? "bg-violet-500/15 text-violet-300" : "bg-sky-500/15 text-sky-300")}>
+          {isAudio ? <Music2 className="h-2.5 w-2.5" /> : <Film className="h-2.5 w-2.5" />}
+        </span>
+        <span className="truncate text-[11.5px] font-medium text-slate-200" title={d.fileName}>{d.fileName}</span>
+      </div>
+      {/* source → screenwriter; target = faint back-links from clip result nodes */}
+      <Handle type="target" position={H.r} className={handleCls()} />
+      <Handle type="source" position={H.r} className={handleCls()} />
+    </div>
+  );
+});
+
+/** Decorative deterministic waveform for audio posters (seeded by path). */
+function Waveform({ seed }: { seed: string }) {
+  const bars = Array.from({ length: 32 }, (_, i) => {
+    const c = seed.charCodeAt((i * 7) % Math.max(1, seed.length)) || 60;
+    return 18 + ((c * 31 + i * 17) % 62);
+  });
+  return (
+    <div className="flex h-full w-full items-center justify-center gap-[2px] px-5">
+      {bars.map((h, i) => (
+        <span key={i} className="w-[3px] rounded-full bg-violet-500/45" style={{ height: `${h}%` }} />
+      ))}
+    </div>
+  );
+}
+
+// ── B3. Clip result node (final selected source + time slice, previewable) ──
+
+export interface ClipInfo { video_path: string; start: string; end: string; duration: number }
+export interface ClipNodeData {
+  clips: ClipInfo[];
+  fallback?: boolean;
+  state: string;   // shot state p/r/d/f
+  onOpen?: () => void;
+  [key: string]: unknown;
+}
+
+const shortTime = (t?: string) => (t || "").replace(/^00:/, "");
+
+export const ClipNode = memo(({ data }: NodeProps) => {
+  const d = data as ClipNodeData;
+  const clips = d.clips ?? [];
+  const first = clips[0];
+  const name = first ? (first.video_path.split(/[\\/]/).pop() || first.video_path) : "—";
+  return (
+    <div
+      className={cn(
+        "w-[212px] cursor-pointer rounded-xl border bg-slate-900/85 px-2.5 py-2 shadow-lg transition-colors",
+        d.state === "f" ? "border-red-500/40 hover:border-red-400/60" : "border-teal-500/30 hover:border-teal-400/60",
+      )}
+      onClick={(ev) => { ev.stopPropagation(); d.onOpen?.(); }}
+      title="点击预览这个镜头"
+    >
+      <div className="flex items-center gap-1.5">
+        <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-teal-500/15 text-teal-300">
+          <Play className="ml-px h-2.5 w-2.5" />
+        </span>
+        <span className="truncate text-[11.5px] font-medium text-teal-100" title={first?.video_path}>{name}</span>
+        {d.fallback && (
+          <span className="shrink-0 rounded bg-amber-500/15 px-1 py-0.5 text-[8.5px] text-amber-300/90" title="确定性兜底选取">兜底</span>
+        )}
+      </div>
+      {clips.map((c, i) => (
+        <div key={i} className="mt-1 flex items-center gap-1.5 font-mono text-[10px]">
+          {clips.length > 1 && <span className="text-slate-600">{i + 1}</span>}
+          <span className="text-slate-300">{shortTime(c.start)}–{shortTime(c.end)}</span>
+          {c.duration != null && <span className="text-slate-600">{Number(c.duration).toFixed(1)}s</span>}
+        </div>
+      ))}
+      {/* in ← shot lane, out → merge, back → source asset (faint) */}
+      <Handle id="in" type="target" position={H.l} className={handleCls()} />
+      <Handle id="out" type="source" position={H.r} className={handleCls()} />
+      <Handle id="back" type="source" position={H.l} className="!h-1.5 !w-1.5 !border-0 !bg-slate-600/50" />
+    </div>
+  );
+});
+
+// ── C. Screenwriter stage — a self-drawn vertical timeline (single node) ─────
+// One node renders the whole "AI 编剧" phase as an elegant station-and-rail
+// timeline: each sub-step is a station with its own call data, connected by a
+// rail whose active segment glows and flows. Drawn internally (CSS) rather than
+// with React-Flow child nodes + edges, so there are no exposed handle dots.
+
+// ordered sub-steps of the screenwriter phase. Labels MUST match _sw_stage()
+// in src/Screenwriter_scene_short.py (order drives done/running/pending).
+export const SW_STEPS = ["选择音乐段落", "生成结构提案", "生成分镜脚本", "挑选开场对白", "保存分镜脚本"];
+
+export interface SwStep { label: string; state: string; calls: number; elapsed: number; }
+export interface ScreenwriterData {
+  title: string;
+  state: string;      // p/r/d/f (whole stage)
+  running?: boolean;
+  started?: boolean;  // false → dim "待开始" placeholder before the phase begins
+  calls: number;      // total LLM calls
+  steps: SwStep[];
+  onOpen?: () => void;
+  [key: string]: unknown;
+}
+
+/** True once the pipeline has reached station i (done / running / failed). */
+const reached = (steps: SwStep[], i: number) =>
+  i >= 0 && i < steps.length && ["d", "r", "f"].includes(steps[i].state);
+
+export const ScreenwriterNode = memo(({ data }: NodeProps) => {
+  const d = data as ScreenwriterData;
+  const steps = d.steps ?? [];
+  const notStarted = d.started === false;
+  return (
+    <div className={cn(
+      "w-[300px] overflow-hidden rounded-2xl border bg-gradient-to-b from-slate-900/95 to-slate-950/95 shadow-[0_10px_34px_rgba(0,0,0,0.45)] transition-opacity",
+      d.running ? "border-amber-400/50 node-breathe-amber"
+        : d.state === "f" ? "border-red-500/40" : "border-amber-500/25",
+      notStarted && "opacity-70",
+    )}>
+      {/* header */}
+      <div
+        className="flex cursor-pointer items-center gap-2 border-b border-white/[0.06] bg-gradient-to-r from-amber-500/[0.16] via-amber-500/[0.05] to-transparent px-3.5 py-2.5"
+        onClick={(ev) => { ev.stopPropagation(); d.onOpen?.(); }}
+        title="点击查看编剧的提示词与回复"
+      >
+        <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20">
+          <PenLine className="h-3.5 w-3.5" />
+        </span>
+        <span className="text-[13px] font-semibold tracking-wide text-amber-200">{d.title}</span>
+        {d.running && <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-300/90" />}
+        <span className="ml-auto font-mono text-[10px] text-slate-500">
+          {d.calls > 0 ? `${d.calls} 次调用` : d.running ? "运行中" : notStarted ? "待开始" : "已完成"}
+        </span>
+      </div>
+
+      {/* timeline */}
+      <div className="px-3 py-1.5">
+        {steps.map((s, i) => {
+          const active = s.state === "r", done = s.state === "d", fail = s.state === "f";
+          const last = i === steps.length - 1;
+          const topFilled = reached(steps, i);
+          const botFilled = reached(steps, i + 1);
+          const flowing = done && steps[i + 1]?.state === "r";
+          return (
+            <div
+              key={i}
+              className={cn(
+                "group relative flex h-12 cursor-pointer items-center gap-3 rounded-lg px-2 transition-colors",
+                active ? "bg-amber-500/[0.06]" : "hover:bg-white/[0.03]",
+              )}
+              onClick={(ev) => { ev.stopPropagation(); d.onOpen?.(); }}
+            >
+              {/* rail column: two half-lines + a station */}
+              <div className="relative h-full w-4 shrink-0">
+                {!(i === 0) && (
+                  <span className={cn("absolute top-0 left-1/2 h-1/2 w-px -translate-x-1/2",
+                    topFilled ? "bg-amber-400/50" : "bg-white/10")} />
+                )}
+                {!last && (
+                  <span className={cn("absolute top-1/2 left-1/2 h-1/2 w-px -translate-x-1/2 overflow-hidden",
+                    botFilled ? "bg-amber-400/50" : "bg-white/10")}>
+                    {flowing && <span className="sw-rail-flow absolute inset-0" />}
+                  </span>
+                )}
+                <span className={cn(
+                  "absolute top-1/2 left-1/2 flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border",
+                  done ? "border-emerald-400/70 bg-emerald-400/15 text-emerald-300"
+                    : active ? "sw-station-active border-amber-300 bg-amber-400/25 text-amber-100"
+                      : fail ? "border-red-400/70 bg-red-500/20 text-red-300"
+                        : "border-white/15 bg-slate-800",
+                )}>
+                  {done ? <Check className="h-2.5 w-2.5" strokeWidth={3} />
+                    : active ? <span className="h-1.5 w-1.5 rounded-full bg-amber-200" />
+                      : fail ? <X className="h-2.5 w-2.5" strokeWidth={3} />
+                        : <span className="h-1 w-1 rounded-full bg-slate-600" />}
+                </span>
+              </div>
+
+              {/* content */}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className={cn("font-mono text-[9px]", active ? "text-amber-400/80" : "text-slate-600")}>
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <span className={cn("truncate text-[12.5px]",
+                    active ? "font-semibold text-amber-100" : done ? "text-slate-200" : "text-slate-500")}>
+                    {s.label}
+                  </span>
+                </div>
+                {(s.calls > 0 || active) && (
+                  <div className="mt-0.5 font-mono text-[9.5px] text-slate-500">
+                    {s.calls > 0
+                      ? <>{s.calls} 次调用{s.elapsed ? <span className="text-slate-600"> · {s.elapsed}s</span> : null}</>
+                      : "调用中…"}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <Handle type="target" position={H.l} className={handleCls()} />
       <Handle type="source" position={H.r} className={handleCls()} />
     </div>
   );
@@ -259,6 +499,8 @@ export const OrchestratorNode = memo(({ data }: NodeProps) => {
 export const nodeTypes = {
   shotRoot: ShotRootNode,
   shotLane: ShotLaneNode,
+  asset: AssetNode,
+  clip: ClipNode,
   screenwriter: ScreenwriterNode,
   orchestrator: OrchestratorNode,
 };

@@ -19,7 +19,9 @@ import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
-import WorkflowCanvas from "../components/flow/WorkflowCanvas";
+import WorkflowCanvas, { type AssetInfo, type ShotInfo } from "../components/flow/WorkflowCanvas";
+import AssetPanel from "../components/flow/AssetPanel";
+import ClipPlayer from "../components/flow/ClipPlayer";
 import type { PipelineStatus, ProjectState } from "../App";
 
 const basename = (p: string) => p.split(/[\\/]/).pop() || p;
@@ -55,6 +57,10 @@ export default function EditorView({
   const [customVideo, setCustomVideo] = useState("");
   const [error, setError] = useState("");
   const [wb, setWb] = useState<{ task: string; idx?: number } | null>(null);
+  const [assetView, setAssetView] = useState<AssetInfo | null>(null);
+  const [assets, setAssets] = useState<AssetInfo[]>([]);
+  const [clipView, setClipView] = useState<ShotInfo | null>(null);
+  const [shots, setShots] = useState<ShotInfo[]>([]);
   const [monitorView, setMonitorView] = useState<"canvas" | "grid">("canvas");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [suggesting, setSuggesting] = useState(false);
@@ -88,6 +94,29 @@ export default function EditorView({
       }
     }).catch(() => {});
   }, [p.id]);
+
+  // Resolve the project's selected assets to their cached annotations so the
+  // pipeline canvas can show which videos/audio are in play + open each's标注.
+  useEffect(() => {
+    const paths = [...p.videos, p.audio].filter(Boolean);
+    if (paths.length === 0) { setAssets([]); return; }
+    api<{ assets: AssetInfo[] }>("/api/assets/by_paths", {
+      method: "POST", body: JSON.stringify({ paths }),
+    }).then((r) => setAssets(r.assets ?? [])).catch(() => setAssets([]));
+  }, [p.videos, p.audio]);
+
+  // Poll the final selected shots (shot_point.json) so the canvas can show each
+  // shot's chosen source + time slice and preview it. Grows during the run.
+  useEffect(() => {
+    if (!pipelineJobId) { setShots([]); return; }
+    let stop = false;
+    const fetchShots = () => api<{ shots: ShotInfo[] }>(`/api/pipeline/shots?project_id=${encodeURIComponent(p.id)}`)
+      .then((r) => { if (!stop) setShots(r.shots ?? []); }).catch(() => {});
+    fetchShots();
+    if (pipelineStatus !== "running") return;
+    const t = window.setInterval(fetchShots, 2500);
+    return () => { stop = true; window.clearInterval(t); };
+  }, [pipelineJobId, pipelineStatus, p.id, job.status]);
 
   const running = pipelineStatus === "running";
   const allVideoOptions = Array.from(new Set([...p.videos, ...videoFiles]));
@@ -414,10 +443,19 @@ export default function EditorView({
                   jobId={pipelineJobId}
                   tasks={job.meta.tasks ?? {}}
                   jobRunning={running}
-                  onOpenScreenwriter={() => setWb({ task: "screenwriter_llm" })}
+                  assets={assets}
+                  onOpenAsset={(a) => { setAssetView(a); setWb(null); setClipView(null); }}
+                  shots={shots}
+                  onOpenClip={(s) => { setClipView(s); setAssetView(null); setWb(null); }}
+                  onOpenScreenwriter={() => { setWb({ task: "screenwriter_llm" }); setAssetView(null); setClipView(null); }}
                   onRetryShot={retryShot}
-                  // workbench renders INSIDE the canvas (also visible in fullscreen)
-                  overlay={wb && (job.meta.tasks ?? {})[wb.task] ? (
+                  // overlay renders INSIDE the canvas (also visible in fullscreen);
+                  // priority: clip preview → asset annotation → agent workbench.
+                  overlay={clipView ? (
+                    <ClipPlayer shot={clipView} onClose={() => setClipView(null)} />
+                  ) : assetView ? (
+                    <AssetPanel asset={assetView} onClose={() => setAssetView(null)} />
+                  ) : wb && (job.meta.tasks ?? {})[wb.task] ? (
                     <AgentWorkbench
                       key={`${wb.task}-${wb.idx ?? "auto"}`} embedded
                       name={wb.task} t={job.meta.tasks[wb.task]} jobId={pipelineJobId}
@@ -457,11 +495,11 @@ export default function EditorView({
             )}
             {job.status === "error" && (
               <div className="mb-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">
-                流水线失败 — 打开右下角「流水线终端」查看日志。缓存已保存，修复后重新运行会跳过已完成步骤。
+                流水线失败 — 展开左下角「流水线」工作台查看日志。缓存已保存，修复后重新运行会跳过已完成步骤。
               </div>
             )}
             <div className="mt-1 text-xs text-slate-500">
-              完整日志在右下角悬浮的「流水线终端」中查看（可拖动 / 最小化）。
+              完整日志在左下角「流水线」工作台中查看（点击展开，可拖拽右下角调节大小）。
             </div>
           </CardContent>
         </Card>

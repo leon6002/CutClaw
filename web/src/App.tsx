@@ -20,7 +20,6 @@ import { api, useJob, type JobState } from "./api";
 import { ModelConfigProvider } from "./components/ModelConfig";
 import PipelineSettings from "./components/PipelineSettings";
 import AgentFlow from "./components/AgentFlow";
-import FloatingTerminal from "./components/FloatingTerminal";
 import JobDock from "./components/JobDock";
 import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
@@ -359,12 +358,9 @@ export default function App() {
         {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
         <PipelineSettings open={showParams} onOpenChange={setShowParams} />
 
-      <FloatingTerminal
-        lines={pipelineJob.lines}
-        running={pipelineStatus === "running"}
-        visible={!!pipelineJobId || pipelineJob.lines.length > 0}
-      />
-      {/* global job dock — bottom-left, above all overlays */}
+      {/* global job dock — bottom-left, above all overlays. Shows every running
+          job (annotate/select/pipeline/render) with an expandable, resizable log.
+          Replaced the old bottom-right FloatingTerminal, which duplicated it. */}
       <JobDock />
 
         <Dialog open={newModal} onOpenChange={(o) => !o && setNewModal(false)}>

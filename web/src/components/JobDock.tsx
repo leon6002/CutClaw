@@ -21,6 +21,22 @@ const KINDS = [
   { kind: "render", label: "渲染", Icon: Video },
 ] as const;
 
+// Remember the log panel's dragged size across sessions (one shared size for
+// every job kind, so the dock feels consistent wherever it opens).
+const SIZE_KEY = "cutclaw_jobdock_logsize";
+
+function loadLogSize(): { w: number; h: number } | null {
+  try {
+    const s = JSON.parse(localStorage.getItem(SIZE_KEY) || "null");
+    if (s && typeof s.w === "number" && typeof s.h === "number") return s;
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveLogSize(w: number, h: number) {
+  try { localStorage.setItem(SIZE_KEY, JSON.stringify({ w, h })); } catch { /* ignore */ }
+}
+
 function JobChip({
   label, Icon, jobId, onDismiss,
 }: {
@@ -28,7 +44,25 @@ function JobChip({
 }) {
   const job = useJob(jobId);
   const [open, setOpen] = useState(false);
+  const preRef = useRef<HTMLPreElement>(null);
   const m: any = job.meta ?? {};
+
+  // Restore the saved log-panel size on open, and persist any resize the user
+  // does (debounced). The native CSS resize handle mutates the element's
+  // inline width/height — we mirror that into localStorage.
+  useEffect(() => {
+    const el = preRef.current;
+    if (!open || !el) return;
+    const s = loadLogSize();
+    if (s) { el.style.width = `${s.w}px`; el.style.height = `${s.h}px`; }
+    let t = 0;
+    const ro = new ResizeObserver(() => {
+      window.clearTimeout(t);
+      t = window.setTimeout(() => saveLogSize(el.offsetWidth, el.offsetHeight), 250);
+    });
+    ro.observe(el);
+    return () => { window.clearTimeout(t); ro.disconnect(); };
+  }, [open]);
   const running = job.status === "running";
   const pct = typeof m.total === "number" && m.total > 0
     ? Math.min(100, Math.round(((m.current ?? 0) / m.total) * 100))
@@ -46,12 +80,12 @@ function JobChip({
 
   return (
     <div className={cn(
-      "pointer-events-auto w-[300px] overflow-hidden rounded-xl border shadow-[0_8px_32px_rgba(0,0,0,0.55)] backdrop-blur-xl",
+      "pointer-events-auto w-fit min-w-[300px] overflow-hidden rounded-xl border shadow-[0_8px_32px_rgba(0,0,0,0.55)] backdrop-blur-xl",
       running ? "border-cyan-500/40 bg-slate-950/95"
         : job.status === "done" ? "border-emerald-500/40 bg-slate-950/95"
           : "border-red-500/50 bg-slate-950/95",
     )}>
-      <div className="flex items-center gap-2 px-3 py-2">
+      <div className="flex min-w-[300px] items-center gap-2 px-3 py-2">
         {running
           ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-cyan-400" />
           : job.status === "done"
@@ -88,8 +122,14 @@ function JobChip({
         </div>
       )}
       {open && (
-        <pre className="max-h-44 overflow-y-auto border-t border-white/[0.07] bg-black/40 px-3 py-2 font-mono text-[10.5px] leading-relaxed whitespace-pre-wrap text-slate-400">
-          {job.lines.slice(-40).join("\n") || "（暂无日志）"}
+        // resize: drag the bottom-right corner to grow the log in both
+        // directions. Anchored bottom-left, so it expands up/right into free
+        // space. min keeps it usable; max stops it covering the whole screen.
+        <pre
+          ref={preRef}
+          className="h-64 max-h-[75vh] min-h-[120px] w-[460px] min-w-[300px] max-w-[85vw] resize overflow-auto border-t border-white/[0.07] bg-black/40 px-3 py-2 font-mono text-[10.5px] leading-relaxed whitespace-pre-wrap text-slate-400"
+        >
+          {job.lines.slice(-400).join("\n") || "（暂无日志）"}
         </pre>
       )}
     </div>
