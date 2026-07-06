@@ -825,13 +825,17 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
 
   return (
     <motion.div
+      className="h-full"
       initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.3, delay: Math.min(index * 0.04, 0.5) }}
     >
       <Card
         className={cn(
-          "group relative cursor-pointer gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]",
+          // h-full + flex column: grid rows stretch cards to equal height and
+          // the action buttons pin to the bottom, so rows stay aligned even
+          // when tags/summary差异 makes content heights differ
+          "group relative flex h-full cursor-pointer flex-col gap-0 overflow-hidden rounded-2xl border-white/[0.07] bg-slate-900/50 py-0 transition-all hover:border-cyan-500/30 hover:shadow-[0_0_20px_rgba(34,211,238,0.08)]",
           picked && "border-cyan-400/60 shadow-[0_0_16px_rgba(34,211,238,0.18)]",
         )}
         style={{ backdropFilter: "none", WebkitBackdropFilter: "none" }}
@@ -924,7 +928,7 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
           )}
         </div>
 
-        <CardContent className="p-3">
+        <CardContent className="flex flex-1 flex-col p-3">
           <div className="truncate text-[13px] font-semibold text-slate-200" title={a.absolute_path || a.file_path}>
             {a.file_name || a.file_path}
           </div>
@@ -932,11 +936,11 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             {a.width ? `${a.width}×${a.height} · ` : ""}
             {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
           </div>
-          {(a.capture_time || a.location) && (
-            <div className="mt-0.5 truncate text-[11px] text-slate-500">
-              {a.capture_time && <span>📅 {fmtCapture(a.capture_time)}</span>}
-              {a.location && <span className="ml-1.5">📍 {a.location}</span>}
-            </div>
+          {a.capture_time && (
+            <div className="mt-0.5 text-[11px] text-slate-500">📅 {fmtCapture(a.capture_time)}</div>
+          )}
+          {a.location && (
+            <div className="mt-0.5 truncate text-[11px] text-slate-500" title={a.location}>📍 {a.location}</div>
           )}
           <div className="mt-1.5 flex flex-wrap gap-1">
             {a.annotated
@@ -962,7 +966,7 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             <p className="mt-1.5 line-clamp-2 text-xs text-slate-400">{ann.summary}</p>
           )}
           {onAnnotate && (
-            <div className="mt-2.5 flex gap-1.5">
+            <div className="mt-auto flex gap-1.5 pt-2.5">
               <Button
                 variant="outline" size="sm"
                 className={cn(
