@@ -510,7 +510,16 @@ def extract_all_clips(
 def _ai_pick_transitions(clips, shot_plan) -> list:
     """Ask the agent LLM to choose a transition per cut, based on the outgoing/
     incoming shot descriptions from the shot_plan. Returns a list of
-    "name:duration" strings (len = n-1) or None on any failure (→ hard cuts)."""
+    "name:duration" strings (len = n-1), or None when there are no boundaries.
+
+    Never falls back to bare hard cuts: unknown picks, missing entries and a
+    failed LLM call all become the soft fallback (TRANSITION_FALLBACK,
+    default fade:0.4) — a mellow memory montage must not degrade to a
+    transition-less slideshow of jumps."""
+    main_clips = [c for c in clips if not c.get("is_ending") and not c.get("is_intro")]
+    if len(main_clips) < 2:
+        return None
+    _fb = "fade:0.4"
     try:
         _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _root not in sys.path:
@@ -519,6 +528,8 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
         import src.config as config
         import litellm
 
+        _fb = str(getattr(config, "TRANSITION_FALLBACK", _fb) or _fb).strip().lower()
+
         # per-shot descriptions keyed by (section_idx, shot_idx)
         plan_shots = {}
         for si, sec in enumerate((shot_plan or {}).get("video_structure", []) or []):
@@ -526,9 +537,6 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
                 plan_shots[(si, hi)] = sh
         theme = ((shot_plan or {}).get("video_structure") or [{}])[0].get("overall_theme", "")
 
-        main_clips = [c for c in clips if not c.get("is_ending") and not c.get("is_intro")]
-        if len(main_clips) < 2:
-            return None
         boundaries = []
         for k in range(1, len(main_clips)):
             a = plan_shots.get((main_clips[k - 1].get("section_idx", 0), main_clips[k - 1].get("shot_idx", 0)), {})
@@ -543,19 +551,29 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
 
         palette_desc = "\n".join(f"- {k}: {v}" for k, v in TRANSITION_PALETTE.items())
         prompt = (
-            "You are a professional video editor choosing the transition for EACH cut of a music-driven "
-            "short montage.\n\n"
+            "You are a seasoned editor choosing the transition for EACH cut of a cinematic "
+            "travel-memory montage: mellow and emotional — scenery, ambient moments, candid "
+            "voices and laughter, cut to music. This is a memory reel, NOT a fast beat-drop MV.\n\n"
             f"Overall theme: {theme}\n\n"
             "Available transitions (name: when to use):\n"
-            f"- cut: instant hard cut — the DEFAULT for beat-synced, high-energy edits\n{palette_desc}\n\n"
-            "Rules:\n"
-            "- Hard cuts should DOMINATE a fast, beat-driven edit; use visible transitions only as accents "
-            "(emotion shifts, location changes, the finale).\n"
+            "- cut: instant hard cut — right ON a strong musical accent, or when the two shots "
+            "contrast clearly (wide→close, scenery→people, motion→still)\n"
+            f"{palette_desc}\n\n"
+            "Craft rules (emotion first — pick what the moment feels like):\n"
+            "- Between two calm, similar shots (scenery→scenery, drone→drone) a bare cut feels "
+            "abrupt — prefer fade / dissolve / hblur there. In a mellow montage, soft transitions "
+            "are the workhorse and will usually be the majority.\n"
+            "- Choose cut only where the music clearly accents the boundary or the incoming shot "
+            "is a deliberate energy spike.\n"
+            "- fadeblack: only for a chapter-level reset or right before the finale (1-2 max).\n"
+            "- fadewhite: only at a bright euphoric peak (1 max).\n"
+            "- Stylized accents (zoomin, radial, circleopen, hlslice, distance, smoothleft/right): "
+            "1-2 in the WHOLE video, never on quiet moments.\n"
             "- Never use the same non-cut transition twice in a row.\n"
-            "- duration: 0.3-0.6 seconds.\n\n"
+            "- duration: 0.3-0.6 seconds (0.5-0.6 for calm dissolves, 0.3-0.4 for accents).\n\n"
             f"Cuts to decide (between consecutive shots):\n{json.dumps(boundaries, ensure_ascii=False, indent=1)}\n\n"
             'Reply with ONLY a JSON array, one entry per cut, e.g.: '
-            '["cut", "fadeblack:0.4", "cut", "zoomin:0.35"]'
+            '["fade:0.5", "cut", "dissolve:0.5", "fadeblack:0.4"]'
         )
         def _ask(model, api_base, api_key):
             kwargs = dict(model=model,
@@ -599,19 +617,19 @@ def _ai_pick_transitions(clips, shot_plan) -> list:
             except Exception as _e:  # noqa: BLE001
                 print(f"⚠️ transition pick via {_model} failed ({str(_e)[:120]}) — trying fallback")
         if not arr:
-            return None
+            raise RuntimeError("no usable reply from any model")
         out = []
         for item in arr[: len(main_clips) - 1]:
             s = str(item).strip().lower()
             name = s.split(":")[0]
-            out.append(s if (name == "cut" or name in TRANSITION_PALETTE) else "cut")
+            out.append(s if (name == "cut" or name in TRANSITION_PALETTE) else _fb)
         while len(out) < len(main_clips) - 1:
-            out.append("cut")
+            out.append(_fb)
         print(f"🎞️  [AI transitions] {out}")
         return out
     except Exception as e:  # noqa: BLE001
-        print(f"⚠️ AI transition selection failed ({e}) — falling back to hard cuts")
-        return None
+        print(f"⚠️ AI transition selection failed ({e}) — falling back to uniform {_fb}")
+        return [_fb] * (len(main_clips) - 1)
 
 
 # Curated xfade transitions with editorial intent — the AI picker (and any
@@ -2160,7 +2178,7 @@ def main():
         _plan = shot_plan if ('shot_plan' in locals() and isinstance(shot_plan, dict)) else None
         transitions = _ai_pick_transitions(clips, _plan)
         if transitions is None:
-            print("AI transition selection unavailable — rendering with hard cuts")
+            print("Fewer than 2 main clips — no transitions to decide")
 
     # Voice highlights → BGM ducking windows (real voices/laughter play through)
     duck_windows = []
