@@ -565,7 +565,8 @@ shot_point.json（多源 clip 各带 video_path）
 ### BGM 拼接（独立工具,不跑流水线）
 - `src/audio/bgm_stitch.py` + `POST /api/bgm/stitch`；素材页「拼接 BGM」按钮（音频≥2 时可用）。
 - 实测无缝三件套：起止吸附各曲**小节线**（facts.bar_sec）；段间 `acrossfade` **2 小节封顶 4s**；各段先 loudnorm 再接。
-- **物化哲学**：产物是 `resource/imports/` 里的普通 mp3（+同名 .bgmmix.json 记录成分）——重新扫描后流水线把它当"一首歌"分析使用，**零下游改动**就获得多 BGM 能力。二期（AI 自由编排/免重分析的 facts 合并）待一期听感验收后再做。
+- **物化哲学**：产物是 `resource/imports/` 里的普通 mp3（+同名 .bgmmix.json 记录成分）——重新扫描后流水线把它当"一首歌"分析使用，**零下游改动**就获得多 BGM 能力。
+- **AI 融合模式**（`plan_bgm_mix`，面板默认）：LLM 拿到各曲**实测段落**（section_stats 的能量均值/趋势 + BPM + 小节长 + climax），只做编排决策——哪首的哪几段承担 开场→铺垫→高潮→收尾，**按段落序号引用，禁止编时间**；物化仍走小节吸附+低谷衔接+loudnorm。LLM 失败 → 确定性兜底（各曲能量峰值段贪心扩展），100% 成功。推理模型空回复要读 reasoning_content + 放大 token 预算（与转场选择器同款处理）。facts 读取兜底到标注轨缓存（asset_index/audio_captions），刚标注完没跑过流水线的歌也能融合。
 - 局限：无调性检测，风格相近的歌拼接效果最好。
 
 ### 素材红心 ❤️（与镜头级 👍 互补的粗粒度口味）
