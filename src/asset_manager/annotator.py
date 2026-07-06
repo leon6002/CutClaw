@@ -499,9 +499,15 @@ def annotate_audio_asset(
                         _bpm = _measured_bpm_from_caption(caption_data, metadata.content_hash)
                         if _bpm:
                             parsed["bpm"] = _bpm
-                        # LLMs rewrite the structured section list into prose,
-                        # which kills the UI's colored section timeline — the
-                        # measured "Name start-end, ..." string always wins
+                        # BOTH representations are kept: the LLM's prose telling
+                        # of the musical journey moves to structure_notes; the
+                        # MEASURED "Name start-end, ..." string owns
+                        # sections_summary (the UI timeline parses it — an LLM
+                        # rewrite into prose used to silently kill that view)
+                        _llm_sections = str(parsed.get("sections_summary") or "").strip()
+                        if _llm_sections and _llm_sections != sections_summary \
+                                and not parsed.get("structure_notes"):
+                            parsed["structure_notes"] = _llm_sections
                         if sections_summary:
                             parsed["sections_summary"] = sections_summary
                         return AudioAnnotation(**parsed)

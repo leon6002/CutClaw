@@ -96,6 +96,7 @@ const FIELD_LABELS: Record<string, string> = {
   genre: "曲风", energy_level: "能量", bpm: "BPM", quality_score: "质量分",
   mood: "氛围", instruments: "乐器", vocals: "人声", tempo: "节奏",
   description: "描述", subject: "主体", style: "风格",
+  structure_notes: "结构叙述",
 };
 
 function fmtVal(v: any): string {
