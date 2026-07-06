@@ -236,27 +236,40 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
     if len(usable) < 2:
         raise ValueError("至少要有两首已标注(有节奏分析)的歌才能 AI 融合")
 
+    # Segments carry EXPLICIT durations and cumulative spans — the 84s/165s
+    # under-pick happened because the model had to mentally sum (end−start)
+    # across runs with zero support. Give it the arithmetic pre-chewed and
+    # make it show its own total so under-picks are self-evident.
     lines = []
     for ti, info in enumerate(usable):
         seg_txt = " | ".join(
-            f"S{s['idx']} {s['start']:.0f}-{s['end']:.0f}s e={s['energy']} {s['trend']}"
+            f"S{s['idx']} {s['start']:.0f}-{s['end']:.0f}s (dur {s['end'] - s['start']:.0f}s) "
+            f"e={s['energy']} {s['trend']}"
             for s in info["segments"])
-        lines.append(f"Track {ti} 「{info['name']}」 bpm={info['bpm']} bar={info['bar_sec']}s "
-                     f"climax@{info['climax_sec']}s\n  {info['summary']}\n  {seg_txt}")
+        track_total = info["segments"][-1]["end"] - info["segments"][0]["start"]
+        lines.append(f"Track {ti} 「{info['name']}」 total {track_total:.0f}s, bpm={info['bpm']} "
+                     f"bar={info['bar_sec']}s climax@{info['climax_sec']}s\n"
+                     f"  {info['summary']}\n  {seg_txt}")
 
+    per_track = target_sec / max(1, len(usable))
     prompt = (
         "You are a music editor arranging a seamless BGM mix for a travel-memory montage.\n"
-        f"Target total duration: about {target_sec:.0f}s (within ±15%).\n"
+        f"HARD REQUIREMENT — total duration: {target_sec:.0f}s (acceptable {target_sec * 0.9:.0f}"
+        f"–{target_sec * 1.1:.0f}s). This is the film's length; a shorter mix truncates the film. "
+        f"With {len(usable)} track(s), each run should span roughly {per_track:.0f}s — that means "
+        "MULTIPLE consecutive sections per run, not one section.\n"
         + (brief or "") + "\n"
-        "Tracks with their MEASURED sections (energy 0-1, trend building/steady/falling):\n"
+        "Tracks with their MEASURED sections (each shows its own duration; energy 0-1, "
+        "trend building/steady/falling):\n"
         + "\n".join(lines) + "\n\n"
         "Arrange CONTIGUOUS section runs (each from one track) into an emotional arc: "
         "calm opening → build → peak → gentle resolve.\n"
         "Rules:\n"
         "- Reference sections ONLY by index; never invent times.\n"
+        "- ADD UP the section durations of every run as you plan; adjust runs until the grand "
+        "total lands in the acceptable range, then report it in \"total_sec\".\n"
         "- BALANCE: with 4+ tracks provided use AT LEAST 3 of them; no single track may "
         "exceed ~40% of the total — the user picked these songs to HEAR them.\n"
-        "- Total duration within ±10% of the target.\n"
         "- OPENING must sound like a real beginning: strongly prefer a run that STARTS at "
         "some track's section 0 (its own intro) — an excerpt from mid-track sounds like a "
         "radio switched on halfway.\n"
@@ -267,8 +280,25 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
         "and building — that is where a crossfade disappears.\n"
         "- Use each track at most once.\n"
         'Reply ONLY JSON: {"plan": [{"track": 0, "from": 2, "to": 4, "role": "build"}, ...], '
-        '"why": "one short sentence in Chinese"}'
+        '"total_sec": <the sum you computed>, "why": "one short sentence in Chinese"}'
     )
+
+    def _plan_total(pl) -> float:
+        """MEASURED sum of a plan's runs — never trust the model's total_sec."""
+        t = 0.0
+        for item in pl or []:
+            try:
+                ti = int(item.get("track"))
+                lo, hi = int(item.get("from")), int(item.get("to"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= ti < len(usable)):
+                continue
+            segs = usable[ti]["segments"]
+            lo = max(0, min(lo, len(segs) - 1))
+            hi = max(lo, min(hi, len(segs) - 1))
+            t += segs[hi]["end"] - segs[lo]["start"]
+        return t
 
     plan, why = None, ""
     try:
@@ -284,33 +314,58 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
         for model, base, key in candidates:
             if not model:
                 continue
-            try:
-                # reasoning models think BEFORE replying and share the token
-                # budget; a small cap truncates the answer to empty
-                kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}],
-                              temperature=0.4, max_tokens=16000, timeout=180)
-                if base:
-                    kwargs["api_base"] = base
-                if key:
-                    kwargs["api_key"] = key
-                raw = litellm.completion(**kwargs)
-                msg = raw.choices[0].message
-                content = (msg.content or "").strip()
-                if not content:  # some reasoning models leave the JSON in the thinking text
-                    content = str(getattr(msg, "reasoning_content", "") or "").strip()
-                if content.startswith("```"):
-                    content = _re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", content)
-                parsed = _extract_json_obj(content)
-                if parsed is None:
-                    raise ValueError(f"no parseable JSON object in reply (len={len(content)})")
-                if isinstance(parsed, dict) and isinstance(parsed.get("plan"), list):
+            feedback = ""
+            for attempt in (1, 2):
+                try:
+                    # reasoning models think BEFORE replying and share the token
+                    # budget; a small cap truncates the answer to empty
+                    kwargs = dict(model=model,
+                                  messages=[{"role": "user", "content": prompt + feedback}],
+                                  temperature=0.4, max_tokens=16000, timeout=180)
+                    if base:
+                        kwargs["api_base"] = base
+                    if key:
+                        kwargs["api_key"] = key
+                    raw = litellm.completion(**kwargs)
+                    msg = raw.choices[0].message
+                    content = (msg.content or "").strip()
+                    if not content:  # some reasoning models leave the JSON in the thinking text
+                        content = str(getattr(msg, "reasoning_content", "") or "").strip()
+                    if content.startswith("```"):
+                        content = _re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", content)
+                    parsed = _extract_json_obj(content)
+                    if parsed is None:
+                        raise ValueError(f"no parseable JSON object in reply (len={len(content)})")
+                    if not (isinstance(parsed, dict) and isinstance(parsed.get("plan"), list)):
+                        # parsed but shape wrong — say WHAT came back so failures are diagnosable
+                        print(f"[BGMmix] {model}: JSON parsed but no plan list "
+                              f"(keys={list(parsed)[:6] if isinstance(parsed, dict) else type(parsed).__name__})")
+                        break
+                    # LENGTH ACCOUNTING at the source (not just the downstream
+                    # safety net): measure the plan's real span; a bad total gets
+                    # ONE repair re-ask with the concrete numbers.
+                    t = _plan_total(parsed["plan"])
+                    if not (target_sec * 0.85 <= t <= target_sec * 1.25):
+                        if attempt == 1:
+                            feedback = (
+                                f"\n\nYOUR PREVIOUS PLAN WAS REJECTED: its runs sum to {t:.0f}s, "
+                                f"but the target is {target_sec:.0f}s (acceptable "
+                                f"{target_sec * 0.9:.0f}–{target_sec * 1.1:.0f}s). Re-plan with runs "
+                                "spanning MORE consecutive sections per track"
+                                + (" (or fewer)" if t > target_sec else "")
+                                + " so the measured total lands in range.")
+                            print(f"⚠️ [BGMmix] 编排总长 {t:.0f}s 偏离目标 {target_sec:.0f}s —— "
+                                  "带反馈修复性重试（会重新计费整个 prompt）", flush=True)
+                            continue
+                        print(f"⚠️ [BGMmix] 修复性重试后总长仍为 {t:.0f}s —— 交给确定性收口扩/裁",
+                              flush=True)
                     plan, why = parsed["plan"], str(parsed.get("why", ""))[:200]
                     break
-                # parsed but shape wrong — say WHAT came back so failures are diagnosable
-                print(f"[BGMmix] {model}: JSON parsed but no plan list "
-                      f"(keys={list(parsed)[:6] if isinstance(parsed, dict) else type(parsed).__name__})")
-            except Exception as e:  # noqa: BLE001
-                print(f"[BGMmix] plan via {model} failed: {str(e)[:120]}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[BGMmix] plan via {model} failed: {str(e)[:120]}")
+                    break
+            if plan:
+                break
     except Exception:  # noqa: BLE001
         pass
 

@@ -828,9 +828,21 @@ def _compute_duck_windows(clips, transitions, transition_duration) -> list:
             w_e = min(clip_out_e, pos[k] + (ov_e - s0) + 0.4)
             windows.append([round(w_s, 2), round(w_e, 2)])
     windows.sort()
+    # merge近邻窗口:两段人声隔得太近时,BGM 音量在中间"弹起来又压下去"
+    # 非常难受(用户反馈)——间隔 < DUCK_MERGE_GAP_SEC(默认 2s)的窗口
+    # 合并成一段,中间音乐保持压低不恢复
+    merge_gap = 2.0
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from src import config as _cfg
+        merge_gap = float(getattr(_cfg, "DUCK_MERGE_GAP_SEC", 2.0))
+    except Exception:  # noqa: BLE001
+        pass
     merged: list = []
     for a, b in windows:
-        if merged and a - merged[-1][1] < 0.4:
+        if merged and a - merged[-1][1] < merge_gap:
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
@@ -1576,10 +1588,20 @@ def render_video_ffmpeg(
                 )
             else:
                 bgm_outro_fade_expr = "1.0"
-            # voice-highlight ducking: inside each window the BGM drops to 25%
-            # and the ORIGINAL audio fades in, with 0.3s ramps on both sides —
-            # real voices/laughter play over quiet music, then music returns
+            # voice-highlight ducking: inside each window the BGM drops to
+            # DUCK_BGM_LEVEL (default 50% — 25% felt like the music vanished,
+            # user feedback) and the ORIGINAL audio fades in, with 0.3s ramps
+            # on both sides — voices/laughter play over softened music
             _DUCK_R = 0.3
+            _duck_level = 0.5
+            try:
+                _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if _root not in sys.path:
+                    sys.path.insert(0, _root)
+                from src import config as _dcfg
+                _duck_level = min(1.0, max(0.1, float(getattr(_dcfg, "DUCK_BGM_LEVEL", 0.5))))
+            except Exception:  # noqa: BLE001
+                pass
             duck_env = None
             if duck_windows:
                 _terms = [
@@ -1587,12 +1609,12 @@ def render_video_ffmpeg(
                     for a, b in duck_windows
                 ]
                 duck_env = "min(1,(" + "+".join(_terms) + "))"
-                print("Voice-highlight ducking at: "
+                print(f"Voice-highlight ducking (BGM → {_duck_level:.0%}) at: "
                       + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in duck_windows))
 
             bgm_volume_expr = f"({bgm_base_volume_expr})*({bgm_outro_fade_expr})"
             if duck_env:
-                bgm_volume_expr = f"({bgm_volume_expr})*(1-0.75*{duck_env})"
+                bgm_volume_expr = f"({bgm_volume_expr})*(1-{1.0 - _duck_level:.2f}*{duck_env})"
 
             if audio_start_time is not None and audio_duration is not None:
                 print(f"Audio crop: {audio_start_time:.2f}s - {audio_start_time + audio_duration:.2f}s (duration: {audio_duration:.2f}s)")
