@@ -376,7 +376,11 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
                 if feedback else ""
             ),
         )
-        content = _call_agent_litellm([{"role": "user", "content": prompt}], max_tokens=512)
+        # The ANSWER is ~100 tokens, but reasoning models spend thinking tokens
+        # from the same budget — 512 starved deepseek's reasoning to death
+        # (empty content, finish_reason=length → fail-fast). 8k leaves ample
+        # thinking room while still capping a runaway reply.
+        content = _call_agent_litellm([{"role": "user", "content": prompt}], max_tokens=8192)
         if not content:
             feedback = "No response returned. Return valid JSON with section_index."
             continue
