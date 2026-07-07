@@ -1591,6 +1591,12 @@ export default function AssetsView({
       setAssets(r.assets); setScanned(true);
       if (!root) setRoot(r.root);
       setDetail((d) => d ? r.assets.find((a) => a.content_hash === d.content_hash) ?? d : null);
+      // pull Immich favorites into hearts (fire-and-forget) — the user's
+      // natural taste gesture is ❤️ while browsing memories on the phone
+      api<any>("/api/immich/sync_hearts", { method: "POST", body: "{}" })
+        .then(() => api<{ hearts: string[] }>("/api/assets/hearts"))
+        .then((h) => setHearts(new Set(h.hearts ?? [])))
+        .catch(() => {});
     } catch (e: any) { setError(e.message); }
     setScanning(false);
   };
@@ -1913,6 +1919,19 @@ export default function AssetsView({
                       } catch (e: any) { setError(`识别失败：${e.message}`); }
                     }}>
                     🔗 识别本地原片 ↔ Immich…
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"
+                    onClick={async () => {
+                      setMoreOpen(false); setError("");
+                      try {
+                        const r = await api<any>("/api/immich/sync_hearts", { method: "POST", body: "{}" });
+                        setError(`✓ Immich 收藏同步：全库 ${r.favorites} 条收藏视频，工作区新增红心 ${r.linked_added} 个${r.linked_removed ? ` · 移除 ${r.linked_removed}` : ""}`);
+                        const h = await api<{ hearts: string[] }>("/api/assets/hearts");
+                        setHearts(new Set(h.hearts ?? []));
+                      } catch (e: any) { setError(`同步失败：${e.message}`); }
+                    }}>
+                    ❤️ 同步 Immich 收藏为红心
                   </button>
                   <button
                     className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-slate-300 hover:bg-white/[0.06]"

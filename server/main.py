@@ -3596,19 +3596,95 @@ def assets_hearts():
     return {"hearts": sorted(h for h, v in _hearts_load().items() if v.get("hearted"))}
 
 
-@app.post("/api/assets/heart")
-def asset_heart(body: HeartRequest):
-    """Toggle the ❤️ on an asset. Hearted videos get a modest pool bonus and
-    a +1 source quota; hearted music is preferred by the BGM planner."""
-    if not body.content_hash:
-        raise HTTPException(400, "content_hash required")
-    hearts = _hearts_load()
-    hearts[body.content_hash] = {"hearted": bool(body.hearted),
-                                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+def _hearts_save(hearts: dict) -> None:
     os.makedirs(os.path.dirname(_HEARTS_PATH), exist_ok=True)
     with open(_HEARTS_PATH, "w", encoding="utf-8") as f:
         json.dump(hearts, f, ensure_ascii=False, indent=2)
-    return {"ok": True, "hearted": bool(body.hearted)}
+
+
+def _hash_to_immich_id(content_hash: str) -> str | None:
+    """content hash → workspace file → Immich asset id (via immich_map)."""
+    try:
+        from src.asset_manager.index_store import load_index
+        ann = load_index().get(content_hash)
+        fn = os.path.basename(getattr(ann.metadata, "absolute_path", "") or "") if ann else ""
+        if fn:
+            return (_load_immich_map().get(fn) or {}).get("id")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+@app.post("/api/assets/heart")
+def asset_heart(body: HeartRequest):
+    """Toggle the ❤️ on an asset. Hearted videos get a modest pool bonus and
+    a +1 source quota; hearted music is preferred by the BGM planner.
+    Linked assets push the heart to Immich as a favorite (one heart universe:
+    the user's natural gesture is ❤️, in either app)."""
+    if not body.content_hash:
+        raise HTTPException(400, "content_hash required")
+    hearts = _hearts_load()
+    hearts[body.content_hash] = {"hearted": bool(body.hearted), "source": "user",
+                                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    _hearts_save(hearts)
+    synced = False
+    aid = _hash_to_immich_id(body.content_hash)
+    if aid:
+        try:
+            _immich_req(f"/assets/{aid}", "PUT", {"isFavorite": bool(body.hearted)})
+            synced = True
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "hearted": bool(body.hearted), "immich_synced": synced}
+
+
+@app.post("/api/immich/sync_hearts")
+def immich_sync_hearts():
+    """Pull Immich FAVORITES into CutClaw hearts — the user's natural taste
+    gesture is ❤️ while browsing memories on the phone, not rating stars.
+    Additive for new favorites; mirrors un-favorites ONLY for hearts that
+    came from Immich (source=immich), never touching manual CutClaw hearts
+    (audio tracks etc. live only here)."""
+    fav_ids = set()
+    page = 1
+    while page:
+        r = _immich_req("/search/metadata", "POST",
+                        {"isFavorite": True, "type": "VIDEO", "size": 200, "page": page})
+        a = r.get("assets") or {}
+        for it in a.get("items", []):
+            if it.get("id"):
+                fav_ids.add(it["id"])
+        page = a.get("nextPage")
+
+    # linked workspace files: immich id ↔ basename ↔ content hash
+    imap = _load_immich_map()
+    from src.asset_manager.index_store import load_index
+    hash_by_name = {}
+    for h, ann in load_index().items():
+        fn = os.path.basename(getattr(ann.metadata, "absolute_path", "") or "")
+        if fn:
+            hash_by_name[fn] = h
+
+    hearts = _hearts_load()
+    added = removed = 0
+    for fname, entry in imap.items():
+        aid = entry.get("id")
+        h = hash_by_name.get(fname)
+        if not aid or not h:
+            continue
+        cur = hearts.get(h) or {}
+        if aid in fav_ids:
+            if not cur.get("hearted"):
+                hearts[h] = {"hearted": True, "source": "immich",
+                             "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                added += 1
+        elif cur.get("hearted") and cur.get("source") == "immich":
+            hearts[h] = {"hearted": False, "source": "immich",
+                         "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            removed += 1
+    if added or removed:
+        _hearts_save(hearts)
+    return {"favorites": len(fav_ids), "linked_added": added, "linked_removed": removed}
 
 
 @app.get("/api/render/beats")
