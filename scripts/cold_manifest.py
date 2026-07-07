@@ -170,16 +170,29 @@ th{color:#67e8f9;position:sticky;top:0;background:#0f172a}
 <h2>冷备份清单</h2>
 <div class=hint>生成于 """ + time.strftime("%Y-%m-%d %H:%M") + """ · 共 """ + str(len(data)) + """ 项 · 输入即筛(文件名/日期/相簿/相机)</div>
 <input id=q placeholder="例如: DJI_2026 / 新疆 / OsmoPocket / 从 Immich 网址复制的资产 ID" autofocus>
-<div class=hint>提示: 在 Immich 打开某个视频,网址 /photos/ 后面那串就是资产 ID,粘贴到这里直达母带路径</div>
-<table><thead><tr><th>文件名<th>拍摄时间<th>相簿<th>大小MB<th>相机<th>资产ID<th>冷盘路径</tr></thead><tbody id=tb></tbody></table>
+<div class=hint>提示: 网址 /photos/ 后面那串就是资产 ID,粘贴直达母带路径 · 点表头排序(再点反向) — 按「大小」降序即得瘦身候选清单</div>
+<table><thead><tr id=hd>
+<th data-k=name>文件名<th data-k=taken>拍摄时间<th data-k=album>相簿<th data-k=size_mb>大小MB<th data-k=camera>相机<th>资产ID<th>冷盘路径
+</tr></thead><tbody id=tb></tbody></table>
 <script>const D=""" + json.dumps(data, ensure_ascii=False) + """;
 const tb=document.getElementById('tb'),q=document.getElementById('q');
+let sortK=null,sortDir=-1;
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-function render(){const t=q.value.trim().toLowerCase();let n=0;let h='';
-for(const r of D){if(t&&!(r.name+' '+r.taken+' '+r.album+' '+r.camera+' '+r.id).toLowerCase().includes(t))continue;
-if(++n>500){h+='<tr><td colspan=7 class=hint>…还有更多,请细化搜索</td></tr>';break}
+function render(){const t=q.value.trim().toLowerCase();
+let rows=D.filter(r=>!t||(r.name+' '+r.taken+' '+r.album+' '+r.camera+' '+r.id).toLowerCase().includes(t));
+if(sortK){rows=[...rows].sort((a,b)=>{const x=a[sortK],y=b[sortK];
+return (typeof x==='number'?x-y:String(x).localeCompare(String(y)))*sortDir})}
+let n=0,h='';
+for(const r of rows){if(++n>500){h+='<tr><td colspan=7 class=hint>…还有更多,请细化搜索</td></tr>';break}
 h+=`<tr><td>${esc(r.name)}<td>${esc(r.taken)}<td>${esc(r.album)}<td>${r.size_mb}<td>${esc(r.camera)}<td class=path title="${esc(r.id)}">${esc(r.id.slice(0,8))}<td class="path${r.on_disk?'':' miss'}">${esc(r.cold)}${r.on_disk?'':' (缺失)'}</td></tr>`}
-tb.innerHTML=h}
+tb.innerHTML=h;
+for(const th of document.querySelectorAll('#hd th')){const k=th.dataset.k;
+th.textContent=th.textContent.replace(/ [▲▼]$/,'')+(k===sortK?(sortDir<0?' ▼':' ▲'):'')}}
+document.getElementById('hd').addEventListener('click',e=>{
+const k=e.target.dataset&&e.target.dataset.k;if(!k)return;
+if(sortK===k)sortDir=-sortDir;else{sortK=k;sortDir=k==='size_mb'?-1:1}
+render()});
+document.querySelectorAll('#hd th[data-k]').forEach(th=>th.style.cursor='pointer');
 q.addEventListener('input',render);render();</script>""")
     print(f"清单: {csv_path}")
     print(f"      {html_path}")
