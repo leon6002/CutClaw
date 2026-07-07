@@ -166,28 +166,42 @@ table{border-collapse:collapse;margin-top:12px;width:100%}
 td,th{padding:3px 8px;border-bottom:1px solid #1e293b;text-align:left;white-space:nowrap}
 th{color:#67e8f9;position:sticky;top:0;background:#0f172a}
 .miss{color:#f87171}.path{color:#64748b;font-family:monospace;font-size:11px}
-.hint{color:#64748b;margin:6px 0}</style>
+.hint{color:#64748b;margin:6px 0}
+.btn{display:inline-block;padding:1px 8px;margin-right:4px;font-size:11px;color:#67e8f9;
+background:#164e63;border:1px solid #155e75;border-radius:5px;text-decoration:none;cursor:pointer}
+.btn:hover{background:#155e75}button.btn{font:inherit}</style>
 <h2>冷备份清单</h2>
 <div class=hint>生成于 """ + time.strftime("%Y-%m-%d %H:%M") + """ · 共 """ + str(len(data)) + """ 项 · 输入即筛(文件名/日期/相簿/相机)</div>
 <input id=q placeholder="例如: DJI_2026 / 新疆 / OsmoPocket / 从 Immich 网址复制的资产 ID" autofocus>
 <div class=hint>提示: 网址 /photos/ 后面那串就是资产 ID,粘贴直达母带路径 · 点表头排序(再点反向) — 按「大小」降序即得瘦身候选清单</div>
 <table><thead><tr id=hd>
-<th data-k=name>文件名<th data-k=taken>拍摄时间<th data-k=album>相簿<th data-k=size_mb>大小MB<th data-k=camera>相机<th>资产ID<th>冷盘路径
+<th data-k=name>文件名<th data-k=taken>拍摄时间<th data-k=album>相簿<th data-k=size_mb>大小MB<th data-k=camera>相机<th>资产ID<th>操作<th>冷盘路径
 </tr></thead><tbody id=tb></tbody></table>
 <script>const D=""" + json.dumps(data, ensure_ascii=False) + """;
 const tb=document.getElementById('tb'),q=document.getElementById('q');
 let sortK=null,sortDir=-1;
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function fileUrl(p){return 'file:///'+encodeURI(p.replace(/\\\\/g,'/')).replace(/#/g,'%23')}
+function copyPath(btn,p){
+  // file:// 页面拿不到 navigator.clipboard — 退回 execCommand
+  const ta=document.createElement('textarea');ta.value=p;document.body.appendChild(ta);
+  ta.select();try{document.execCommand('copy')}catch(e){}
+  document.body.removeChild(ta);
+  const t=btn.textContent;btn.textContent='✓ 已复制';setTimeout(()=>btn.textContent=t,1200)}
 function render(){const t=q.value.trim().toLowerCase();
 let rows=D.filter(r=>!t||(r.name+' '+r.taken+' '+r.album+' '+r.camera+' '+r.id).toLowerCase().includes(t));
 if(sortK){rows=[...rows].sort((a,b)=>{const x=a[sortK],y=b[sortK];
 return (typeof x==='number'?x-y:String(x).localeCompare(String(y)))*sortDir})}
 let n=0,h='';
-for(const r of rows){if(++n>500){h+='<tr><td colspan=7 class=hint>…还有更多,请细化搜索</td></tr>';break}
-h+=`<tr><td>${esc(r.name)}<td>${esc(r.taken)}<td>${esc(r.album)}<td>${r.size_mb}<td>${esc(r.camera)}<td class=path title="${esc(r.id)}">${esc(r.id.slice(0,8))}<td class="path${r.on_disk?'':' miss'}">${esc(r.cold)}${r.on_disk?'':' (缺失)'}</td></tr>`}
+for(const r of rows){if(++n>500){h+='<tr><td colspan=8 class=hint>…还有更多,请细化搜索</td></tr>';break}
+const acts=(r.on_disk?`<a class=btn href="${fileUrl(r.cold)}" target=_blank title="浏览器直接播放冷盘文件">▶ 播放</a> `:'')
+  +`<button class=btn data-p="${esc(r.cold)}" title="复制冷盘完整路径">📋 复制</button>`;
+h+=`<tr><td>${esc(r.name)}<td>${esc(r.taken)}<td>${esc(r.album)}<td>${r.size_mb}<td>${esc(r.camera)}<td class=path title="${esc(r.id)}">${esc(r.id.slice(0,8))}<td>${acts}<td class="path${r.on_disk?'':' miss'}">${esc(r.cold)}${r.on_disk?'':' (缺失)'}</td></tr>`}
 tb.innerHTML=h;
 for(const th of document.querySelectorAll('#hd th')){const k=th.dataset.k;
 th.textContent=th.textContent.replace(/ [▲▼]$/,'')+(k===sortK?(sortDir<0?' ▼':' ▲'):'')}}
+tb.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-p]');if(b)copyPath(b,b.dataset.p)});
 document.getElementById('hd').addEventListener('click',e=>{
 const k=e.target.dataset&&e.target.dataset.k;if(!k)return;
 if(sortK===k)sortDir=-sortDir;else{sortK=k;sortDir=k==='size_mb'?-1:1}
