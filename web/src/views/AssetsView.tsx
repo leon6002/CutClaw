@@ -2315,7 +2315,7 @@ export default function AssetsView({
               <span className="text-[11px] text-cyan-300">筛出 {shown.length} 个</span>
             )}
             <div className="ml-auto flex items-center gap-2">
-              <span className="text-[11px] text-slate-600">勾选卡片=手动选材</span>
+              <span className="text-[11px] text-slate-600">勾选卡片 → 底部批量操作(标注 / 设为素材)</span>
               <Button
                 variant="outline"
                 className="h-8 gap-1.5 border-violet-500/40 bg-violet-500/10 text-xs text-violet-300 hover:bg-violet-500/20"
@@ -2354,44 +2354,80 @@ export default function AssetsView({
               {shown.map((a, i) => renderAssetCard(a, i))}
             </div>
           )}
-          {/* manual selection apply bar */}
-          {(pickedVideos.length > 0 || pickedAudioAssets.length > 0) && (
+          {/* SELECTION ACTION BAR — checking cards means "selected", not yet
+              "for the project": the intent (annotate / re-annotate / use as
+              footage) is chosen HERE, file-manager style. */}
+          {(pickedVideos.length > 0 || pickedAudioAssets.length > 0) && (() => {
+            const sel = [...pickedVideos, ...pickedAudioAssets];
+            const selHashes = sel.map((a) => a.content_hash).filter(Boolean);
+            const nAnnotated = sel.filter((a) => a.annotated).length;
+            const vids = pickedVideos.filter((a) => a.content_hash);
+            const nLocalAnn = vids.filter((a) => a.annotated_local).length;
+            const shownChips = sel.slice(0, 6);
+            return (
             <div className="sticky bottom-3 z-20 mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-slate-900/95 px-4 py-2.5 shadow-[0_0_24px_rgba(0,0,0,0.5)]">
-              <span className="text-sm font-semibold text-cyan-300">手动选材：</span>
-              {pickedVideos.map((a) => (
-                <Badge key={a.content_hash} variant="outline" className="border-sky-500/40 bg-sky-500/10 text-[11px] text-sky-300">
-                  <Film className="mr-1 h-3 w-3" />{a.file_name || a.file_path}
+              <span className="text-sm font-semibold text-cyan-300">已选 {sel.length} 项</span>
+              {shownChips.map((a) => (
+                <Badge key={a.content_hash || a.file_path} variant="outline"
+                  className={a.asset_type === "audio"
+                    ? "border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300"
+                    : "border-sky-500/40 bg-sky-500/10 text-[11px] text-sky-300"}>
+                  {a.asset_type === "audio" ? <Music2 className="mr-1 h-3 w-3" /> : <Film className="mr-1 h-3 w-3" />}
+                  {(a.file_name || a.file_path).slice(0, 24)}
                 </Badge>
               ))}
-              {pickedAudioAssets.map((a, i) => (
-                <Badge key={a.content_hash} variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[11px] text-violet-300">
-                  <Music2 className="mr-1 h-3 w-3" />{pickedAudioAssets.length > 1 ? `${i + 1}. ` : ""}{a.file_name || a.file_path}
-                </Badge>
-              ))}
-              <div className="ml-auto flex items-center gap-2">
+              {sel.length > shownChips.length && (
+                <span className="text-[11px] text-slate-500">+{sel.length - shownChips.length}</span>
+              )}
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                {/* annotate ops */}
+                <Button variant="outline" size="sm"
+                  className="h-7 gap-1 border-cyan-500/30 bg-cyan-500/[0.08] text-xs text-cyan-300 hover:bg-cyan-500/15"
+                  disabled={busy || selHashes.length === 0}
+                  title="用云端模型标注选中素材(视频+音频)"
+                  onClick={() => {
+                    if (nAnnotated > 0 && !window.confirm(`选中的 ${sel.length} 项里有 ${nAnnotated} 个已标注,将重跑(消耗 API)。继续?`)) return;
+                    annotate(selHashes, nAnnotated > 0);
+                  }}>
+                  <Tags className="h-3 w-3" /> ☁ 标注 ({selHashes.length})
+                </Button>
+                <Button variant="outline" size="sm"
+                  className="h-7 gap-1 border-violet-500/30 bg-violet-500/[0.08] text-xs text-violet-300 hover:bg-violet-500/15"
+                  disabled={busy || vids.length === 0}
+                  title="用本地 VLM 标注选中视频(3090,免费,并行轨道)"
+                  onClick={() => {
+                    if (nLocalAnn > 0 && !window.confirm(`选中视频里有 ${nLocalAnn} 个已有本地标注,将重跑。继续?`)) return;
+                    annotate(vids.map((a) => a.content_hash), nLocalAnn > 0, "local");
+                  }}>
+                  🖥 本地标注 ({vids.length})
+                </Button>
+                <span className="mx-1 h-4 w-px bg-white/10" />
+                {/* project ops */}
                 {pickApplied ? (
-                  <span className="text-xs text-emerald-400">✓ 已写入项目 — 切到「项目编辑」运行流水线</span>
+                  <span className="text-xs text-emerald-400">✓ 已写入项目 — 去「项目编辑」运行</span>
                 ) : (
                   <span className="text-[11px] text-slate-500">
                     {pickedVideos.length} 视频
-                    {pickedAudioAssets.length === 0 ? " · 未选音乐"
+                    {pickedAudioAssets.length === 0 ? ""
                       : pickedAudioAssets.length === 1 ? " · 1 音乐"
-                        : ` · ${pickedAudioAssets.length} 音乐(运行流水线前按目标时长自动融合)`}
+                        : ` · ${pickedAudioAssets.length} 音乐(运行前自动融合)`}
                   </span>
                 )}
+                <Button size="sm"
+                  className="h-7 gap-1 bg-cyan-500 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
+                  disabled={pickedVideos.length === 0}
+                  title="把选中的视频/音乐设为当前项目的剪辑素材"
+                  onClick={applyPick}>
+                  <Pin className="h-3 w-3" /> 设为项目素材
+                </Button>
                 <Button variant="outline" size="sm" className="h-7 border-white/10 bg-white/[0.04] text-xs"
                   onClick={() => { setPicked(new Set()); setPickedAudios([]); setPickApplied(false); }}>
                   清空
                 </Button>
-                <Button size="sm"
-                  className="h-7 gap-1 bg-cyan-500 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
-                  disabled={pickedVideos.length === 0}
-                  onClick={applyPick}>
-                  <Pin className="h-3 w-3" /> 应用到项目
-                </Button>
               </div>
             </div>
-          )}
+            );
+          })()}
         </>
       ) : (
         <EmptyHint>点击「扫描」发现素材文件</EmptyHint>
