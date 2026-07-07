@@ -176,6 +176,8 @@ def audit(entry: dict) -> None:
 
 
 def done_ids() -> set:
+    """Both sides of every completed swap — skipping new_id keeps replacements
+    from being re-shrunk on later runs (they can exceed --min-mb too)."""
     ids = set()
     try:
         with open(AUDIT, "r", encoding="utf-8") as f:
@@ -184,10 +186,12 @@ def done_ids() -> set:
                     d = json.loads(line)
                     if d.get("ok"):
                         ids.add(d.get("old_id"))
+                        ids.add(d.get("new_id"))
                 except Exception:  # noqa: BLE001
                     continue
     except FileNotFoundError:
         pass
+    ids.discard(None)
     return ids
 
 
@@ -227,8 +231,13 @@ def main():
     todo = []
     for a in assets:
         sz = (a.get("exifInfo") or {}).get("fileSizeInByte") or 0
-        if sz >= args.min_mb * 1024 * 1024 and a["id"] not in skip:
-            todo.append(a)
+        if sz < args.min_mb * 1024 * 1024 or a["id"] in skip:
+            continue
+        # belt-and-suspenders: never re-shrink our own uploads even if the
+        # audit log is lost — they carry a marked deviceAssetId
+        if str(a.get("deviceAssetId") or "").startswith("shrink-"):
+            continue
+        todo.append(a)
     todo.sort(key=lambda x: -(x.get("exifInfo") or {}).get("fileSizeInByte", 0))
     if args.limit:
         todo = todo[:args.limit]
