@@ -295,8 +295,12 @@ def main():
 
             req("/assets", "DELETE", {"ids": [aid], "force": bool(args.purge)})
             print(f"    旧资产已{'永久删除' if args.purge else '移入回收站'}")
+            # cold path + capture time land in the audit so the manifest can
+            # keep mapping this master FOREVER — Immich forgets trashed assets
             entry.update({"ok": True, "new_id": new_id, "bytes_after": new_sz,
-                          "cold_verified": True})
+                          "cold_verified": True, "cold_path": cold,
+                          "taken": (info.get("fileCreatedAt") or "")[:19].replace("T", " "),
+                          "album": album["albumName"]})
         except Exception as e:  # noqa: BLE001
             print(f"    ❌ {e}")
             entry.update({"ok": False, "error": str(e)[:300]})
