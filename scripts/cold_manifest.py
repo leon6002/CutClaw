@@ -93,6 +93,7 @@ def shrunk_master_rows() -> list:
                     "size_mb": round((d.get("bytes_before") or 0) / 2**20, 1),
                     "camera": "",
                     "path": "",
+                    "live": False,   # gone from Immich once the trash empties
                     "_cold_override": d["cold_path"],
                 })
     except FileNotFoundError:
@@ -178,6 +179,7 @@ background:#164e63;border:1px solid #155e75;border-radius:5px;text-decoration:no
 <th data-k=name>文件名<th data-k=taken>拍摄时间<th data-k=album>相簿<th data-k=size_mb>大小MB<th data-k=camera>相机<th>资产ID<th>操作<th>冷盘路径
 </tr></thead><tbody id=tb></tbody></table>
 <script>const D=""" + json.dumps(data, ensure_ascii=False) + """;
+const IM=""" + json.dumps(BASE) + """;
 const tb=document.getElementById('tb'),q=document.getElementById('q');
 let sortK=null,sortDir=-1;
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -195,6 +197,7 @@ return (typeof x==='number'?x-y:String(x).localeCompare(String(y)))*sortDir})}
 let n=0,h='';
 for(const r of rows){if(++n>500){h+='<tr><td colspan=8 class=hint>…还有更多,请细化搜索</td></tr>';break}
 const acts=(r.on_disk?`<a class=btn href="${fileUrl(r.cold)}" target=_blank title="浏览器直接播放冷盘文件">▶ 播放</a> `:'')
+  +(r.live!==false?`<a class=btn href="${IM}/photos/${r.id}" target=_blank title="在 Immich 中打开">🖼 Immich</a> `:'')
   +`<button class=btn data-p="${esc(r.cold)}" title="复制冷盘完整路径">📋 复制</button>`;
 h+=`<tr><td>${esc(r.name)}<td>${esc(r.taken)}<td>${esc(r.album)}<td>${r.size_mb}<td>${esc(r.camera)}<td class=path title="${esc(r.id)}">${esc(r.id.slice(0,8))}<td>${acts}<td class="path${r.on_disk?'':' miss'}">${esc(r.cold)}${r.on_disk?'':' (缺失)'}</td></tr>`}
 tb.innerHTML=h;
