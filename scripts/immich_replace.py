@@ -197,7 +197,10 @@ def done_ids() -> set:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--album", required=True, help="相簿名(子串匹配)")
+    ap.add_argument("--album", help="相簿名(子串匹配)— 批量模式")
+    ap.add_argument("--id", help="资产 ID(逗号分隔可多个;Immich 网址 /photos/ 后那串,"
+                                 "或冷盘清单的资产ID列)— 指名模式,忽略 --min-mb")
+    ap.add_argument("--name", help="按文件名子串过滤(配合 --album)")
     ap.add_argument("--min-mb", type=int, default=500, help="只处理大于此体积的视频")
     ap.add_argument("--preset", choices=list(PRESETS), default="4k")
     ap.add_argument("--limit", type=int, default=0, help="本次最多处理 N 个(0=不限)")
@@ -205,42 +208,66 @@ def main():
     ap.add_argument("--purge", action="store_true",
                     help="跳过回收站直接删除(默认进回收站,30天可恢复)")
     args = ap.parse_args()
+    if not args.album and not args.id:
+        sys.exit("❌ 需要 --album(批量)或 --id(指名)其一")
 
     if not os.path.isdir(COLD_ROOT):
         sys.exit(f"❌ 冷备份盘不在位({COLD_ROOT})— 校验母带需要它,插盘后重试")
     if not os.path.exists(FFMPEG):
         sys.exit(f"❌ 找不到 ffmpeg: {FFMPEG}")
 
-    albums = req("/albums")
-    matches = [a for a in albums if args.album.lower() in (a.get("albumName") or "").lower()]
-    if len(matches) != 1:
-        sys.exit(f"❌ 相簿匹配到 {len(matches)} 个: {[a.get('albumName') for a in matches]}")
-    album = matches[0]
-    print(f"相簿: {album['albumName']} ({album.get('assetCount')} 项)")
-
-    assets, page = [], 1
-    while page:
-        r = req("/search/metadata", "POST",
-                {"albumIds": [album["id"]], "type": "VIDEO", "size": 200,
-                 "page": page, "withExif": True})
-        a = r.get("assets") or {}
-        assets.extend(a.get("items", []))
-        page = a.get("nextPage")
-
     skip = done_ids()
-    todo = []
-    for a in assets:
-        sz = (a.get("exifInfo") or {}).get("fileSizeInByte") or 0
-        if sz < args.min_mb * 1024 * 1024 or a["id"] in skip:
-            continue
-        # belt-and-suspenders: never re-shrink our own uploads even if the
-        # audit log is lost — they carry a marked deviceAssetId
-        if str(a.get("deviceAssetId") or "").startswith("shrink-"):
-            continue
-        todo.append(a)
-    todo.sort(key=lambda x: -(x.get("exifInfo") or {}).get("fileSizeInByte", 0))
-    if args.limit:
-        todo = todo[:args.limit]
+
+    if args.id:
+        # 指名模式:直接拉这些资产,不做体积过滤
+        album_name = ""
+        assets = []
+        for aid in [x.strip() for x in args.id.split(",") if x.strip()]:
+            try:
+                a = req(f"/assets/{aid}")
+            except Exception as e:  # noqa: BLE001
+                sys.exit(f"❌ 资产 {aid[:12]} 获取失败: {e}")
+            if a.get("type") != "VIDEO":
+                sys.exit(f"❌ {a.get('originalFileName')} 不是视频")
+            assets.append(a)
+        todo = [a for a in assets if a["id"] not in skip
+                and not str(a.get("deviceAssetId") or "").startswith("shrink-")]
+        for a in assets:
+            if a not in todo:
+                print(f"  ⏭ 已处理过,跳过: {a.get('originalFileName')}")
+    else:
+        albums = req("/albums")
+        matches = [a for a in albums if args.album.lower() in (a.get("albumName") or "").lower()]
+        if len(matches) != 1:
+            sys.exit(f"❌ 相簿匹配到 {len(matches)} 个: {[a.get('albumName') for a in matches]}")
+        album = matches[0]
+        album_name = album["albumName"]
+        print(f"相簿: {album_name} ({album.get('assetCount')} 项)")
+
+        assets, page = [], 1
+        while page:
+            r = req("/search/metadata", "POST",
+                    {"albumIds": [album["id"]], "type": "VIDEO", "size": 200,
+                     "page": page, "withExif": True})
+            a = r.get("assets") or {}
+            assets.extend(a.get("items", []))
+            page = a.get("nextPage")
+
+        todo = []
+        for a in assets:
+            sz = (a.get("exifInfo") or {}).get("fileSizeInByte") or 0
+            if sz < args.min_mb * 1024 * 1024 or a["id"] in skip:
+                continue
+            if args.name and args.name.lower() not in str(a.get("originalFileName") or "").lower():
+                continue
+            # belt-and-suspenders: never re-shrink our own uploads even if the
+            # audit log is lost — they carry a marked deviceAssetId
+            if str(a.get("deviceAssetId") or "").startswith("shrink-"):
+                continue
+            todo.append(a)
+        todo.sort(key=lambda x: -(x.get("exifInfo") or {}).get("fileSizeInByte", 0))
+        if args.limit:
+            todo = todo[:args.limit]
 
     total_gb = sum((a.get("exifInfo") or {}).get("fileSizeInByte", 0) for a in todo) / 2**30
     print(f"待处理: {len(todo)} 个视频 · {total_gb:.1f} GB · 预设 {args.preset} "
@@ -297,10 +324,18 @@ def main():
             print(f"    旧资产已{'永久删除' if args.purge else '移入回收站'}")
             # cold path + capture time land in the audit so the manifest can
             # keep mapping this master FOREVER — Immich forgets trashed assets
+            _alname = album_name
+            if not _alname:   # 指名模式:反查该资产所属相簿(取第一个)
+                try:
+                    als = requests.get(BASE + "/api/albums", params={"assetId": aid},
+                                       headers={"x-api-key": KEY}, timeout=30).json()
+                    _alname = (als or [{}])[0].get("albumName", "")
+                except Exception:  # noqa: BLE001
+                    pass
             entry.update({"ok": True, "new_id": new_id, "bytes_after": new_sz,
                           "cold_verified": True, "cold_path": cold,
                           "taken": (info.get("fileCreatedAt") or "")[:19].replace("T", " "),
-                          "album": album["albumName"]})
+                          "album": _alname})
         except Exception as e:  # noqa: BLE001
             print(f"    ❌ {e}")
             entry.update({"ok": False, "error": str(e)[:300]})
