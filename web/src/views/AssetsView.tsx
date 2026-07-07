@@ -1683,8 +1683,10 @@ export default function AssetsView({
       JSON.stringify(a.annotation ?? {}).toLowerCase().includes(q))
     .filter((a) => annFilter === "all" ? true
       : annFilter === "cloud" ? a.annotated
-        : annFilter === "local" ? !!a.annotated_local
-          : (!a.annotated && !a.annotated_local))
+        : annFilter === "cloud_no" ? !a.annotated
+          : annFilter === "local" ? !!a.annotated_local
+            : annFilter === "local_no" ? (a.asset_type === "video" && !a.annotated_local)
+              : (!a.annotated && !a.annotated_local))
     .filter((a) => !tagFilter || assetTags(a).includes(tagFilter))
     .sort((a, b) => {
       // AI-synthesized mixes display FIRST in the audio wall (they're project
@@ -2286,8 +2288,10 @@ export default function AssetsView({
               共 {assets.length} 个素材 · {assets.length - newCount} 已标注 · {newCount} 新
             </span>
             {/* sort & filter — journey time / score / tags / annotation tracks */}
+            {/* native <option> popups ignore the select's dark classes — each
+                option needs its own bg or Windows renders them white-on-white */}
             <select
-              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none [&>option]:bg-slate-900 [&>option]:text-slate-200"
               value={sortBy} onChange={(e) => setSortBy(e.target.value as any)}
             >
               <option value="trip">按旅程分组</option>
@@ -2296,16 +2300,18 @@ export default function AssetsView({
               <option value="time_asc">按拍摄时间 旧→新</option>
             </select>
             <select
-              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              className="h-7 rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none [&>option]:bg-slate-900 [&>option]:text-slate-200"
               value={annFilter} onChange={(e) => setAnnFilter(e.target.value as any)}
             >
               <option value="all">全部标注状态</option>
               <option value="cloud">☁ 已云端标注</option>
+              <option value="cloud_no">☁ 未云端标注</option>
               <option value="local">🖥 已本地标注</option>
-              <option value="none">未标注</option>
+              <option value="local_no">🖥 未本地标注</option>
+              <option value="none">完全未标注</option>
             </select>
             <select
-              className="h-7 max-w-[130px] rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none"
+              className="h-7 max-w-[130px] rounded-md border border-white/10 bg-black/25 px-1.5 text-[11px] text-slate-300 outline-none [&>option]:bg-slate-900 [&>option]:text-slate-200"
               value={tagFilter} onChange={(e) => setTagFilter(e.target.value)}
             >
               <option value="">全部 tag</option>
@@ -2313,6 +2319,27 @@ export default function AssetsView({
             </select>
             {(annFilter !== "all" || tagFilter) && (
               <span className="text-[11px] text-cyan-300">筛出 {shown.length} 个</span>
+            )}
+            {shown.length > 0 && (
+              <button
+                className="rounded-md border border-white/10 bg-white/[0.04] px-2 py-1 text-[11px] text-slate-300 hover:border-cyan-400/40 hover:text-cyan-300"
+                title="选中当前筛选结果里的全部视频/音乐 → 底部操作条批量处理"
+                onClick={() => {
+                  setPicked((s) => {
+                    const n = new Set(s);
+                    shown.forEach((a) => { if (a.asset_type === "video" && a.content_hash) n.add(a.content_hash); });
+                    return n;
+                  });
+                  setPickedAudios((s) => {
+                    const n = [...s];
+                    shown.forEach((a) => { if (a.asset_type === "audio" && a.content_hash && !n.includes(a.content_hash)) n.push(a.content_hash); });
+                    return n;
+                  });
+                  setPickApplied(false);
+                }}
+              >
+                全选筛出
+              </button>
             )}
             <div className="ml-auto flex items-center gap-2">
               <span className="text-[11px] text-slate-600">勾选卡片 → 底部批量操作(标注 / 设为素材)</span>
