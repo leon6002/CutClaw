@@ -2155,6 +2155,30 @@ export default function AssetsView({
             </div>
             {imMsg && <span className="text-xs text-emerald-400">{imMsg}</span>}
             <div className="ml-auto flex items-center gap-2">
+              {imMode === "album" && imAlbum && imAlbum.total > imAlbum.items.length && (
+                <Button variant="outline" size="sm" className="h-8 border-amber-500/30 bg-amber-500/[0.06] text-xs text-amber-300 hover:bg-amber-500/15"
+                  onClick={async () => {
+                    const nPhotos = imAlbum.total - imAlbum.items.length;
+                    if (!window.confirm(`对相簿「${imAlbum.name}」的照片做 AI 摄影评审?\n\n约 ${nPhotos} 张照片(每次最多 200 张,已评过的跳过,可重复运行推进)。\n评级写入 Immich 星级(S=5星…D=1星),画质/光影/构图点评写入描述。\n使用当前「视觉」模型 — 本地模型免费。`)) return;
+                    setImMsg("");
+                    try {
+                      await api<any>("/api/immich/score_photos", { method: "POST", body: JSON.stringify({ album_id: imAlbum.id, limit: 200 }) });
+                      const t = window.setInterval(async () => {
+                        try {
+                          const s = await api<any>("/api/workspace/task");
+                          if (s.running) { setImMsg(`评审中… ${s.done}/${s.total} ${s.note || ""}`); return; }
+                          window.clearInterval(t);
+                          if (s.error) { setImMsg(`评审失败:${s.error}`); return; }
+                          const r = s.result || {};
+                          const g = Object.entries(r.grades || {}).map(([k, v]) => `${k}×${v}`).join(" ");
+                          setImMsg(`✓ 评审完成:${r.scored} 张(${g})${r.failed ? ` · 失败 ${r.failed}` : ""}${r.remaining ? ` · 剩余约 ${r.remaining} 张可再跑` : ""} — 去 Immich 按星级筛选看看`);
+                        } catch { window.clearInterval(t); }
+                      }, 2000);
+                    } catch (e: any) { setImMsg(`评审失败:${e.message}`); }
+                  }}>
+                  📷 AI 评分照片
+                </Button>
+              )}
               {imMode === "album" && imAlbum && imAlbum.items.some((x: any) => !x.imported) && (
                 <Button variant="outline" size="sm" className="h-8 border-white/10 bg-white/[0.04] text-xs"
                   onClick={() => setImPicked((s0) => {

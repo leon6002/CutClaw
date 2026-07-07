@@ -1332,6 +1332,195 @@ def immich_writeback(body: WritebackRequest):
     return _writeback_annotations(body.file_names or None)
 
 
+# ── AI photo scoring: professional critique of Immich PHOTOS ───────────────
+# The user never rates manually (thousands of photos), so the Immich star
+# rating is machine-owned: grade → stars (filter/sort inside Immich), full
+# critique → a delimited description block. Runs on the CURRENT vision model
+# (local Qwen = free). v1 is VLM-judged only — no cv2 in the resident server
+# process (铁律10: heavy-DLL deps stay out; measured sharpness can join later
+# via a worker subprocess if the scores feel off).
+
+_PHOTO_MARK = "─── CutClaw 摄影评分 ───"
+_PHOTO_SCORES_PATH = os.path.join(PROJECT_ROOT, "Output", "asset_index", "photo_scores.json")
+_GRADE_STARS = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+
+_PHOTO_SCORE_PROMPT = """你是一位专业摄影评审(风光/旅拍/人文方向)。从专业摄影角度评价这张照片,诚实、克制,不要客套。
+
+只输出 JSON(不要 markdown 代码块):
+{"clarity": <0-10 画质:对焦是否实、噪点、曝光是否准、有无糊>,
+ "lighting": <0-10 光影:光线方向与质感、明暗层次、氛围、是否死黑死白>,
+ "composition": <0-10 构图:主体位置、三分/引导线/框架、平衡、地平线、裁切>,
+ "subject": <0-10 主体与瞬间:有没有明确主体、故事感、抓拍时机>,
+ "overall": <0-10 综合分,可有小数>,
+ "grade": "<S|A|B|C|D — S=作品级(罕见) A=优秀可出片 B=合格记录 C=有明显缺陷 D=废片>",
+ "strengths": "<一句话:这张最出色的地方;若乏善可陈就直说>",
+ "improve": "<一句话:下次拍摄最该改进的一点,要具体可执行,如'降低机位让地平线落在下三分线'>"}"""
+
+
+def _extract_json_generic(text: str):
+    """Fenced JSON → whole text → balanced-brace objects (LAST first —
+    reasoning models bury the answer at the end of thinking text)."""
+    t = (text or "").strip()
+    t = re.sub(r"^```[a-zA-Z]*\s*|\s*```\s*$", "", t)
+    try:
+        return json.loads(t)
+    except Exception:  # noqa: BLE001
+        pass
+    objs, depth, start = [], 0, -1
+    for i, ch in enumerate(t):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objs.append(t[start:i + 1])
+    for b in reversed(objs):
+        try:
+            return json.loads(b)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _photo_scores_load() -> dict:
+    try:
+        with open(_PHOTO_SCORES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _score_photo_vlm(img_b64: str) -> dict | None:
+    import litellm
+    kwargs = dict(
+        model=str(cfg("VIDEO_ANALYSIS_MODEL", "")),
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": _PHOTO_SCORE_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]}],
+        temperature=0.3, max_tokens=8192, timeout=180,
+    )
+    base = str(cfg("VIDEO_ANALYSIS_ENDPOINT", ""))
+    key = str(cfg("VIDEO_ANALYSIS_API_KEY", ""))
+    if base:
+        kwargs["api_base"] = base
+    if key:
+        kwargs["api_key"] = key
+    resp = litellm.completion(**kwargs)
+    msg = resp.choices[0].message
+    content = (msg.content or "").strip() \
+        or str(getattr(msg, "reasoning_content", "") or "").strip()
+    d = _extract_json_generic(content)
+    return d if isinstance(d, dict) and d.get("overall") is not None else None
+
+
+def _photo_block(s: dict) -> str:
+    dims = " · ".join(f"{lab} {s.get(k)}" for k, lab in
+                      (("clarity", "画质"), ("lighting", "光影"),
+                       ("composition", "构图"), ("subject", "主体")) if s.get(k) is not None)
+    lines = [_PHOTO_MARK,
+             f"评级 {s.get('grade', '?')} · 综合 {s.get('overall', '?')}/10"]
+    if dims:
+        lines.append(dims)
+    if s.get("strengths"):
+        lines.append(f"亮点: {s['strengths']}")
+    if s.get("improve"):
+        lines.append(f"建议: {s['improve']}")
+    lines.append(f"(CutClaw 摄影评分 · {time.strftime('%Y-%m-%d %H:%M')})")
+    return "\n".join(lines)
+
+
+def _photo_score_worker(album_id: str, limit: int, write_rating: bool):
+    import base64
+    try:
+        # album photos (IMAGE assets), paginated
+        assets, page = [], 1
+        while page and len(assets) < 2000:
+            r = _immich_req("/search/metadata", "POST",
+                            {"albumIds": [album_id], "type": "IMAGE", "size": 200,
+                             "page": page, "withExif": True})
+            a = r.get("assets") or {}
+            assets.extend(a.get("items", []))
+            page = a.get("nextPage")
+
+        store = _photo_scores_load()
+        todo = [a for a in assets
+                if a.get("id") not in store
+                and (a.get("exifInfo") or {}).get("rating") in (None, 0)][:max(1, limit)]
+        _WS_TASK["total"] = len(todo)
+        scored = failed = 0
+        grades: dict = {}
+        for i, a in enumerate(todo):
+            aid = a["id"]
+            _WS_TASK.update({"done": i, "note": f"评审 {a.get('originalFileName', aid[:8])}"})
+            try:
+                img = _immich_req(f"/assets/{aid}/thumbnail?size=preview", raw=True)
+                s = _score_photo_vlm(base64.b64encode(img).decode())
+                if not s:
+                    failed += 1
+                    continue
+                grade = str(s.get("grade", "")).strip().upper()[:1]
+                if grade not in _GRADE_STARS:
+                    ov = float(s.get("overall") or 0)
+                    grade = "S" if ov >= 9 else "A" if ov >= 8 else "B" if ov >= 6.5 \
+                        else "C" if ov >= 5 else "D"
+                    s["grade"] = grade
+                # description block (strip previous photo block, keep the rest)
+                info = _immich_req(f"/assets/{aid}")
+                cur = ((info.get("exifInfo") or {}).get("description")
+                       or info.get("description") or "")
+                if _PHOTO_MARK in cur:
+                    cur = cur.split(_PHOTO_MARK)[0].rstrip()
+                new_desc = (cur + "\n\n" + _photo_block(s)).strip() if cur else _photo_block(s)
+                body: dict = {"description": new_desc[:4000]}
+                if write_rating:
+                    body["rating"] = _GRADE_STARS[grade]
+                _immich_req(f"/assets/{aid}", "PUT", body)
+                s["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                s["name"] = a.get("originalFileName", "")
+                store[aid] = s
+                grades[grade] = grades.get(grade, 0) + 1
+                scored += 1
+                if scored % 10 == 0:
+                    os.makedirs(os.path.dirname(_PHOTO_SCORES_PATH), exist_ok=True)
+                    with open(_PHOTO_SCORES_PATH, "w", encoding="utf-8") as f:
+                        json.dump(store, f, ensure_ascii=False, indent=1)
+            except Exception:  # noqa: BLE001
+                failed += 1
+        os.makedirs(os.path.dirname(_PHOTO_SCORES_PATH), exist_ok=True)
+        with open(_PHOTO_SCORES_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=1)
+        _WS_TASK.update({"running": False, "done": _WS_TASK["total"],
+                         "result": {"scored": scored, "failed": failed,
+                                    "remaining": max(0, len(assets) - len(store)),
+                                    "grades": grades}})
+    except Exception as e:  # noqa: BLE001
+        _WS_TASK.update({"running": False, "error": str(e)[:400]})
+
+
+class PhotoScoreRequest(BaseModel):
+    album_id: str
+    limit: int = 200
+    write_rating: bool = True
+
+
+@app.post("/api/immich/score_photos")
+def immich_score_photos(body: PhotoScoreRequest):
+    """Batch-score an album's photos with the current vision model. Already-
+    scored (store) and already-rated photos are skipped, so repeated runs
+    walk through a big album incrementally."""
+    if not body.album_id:
+        raise HTTPException(400, "album_id required")
+    if not _ws_start("score_photos"):
+        raise HTTPException(409, "已有工作区任务在运行")
+    threading.Thread(target=_photo_score_worker,
+                     args=(body.album_id, body.limit, body.write_rating),
+                     daemon=True).start()
+    return {"started": True}
+
+
 def _immich_stream_original(immich_id: str, dst: str):
     """Stream an original (can be hundreds of MB) to disk without buffering."""
     import shutil as _sh
