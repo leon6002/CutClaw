@@ -512,6 +512,7 @@ function DetailView({
           {asset.asset_type === "image" && <img src={src} className="max-h-[480px] w-full rounded-xl bg-black object-contain" />}
           <div className="mt-1.5 text-xs text-slate-500">
             {asset.capture_time && <span className="text-slate-400">📅 {fmtCapture(asset.capture_time)} · </span>}
+            {(asset as any).camera && <span className="text-slate-400">📷 {(asset as any).camera} · </span>}
             {asset.location && <span className="text-slate-400">📍 {asset.location} · </span>}
             {asset.duration_sec ? `${Math.round(asset.duration_sec)}s · ` : ""}
             {asset.width ? `${asset.width}×${asset.height} · ` : ""}
@@ -937,7 +938,13 @@ function AssetCard({ a, onOpen, index, picked, onTogglePick, annotating, queued,
             {a.file_size_mb ? `${a.file_size_mb.toFixed(1)}MB` : ""}
           </div>
           {a.capture_time && (
-            <div className="mt-0.5 text-[11px] text-slate-500">📅 {fmtCapture(a.capture_time)}</div>
+            <div className="mt-0.5 text-[11px] text-slate-500">
+              📅 {fmtCapture(a.capture_time)}
+              {(a as any).camera && <span className="ml-1.5" title={(a as any).camera}>📷 {(a as any).camera}</span>}
+            </div>
+          )}
+          {!a.capture_time && (a as any).camera && (
+            <div className="mt-0.5 truncate text-[11px] text-slate-500">📷 {(a as any).camera}</div>
           )}
           {a.location && (
             <div className="mt-0.5 truncate text-[11px] text-slate-500" title={a.location}>📍 {a.location}</div>
