@@ -1389,6 +1389,8 @@ export default function AssetsView({
   const selecting = selJob.status === "running";
   const [typeTab, setTypeTab] = useState<string>("video");
   const [annWb, setAnnWb] = useState<{ task: string; idx?: number } | null>(null);
+  // the batch progress panel is opt-in — cards stream their own stage anyway
+  const [annPanelOpen, setAnnPanelOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<"trip" | "score" | "time_desc" | "time_asc">("trip");
   const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "local" | "none">("all");
@@ -1822,12 +1824,30 @@ export default function AssetsView({
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               扫描
             </Button>
-            {/* primary CTA follows the workflow state */}
-            {scanned && newCount > 0 && (
+            {/* primary CTA follows the workflow state. While a batch runs the
+                button IS the global progress — per-file detail lives on each
+                card's stage strip; the full panel is opt-in (click to expand). */}
+            {busy && (() => {
+              const f: Record<string, string> = annJob.meta.files ?? {};
+              const total = Object.keys(f).length;
+              const dn = Object.values(f).filter((s) => s === "d").length;
+              return (
+                <button
+                  className="flex h-9 items-center gap-1.5 rounded-md border border-cyan-500/40 bg-cyan-500/10 px-3 text-sm font-semibold text-cyan-300 hover:bg-cyan-500/20"
+                  onClick={() => setAnnPanelOpen((v) => !v)}
+                  title="标注进行中 — 点击展开/收起详细进度(每张卡片上也有自己的实时阶段)"
+                >
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  标注中 {dn}/{total}
+                  <span className="text-[10px] opacity-70">{annPanelOpen ? "▲收起" : "▼详情"}</span>
+                </button>
+              );
+            })()}
+            {scanned && newCount > 0 && !busy && (
               <Button
                 className="h-9 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_16px_rgba(34,211,238,0.3)] hover:bg-cyan-400"
-                onClick={() => annotate()} disabled={busy}>
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Tags className="h-4 w-4" />}
+                onClick={() => annotate()}>
+                <Tags className="h-4 w-4" />
                 标注新素材 ({newCount})
               </Button>
             )}
@@ -1985,8 +2005,10 @@ export default function AssetsView({
             </div>
           )}
 
-          {/* annotation batch panel: file dots + stage stepper + per-file grids */}
-          {busy && (
+          {/* annotation batch panel: file dots + stage stepper + per-file grids.
+              OPT-IN (collapsed by default): the same info streams on each
+              card, so the panel is for deliberate watching, not a fixture. */}
+          {busy && annPanelOpen && (
             <>
               <AnnotationProgress
                 meta={annJob.meta} jobId={annJobId}
