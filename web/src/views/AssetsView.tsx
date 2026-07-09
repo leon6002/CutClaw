@@ -296,6 +296,7 @@ function DetailView({
     clips: any[]; scenes: any[]; sound_highlights?: any[];
     highlight_pool?: any[]; highlight_pool_version?: number;
     highlight_pool_progress?: { done: number; total: number; note?: string };
+    fine_review_progress?: { done: number; total: number; note?: string };
   } | null>(null);
   const [poolBuilding, setPoolBuilding] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -346,6 +347,30 @@ function DetailView({
     }, 2500);
     return () => window.clearInterval(t);
   }, [poolBuilding, asset?.content_hash]);
+
+  // 🔬 AI 细评:VLM 逐片段分维度评判(标注时自动做;旧素材在这里补跑)
+  const [fineBusy, setFineBusy] = useState(false);
+  const runFineReview = async () => {
+    if (!asset) return;
+    setFineBusy(true);
+    try {
+      await api("/api/assets/fine_review", {
+        method: "POST", body: JSON.stringify({ content_hash: asset.content_hash }),
+      });
+    } catch { setFineBusy(false); }
+  };
+  useEffect(() => {
+    if (!fineBusy || !asset) return;
+    const t = window.setInterval(async () => {
+      try {
+        const d = await api<any>(`/api/assets/${asset.content_hash}/details`);
+        const done = (d.highlight_pool ?? []).some((m: any) => m.fine) && !d.fine_review_progress;
+        setDetails((prev: any) => ({ ...(prev ?? d), highlight_pool: d.highlight_pool, fine_review_progress: d.fine_review_progress }));
+        if (done) setFineBusy(false);
+      } catch { /* keep polling */ }
+    }, 3000);
+    return () => window.clearInterval(t);
+  }, [fineBusy, asset?.content_hash]);
 
   const detectHighlights = async (thr = shlThr) => {
     if (!asset) return;
@@ -730,6 +755,27 @@ function DetailView({
                         </button>
                       </div>
                     )}
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-7 gap-1.5 border-fuchsia-500/30 bg-fuchsia-500/[0.08] px-2.5 text-[11px] text-fuchsia-300"
+                        disabled={fineBusy} onClick={runFineReview}
+                      >
+                        {fineBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                        {fineBusy ? "细评中…" : details.highlight_pool.some((m: any) => m.fine) ? "🔬 补跑细评" : "🔬 AI 细评(分维度)"}
+                      </Button>
+                      {details.fine_review_progress && (
+                        <span className="text-[11px] text-fuchsia-300">
+                          {details.fine_review_progress.done}/{details.fine_review_progress.total} 段
+                          <span className="ml-1 text-slate-500">{details.fine_review_progress.note}</span>
+                        </span>
+                      )}
+                      {!details.highlight_pool.some((m: any) => m.fine) && !fineBusy && (
+                        <span className="text-[10.5px] text-slate-500">
+                          VLM 按严苛量表逐段评 构图/光影/主体瞬间/情绪 + 分层点评(新标注会自动做)
+                        </span>
+                      )}
+                    </div>
                     <div className="max-h-[560px] space-y-1.5 overflow-y-auto pr-1">
                       {details.highlight_pool.map((m: any, i: number) => (
                         <div key={i}
@@ -762,6 +808,35 @@ function DetailView({
                               )}
                             </span>
                           </div>
+                          {m.fine && (
+                            <div className="mt-1.5 rounded-md border border-fuchsia-500/20 bg-fuchsia-500/[0.05] px-2.5 py-1.5">
+                              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                <span className={cn("rounded px-1.5 py-0.5 text-[11px] font-bold",
+                                  m.fine.tier === "S" ? "bg-amber-400/20 text-amber-300"
+                                    : m.fine.tier === "A" ? "bg-emerald-400/15 text-emerald-300"
+                                      : m.fine.tier === "B" ? "bg-sky-400/15 text-sky-300"
+                                        : "bg-white/10 text-slate-400")}>
+                                  {m.fine.tier} 级{m.fine.avg != null ? ` · ${Number(m.fine.avg).toFixed(1)}` : ""}
+                                </span>
+                                {([["composition", "构图"], ["light", "光影"], ["subject_moment", "主体瞬间"], ["emotion", "情绪"]] as const).map(([k, label]) => (
+                                  m.fine.dims?.[k] != null && (
+                                    <span key={k} className="flex items-center gap-1 text-[10.5px] text-slate-400">
+                                      {label} {Number(m.fine.dims[k]).toFixed(0)}
+                                      <span className="inline-block h-1.5 w-12 overflow-hidden rounded-full bg-white/[0.08]">
+                                        <span className={cn("block h-full",
+                                          Number(m.fine.dims[k]) >= 7 ? "bg-emerald-400"
+                                            : Number(m.fine.dims[k]) >= 5 ? "bg-sky-400" : "bg-slate-500")}
+                                          style={{ width: `${Number(m.fine.dims[k]) * 10}%` }} />
+                                      </span>
+                                    </span>
+                                  )
+                                ))}
+                              </div>
+                              {m.fine.critique && (
+                                <p className="mt-1 text-[11px] text-fuchsia-200/80">「{m.fine.critique}」</p>
+                              )}
+                            </div>
+                          )}
                           <p className="mt-1 line-clamp-2 text-[11.5px] text-slate-300">{m.desc}</p>
                           {m.vlm_notes && (
                             <p className="mt-0.5 line-clamp-1 text-[10.5px] italic text-slate-500">评语：{m.vlm_notes}</p>

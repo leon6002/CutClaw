@@ -276,6 +276,12 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
 
     pool = []
     for ch in content_hashes:
+        # 标注时的逐片段细评(fine_review.json)随行进项目池
+        try:
+            from src.fine_review import load_fine_review
+            _fr = load_fine_review(ch)
+        except Exception:  # noqa: BLE001
+            _fr = {}
         for m in _source_pool(ch):
             best, best_ov = None, 0.0
             for idx, src_h, w_s, w_e in windows:
@@ -288,6 +294,9 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
                 continue          # moment outside every usable merged scene
             mm = dict(m)
             mm["scene"] = best
+            _fk = f"{float(m.get('start') or 0):.1f}:{float(m.get('end') or 0):.1f}"
+            if _fk in _fr:
+                mm["fine"] = _fr[_fk]
             pool.append(mm)
 
     # user taste memory: rejected ranges depress the score (stacking, capped);
@@ -465,7 +474,9 @@ def _score_reform_v9(pool: list) -> None:
             out[i] = rank / n
         return out
 
-    content_raw = [float(m.get("vlm_q") or 3) for m in pool]
+    # content 维度:有细评用细评均分(0-10,严苛量表),否则用标注 VLM 分(1-5 → ×2)
+    content_raw = [float((m.get("fine") or {}).get("avg") or 0) or float(m.get("vlm_q") or 3) * 2
+                   for m in pool]
     stab_raw = [float(m.get("stability", -1)) if float(m.get("stability", -1)) >= 0 else 5.5
                 for m in pool]
     rar_raw = [1.0 / (_csize.get(m.get("cluster"), 1) ** 0.5) for m in pool]
@@ -488,6 +499,13 @@ def _score_reform_v9(pool: list) -> None:
             comp *= 0.6
             m["empty_shot"] = True   # 无人无事无声的空镜——呼吸位可用,前列免谈
             empties += 1
+        _fine = m.get("fine") or {}
+        if _fine.get("tier") in _L3_TIER_SCORE:
+            # 标注时细评的 tier 在此合入(同 L3 配方),并占用 grade 展示通道;
+            # 这些时刻不再进 L3 排序(省钱,见 _l3_aesthetic_rescore 的过滤)
+            comp = 0.65 * comp + 0.35 * _L3_TIER_SCORE[_fine["tier"]]
+            m["l3_tier"] = _fine["tier"]
+            m["l3_why"] = _fine.get("critique", "")
         m["event"] = ev
         m["rarity"] = round(rar_raw[i], 3)
         m["score"] = round(max(0.0, comp + delta), 3)
@@ -561,7 +579,7 @@ def _l3_aesthetic_rescore(pool: list) -> None:
     except Exception:  # noqa: BLE001
         cache = {}
 
-    todo = [m for m in ranked if _l3_key(m) not in cache]
+    todo = [m for m in ranked if _l3_key(m) not in cache and not m.get("fine")]
     if todo:
         try:
             from src.utils.llm_logger import set_llm_stage
@@ -638,6 +656,8 @@ def _l3_aesthetic_rescore(pool: list) -> None:
 
     hit = 0
     for m in ranked:
+        if m.get("fine"):
+            continue          # 细评 tier 已在 v9 阶段合入,不双重混入
         v = cache.get(_l3_key(m))
         if not v:
             continue

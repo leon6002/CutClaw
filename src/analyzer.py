@@ -754,6 +754,15 @@ def analyze_video(
     # the moment annotation completes.
     _highlight_pool_step(content_hash, progress_callback)
 
+    # 逐片段细评(§17):标注时一次做好,项目/流水线直接吃结果。计费:约
+    # 池时刻数/4 次视觉调用;区间键控缓存可断点续评;失败不阻塞标注完成。
+    if getattr(config, "FINE_REVIEW_ON_ANNOTATE", True):
+        try:
+            from src.fine_review import fine_review_source
+            fine_review_source(content_hash)
+        except Exception as _e:  # noqa: BLE001
+            print(f"⚠️ [Analyze] fine review skipped (可稍后在详情页补跑): {_e}")
+
     # Update metadata with completion marker — only NOW does the cache count
     # as "already analyzed" (see the resume check above)
     metadata["analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")

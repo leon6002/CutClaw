@@ -2040,11 +2040,30 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
         try:
             with open(hp, "r", encoding="utf-8") as f:
                 _hd = json.load(f)
+            _moments = _hd.get("moments", [])
+            # 细评结论随行(标注时逐片段精细化评判 → 详情页图形化)
+            try:
+                from src.fine_review import load_fine_review
+                _fr = load_fine_review(content_hash)
+                for _m in _moments:
+                    _k = f"{float(_m.get('start') or 0):.1f}:{float(_m.get('end') or 0):.1f}"
+                    if _k in _fr:
+                        _m["fine"] = _fr[_k]
+            except Exception:  # noqa: BLE001
+                pass
             result["highlight_pool"] = sorted(
-                _hd.get("moments", []), key=lambda m: -m.get("score", 0))
+                _moments, key=lambda m: -m.get("score", 0))
             result["highlight_pool_version"] = _hd.get("version", 1)
         except Exception:  # noqa: BLE001
             pass
+        # 细评进行中的进度(UI 轮询)
+        _frp = os.path.join(get_analysis_path(content_hash), "fine_review.progress.json")
+        if os.path.exists(_frp):
+            try:
+                with open(_frp, "r", encoding="utf-8") as f:
+                    result["fine_review_progress"] = json.load(f)
+            except Exception:  # noqa: BLE001
+                pass
     else:
         # live progress while the background scorer runs
         pp = os.path.join(get_analysis_path(content_hash), "highlight_pool.progress.json")
@@ -2060,6 +2079,41 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
 @app.get("/api/assets/{content_hash}/details")
 def asset_details(content_hash: str, variant: str = ""):
     return _analysis_details(content_hash, variant)
+
+
+class FineReviewRequest(BaseModel):
+    content_hash: str
+
+
+@app.post("/api/assets/fine_review")
+def asset_fine_review(body: FineReviewRequest):
+    """对一个素材的全部池时刻做 VLM 细评(后台子进程,详情页轮询进度)。
+
+    计费:约 (池时刻数/4) 次视觉调用;结论按区间键控缓存,可断点续评。"""
+    from src.analyzer import get_analysis_path
+    cache_dir = get_analysis_path(body.content_hash)
+    if not os.path.isdir(cache_dir):
+        raise HTTPException(400, "该素材还没有分析缓存 — 先标注一次")
+    prog_path = os.path.join(cache_dir, "fine_review.progress.json")
+    try:
+        if os.path.exists(prog_path) and time.time() - os.path.getmtime(prog_path) < 120:
+            return {"status": "reviewing"}
+    except OSError:
+        pass
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {PROJECT_ROOT!r})\n"
+        "from src.analyzer import _ensure_ffmpeg_on_path\n"
+        "_ensure_ffmpeg_on_path()\n"
+        "from src.fine_review import fine_review_source\n"
+        f"fine_review_source({body.content_hash!r})\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    subprocess.Popen([sys.executable, "-c", code], cwd=PROJECT_ROOT, env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    return {"status": "started"}
 
 
 class SoundHighlightRequest(BaseModel):
