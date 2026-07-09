@@ -481,6 +481,10 @@ def filter_sub_segments_by_range(
                 sub_abs = dict(sub)
                 sub_abs['Start_Time'] = sub_start
                 sub_abs['End_Time'] = sub_end
+                # 父段落的实测能量随行——节奏重切槽(reslot_by_energy)靠它分类
+                _meas = section.get('measured') or {}
+                if _meas.get('energy_mean') is not None:
+                    sub_abs['_energy_mean'] = _meas.get('energy_mean')
                 result.append(sub_abs)
 
     # Fill gaps: extend each section's End_Time to the next section's Start_Time
@@ -490,6 +494,86 @@ def filter_sub_segments_by_range(
             result[i]['End_Time'] = result[i + 1]['Start_Time']
 
     return result
+
+
+def reslot_by_energy(segments: list, tempo: dict) -> list:
+    """节奏呼吸:按能量把均匀的音乐槽重切成"副歌快切 / 主歌长镜"。
+
+    问题(白山成片):madmom 段落天然是 2-3 小节的均匀颗粒,26 个镜头里
+    19 个落在 5-8s——卡点有了,呼吸没有。人类剪辑师副歌连切 2s、主歌给
+    10s 长镜。这里全部按**小节线**切分/合并,切点仍落在拍上:
+    - 高能段(实测 energy_mean≥0.55 或文本 high/driving/…):劈成 1 小节
+      (小节≥2.2s)或 2 小节的快切槽;
+    - 低能段(≤0.40 或 calm/gentle/…):相邻低能段向后合并,上限 12s;
+    - 中间段照旧。PACING_RESLOT=False 可整体关闭。
+    """
+    from src import config as _cfg
+    if not getattr(_cfg, "PACING_RESLOT", True):
+        return segments
+    bar = float((tempo or {}).get("bar_sec") or 0)
+    if not (1.2 <= bar <= 6.0) or not segments:
+        return segments
+    _HI = ("high", "driving", "intense", "climax", "powerful", "energetic", "peak", "uplift")
+    _LO = ("calm", "gentle", "quiet", "soft", "relaxed", "ambient", "sparse", "mellow")
+
+    def _cls(s) -> str:
+        em = s.get("_energy_mean")
+        txt = (str(s.get("energy", "")) + " " + str(s.get("rhythm", ""))).lower()
+        if (em is not None and float(em) >= 0.55) or any(k in txt for k in _HI):
+            return "hi"
+        if (em is not None and float(em) <= 0.40) or any(k in txt for k in _LO):
+            return "lo"
+        return "mid"
+
+    out = []
+    i = 0
+    while i < len(segments):
+        s = segments[i]
+        c = _cls(s)
+        st, en = float(s["Start_Time"]), float(s["End_Time"])
+        dur = en - st
+        if c == "hi" and dur >= 2 * bar - 0.2:
+            # 爆发-停顿:先把连续高能段并成一条 run,再对整条 run 走 1-1-2
+            # 小节循环(连切两个短的落一个中的)。按段各切会每段重启循环,
+            # 永远走不到"2",退化成机关枪(蒋小呢干跑:25/37 槽全 2.6s)。
+            j = i + 1
+            run_en = en
+            while j < len(segments) and _cls(segments[j]) == "hi":
+                run_en = float(segments[j]["End_Time"])
+                j += 1
+            unit = bar if bar >= 2.2 else 2 * bar
+            pattern = (1, 1, 2)
+            t, pi = st, 0
+            while run_en - t > unit * 1.5:
+                step = unit * pattern[pi % len(pattern)]
+                if run_en - t < step + unit * 0.5:   # 剩余不够整拍组,并入最后一段
+                    break
+                out.append({**s, "Start_Time": round(t, 2), "End_Time": round(t + step, 2)})
+                t += step
+                pi += 1
+            out.append({**s, "Start_Time": round(t, 2), "End_Time": round(run_en, 2)})
+            i = j
+            continue
+        if c == "lo":
+            j = i + 1
+            cur_en = en
+            while j < len(segments) and _cls(segments[j]) == "lo":
+                nxt_en = float(segments[j]["End_Time"])
+                if nxt_en - st > 12.2:
+                    break
+                cur_en = nxt_en
+                j += 1
+            out.append({**s, "Start_Time": round(st, 2), "End_Time": round(cur_en, 2)})
+            i = j
+            continue
+        out.append(s)
+        i += 1
+
+    if len(out) != len(segments):
+        _d = [round(float(x["End_Time"]) - float(x["Start_Time"]), 1) for x in out]
+        print(f"🫁 [Screenwriter] 节奏重切槽: {len(segments)} → {len(out)} 个镜头位 "
+              f"(小节 {bar:.2f}s · 时长 {min(_d)}–{max(_d)}s)")
+    return out
 
 
 def check_scene_distribution(
@@ -1029,13 +1113,16 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
 
     cmax = int(getattr(config, "VISUAL_CLUSTER_MAX_USES", 2))
     smax = int(getattr(config, "SOURCE_VIDEO_MAX_USES", 4))
-    min_gap = int(getattr(config, "VISUAL_CLUSTER_MIN_GAP_SHOTS", 6))
+    # 6 让相隔 7 个镜头的同 look(白山 #13/#20 雪谷大远景)漏了过去——观感上
+    # 仍是"这镜头我刚看过"。8 = 约 40s,一首歌一个段落的距离。
+    min_gap = int(getattr(config, "VISUAL_CLUSTER_MIN_GAP_SHOTS", 8))
 
     shots = shot_plan.get("shots", []) or []
     used: set = set()
     c_used: dict = {}
     c_last: dict = {}   # cluster -> last shot position it appeared at
     s_used: dict = {}
+    s_iv: dict = {}     # source_hash -> [(start,end)] 已用区间(全片互斥)
     _prev = None        # (video_path, start) of the previous shot's anchor
     n = repaired = stripped = 0
 
@@ -1050,6 +1137,13 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
                 return f"look {c} appeared {pos - lp} shot(s) ago (min gap {min_gap})"
         if s_used.get(s or "", 0) >= smax:
             return "source video at quota"
+        # 同源区间全片互斥:修复备选来自全池(不是去重后的菜单),精华/长镜链
+        # 覆盖同段画面的时刻必须挡在这里(菜单侧同款检查在 build_anchor_budget)
+        _a, _b = float(m.get("start") or 0), float(m.get("end") or 0)
+        for pa, pb in s_iv.get(s or "", ()):
+            ov = min(_b, pb) - max(_a, pa)
+            if ov > 0.3 * max(0.1, min(_b - _a, pb - pa)):
+                return f"overlaps already-used footage {pa:.0f}-{pb:.0f}s of same source"
         if (_prev and not m.get("sound")
                 and m.get("video_path") == _prev[0]
                 and abs(float(m.get("start", 0)) - _prev[1]) < 20.0):
@@ -1064,6 +1158,7 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
             c_used[c] = c_used.get(c, 0) + 1
             c_last[c] = pos
         s_used[s or ""] = s_used.get(s or "", 0) + 1
+        s_iv.setdefault(s or "", []).append((float(m.get("start") or 0), float(m.get("end") or 0)))
         _prev = (m.get("video_path"), float(m.get("start", 0)))
         shot["anchor_id"] = m.get("id")
         # the anchored shot SHOWS this measured moment — describe the real
@@ -1768,6 +1863,10 @@ class Screenwriter:
         selected_sub_segments = filter_sub_segments_by_range(
             audio_sections, selected_start_str, selected_end_str
         )
+        # 副歌快切/主歌长镜(小节对齐,卡点不破坏);槽位数在此定案,
+        # 下游 shot 数校验/时长回填都以重切后的列表为准
+        selected_sub_segments = reslot_by_energy(
+            selected_sub_segments, self.audio_db.get("measured_tempo") or {})
 
         def _to_sec(t):
             if isinstance(t, (int, float)):

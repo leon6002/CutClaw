@@ -2148,7 +2148,10 @@ class ParallelShotOrchestrator:
 
         gap = float(getattr(config, 'SHOT_MIN_GAP_SEC', 0.0) or 0.0)
         need = float(shot.get('time_duration') or 0.0) or 2.0
-        floor = float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0))
+        # 地板对槽位相对化:节奏重切槽后副歌槽只有 1 小节(~2.6s),绝对地板
+        # 4s 会把它们全部误判成闪帧。规则:比槽位短很多(<80%)才算闪帧。
+        floor = max(1.0, min(float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)),
+                             need * 0.8))
 
         # Curation-first rescue (LOGIC.md §14): before free-ranging over scene
         # windows, try an UNUSED measured pool moment — pool entries are
@@ -2516,7 +2519,10 @@ class ParallelShotOrchestrator:
                 # a 6.5s slot and it sailed straight into the render). Too
                 # short → discard, let the deterministic fallback find a real
                 # window; a fallback that is also too short means FAILED.
-                _floor = max(1.0, float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)))
+                # 地板对槽位相对化(同 _fallback_pick):快切槽 ~2.6s 不是闪帧
+                _need_k = float(shot.get('time_duration') or 0.0) or 2.0
+                _floor = max(1.0, min(float(getattr(config, 'MIN_ACCEPTABLE_SHOT_DURATION', 2.0)),
+                                      _need_k * 0.8))
                 if res and float(res.get('total_duration') or 0.0) < _floor - 1e-6:
                     print(f"⚠️ [DurationFuse] shot {k}: committed "
                           f"{float(res.get('total_duration') or 0.0):.2f}s < floor {_floor:.1f}s "
