@@ -169,6 +169,74 @@ export default function RenderView({
 
   const rendering = job.status === "running";
 
+  // ── 片头/片尾字幕(自动从素材的拍摄时间+地点填充,可改可清空)──────────
+  const [titleText, setTitleText] = useState("");
+  const [endText, setEndText] = useState("");
+  const [cardsFilled, setCardsFilled] = useState(false);
+  useEffect(() => {
+    if (cardsFilled || project.videos.length === 0) return;
+    api<{ assets: any[] }>("/api/assets/by_paths", {
+      method: "POST", body: JSON.stringify({ paths: project.videos }),
+    }).then((r) => {
+      const as = r.assets ?? [];
+      const times = as.map((a) => a.capture_time).filter(Boolean).sort();
+      const locs = as.map((a) => (a.location || "").split("·")[0].trim()).filter(Boolean);
+      const loc = locs.sort((a, b) =>
+        locs.filter((x) => x === b).length - locs.filter((x) => x === a).length)[0] ?? "";
+      if (times.length) {
+        const d0 = new Date(times[0]); const d1 = new Date(times[times.length - 1]);
+        const ym = `${d0.getFullYear()}.${String(d0.getMonth() + 1).padStart(2, "0")}`;
+        const range = d0.toDateString() === d1.toDateString()
+          ? `${ym}.${String(d0.getDate()).padStart(2, "0")}`
+          : `${ym}.${String(d0.getDate()).padStart(2, "0")} – ${String(d1.getMonth() + 1).padStart(2, "0")}.${String(d1.getDate()).padStart(2, "0")}`;
+        setTitleText(loc ? `${loc} · ${ym}` : ym);
+        setEndText(`${loc ? loc + "\\n" : ""}${range}`);
+      } else if (loc) {
+        setTitleText(loc);
+      }
+      setCardsFilled(true);
+    }).catch(() => setCardsFilled(true));
+  }, [project.videos, cardsFilled]);
+
+  // ── AI 旁白(narration sidecar,渲染时自动混入)────────────────────────
+  const [nar, setNar] = useState<any>(null);
+  const [narBusy, setNarBusy] = useState("");
+  const [narDirty, setNarDirty] = useState(false);
+  useEffect(() => {
+    setNar(null); setNarDirty(false);
+    if (!shotPoint) return;
+    api<any>(`/api/narration?shot_point=${encodeURIComponent(shotPoint)}`)
+      .then(setNar).catch(() => {});
+  }, [shotPoint]);
+
+  const narGenerate = async () => {
+    setNarBusy("AI 写稿 + 配音中…约 30-60 秒"); setError("");
+    try {
+      const r = await api<any>("/api/narration/generate", {
+        method: "POST",
+        body: JSON.stringify({ shot_point: shotPoint, voice: nar?.voice ?? "yunxi",
+          instruction: project.instruction ?? "" }),
+      });
+      setNar({ exists: true, voices: nar?.voices ?? ["yunxi", "xiaoxiao", "yunjian"], ...r });
+      setNarDirty(false);
+    } catch (e: any) { setError(e.message); }
+    setNarBusy("");
+  };
+  const narSave = async (patch?: { enabled?: boolean; voice?: string }) => {
+    const payload = {
+      shot_point: shotPoint,
+      voice: patch?.voice ?? nar.voice,
+      enabled: patch?.enabled ?? nar.enabled,
+      lines: nar.lines,
+    };
+    setNarBusy(patch?.voice ? "换声线重配音中…" : narDirty ? "重配改动的句子…" : "保存中…");
+    try {
+      const r = await api<any>("/api/narration/save", { method: "POST", body: JSON.stringify(payload) });
+      setNar((old: any) => ({ ...old, ...r })); setNarDirty(false);
+    } catch (e: any) { setError(e.message); }
+    setNarBusy("");
+  };
+
   const render = async (ratio: string) => {
     setError(""); setRenderRatio(ratio);
     try {
@@ -185,6 +253,8 @@ export default function RenderView({
           color_grade: colorGrade,
           letterbox: letterbox && ratio === "16:9",
           fades,
+          title_text: titleText,
+          end_text: endText,
         }),
       });
       setJobId(r.job_id);
@@ -336,6 +406,85 @@ export default function RenderView({
                   <Checkbox checked={fades} onCheckedChange={(v) => setFades(v === true)} />
                   淡入淡出收尾
                 </label>
+              </div>
+
+              <div className="mb-4 flex flex-wrap items-center gap-2.5 text-[13px] text-slate-300">
+                <span>片头字幕</span>
+                <input
+                  className="w-56 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-xs text-slate-200 focus:border-cyan-400/50 focus:outline-none"
+                  placeholder="留空 = 不加(如:长白山 · 2025.12)"
+                  value={titleText} onChange={(e) => setTitleText(e.target.value)} />
+                <span>片尾字幕</span>
+                <input
+                  className="w-56 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-xs text-slate-200 focus:border-cyan-400/50 focus:outline-none"
+                  placeholder="留空 = 不加(\n 换行)"
+                  value={endText} onChange={(e) => setEndText(e.target.value)} />
+                <span className="text-[11px] text-slate-500">
+                  自动按素材的拍摄时间/地点填好,可改可清空;叠在首尾镜头上,不动时间轴
+                </span>
+              </div>
+
+              <div className="mb-4 rounded-xl border border-violet-500/20 bg-violet-500/[0.04] px-3 py-2.5 text-[13px] text-slate-300">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <span className="font-medium text-violet-300">🎙 AI 旁白</span>
+                  {nar?.exists ? (
+                    <>
+                      <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400">
+                        <Checkbox checked={!!nar.enabled}
+                          onCheckedChange={(v) => { setNar((o: any) => ({ ...o, enabled: v === true })); narSave({ enabled: v === true }); }} />
+                        渲染时混入
+                      </label>
+                      <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                        {([["yunxi", "云希·男"], ["xiaoxiao", "晓晓·女"], ["yunjian", "云健·厚"]] as const).map(([v, label]) => (
+                          <button key={v}
+                            className={cn("rounded-md px-2 py-0.5 text-xs transition-colors",
+                              nar.voice === v ? "bg-violet-500/20 font-semibold text-violet-300" : "text-slate-400 hover:text-slate-200")}
+                            onClick={() => { if (nar.voice !== v) { setNar((o: any) => ({ ...o, voice: v })); narSave({ voice: v }); } }}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <button className="text-xs text-violet-400 hover:underline" disabled={!!narBusy} onClick={narGenerate}>
+                        ↻ 整篇重写
+                      </button>
+                      {narDirty && (
+                        <button className="rounded-md bg-violet-500/20 px-2 py-0.5 text-xs font-semibold text-violet-200 hover:bg-violet-500/30"
+                          disabled={!!narBusy} onClick={() => narSave()}>
+                          保存并重配改动句
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <Button size="sm" className="h-6 gap-1 bg-violet-500/80 px-2.5 text-xs text-white hover:bg-violet-500"
+                        disabled={!shotPoint || !!narBusy} onClick={narGenerate}>
+                        {narBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null} 生成旁白
+                      </Button>
+                      <span className="text-[11px] text-slate-500">
+                        AI 按成片内容写 4-6 句第一人称旁白并配音,BGM 自动闪避 — 让片子有"谁在回忆"
+                      </span>
+                    </>
+                  )}
+                  {narBusy && <span className="text-[11px] text-violet-300">{narBusy}</span>}
+                </div>
+                {nar?.exists && (
+                  <div className="mt-2 space-y-1">
+                    {(nar.lines ?? []).map((l: any, i: number) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <span className="w-14 shrink-0 text-right text-[11px] text-slate-500">@{Math.round(l.at_sec)}s</span>
+                        <input
+                          className="flex-1 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-xs text-slate-200 focus:border-violet-400/50 focus:outline-none"
+                          value={l.text}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setNar((o: any) => ({ ...o, lines: o.lines.map((x: any, j: number) => j === i ? { ...x, text: v } : x) }));
+                            setNarDirty(true);
+                          }} />
+                        <span className="w-10 shrink-0 text-[11px] text-slate-600">{l.dur ? `${l.dur}s` : ""}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div className="flex flex-wrap gap-2">

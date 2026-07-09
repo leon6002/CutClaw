@@ -725,6 +725,15 @@ def _video_codec_args() -> list:
     return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', *_color_tags]
 
 
+def _cjk_font() -> str:
+    """可渲染中文的字体:微软雅黑 → 黑体 → 宋体(Win11 必有其一)。"""
+    for f in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",
+              r"C:\Windows\Fonts\simsun.ttc"):
+        if os.path.exists(f):
+            return f
+    return r"C:\Windows\Fonts\arial.ttf"
+
+
 _COLOR_XFER_CACHE: dict = {}
 
 
@@ -1026,6 +1035,9 @@ def render_video_ffmpeg(
     color_grade: str = "",
     letterbox: bool = False,
     fades: bool = False,
+    narration: dict = None,
+    title_text: str = "",
+    end_text: str = "",
 ) -> bool:
     """
     Render video clips using ffmpeg concat demuxer.
@@ -1495,6 +1507,35 @@ def render_video_ffmpeg(
                     _extra_vf.append("fade=t=in:st=0:d=0.5")
                 if i == _last_main_idx and duration > 1.5:
                     _extra_vf.append(f"fade=t=out:st={duration - 1.2:.2f}:d=1.2")
+            # 片头/片尾字幕:直接叠在首/尾镜头上(切片本来就要重编码,零额外
+            # 遍数,也不移动时间轴——不破坏卡点)。中文走 textfile 免转义。
+            _card_h = target_h if (crop_w_ratio and crop_h_ratio) else (video_height or src_h)
+            if title_text and i == 0 and not _is_extra:
+                _tf = os.path.join(temp_dir, "title_card.txt")
+                with open(_tf, "w", encoding="utf-8") as _tfh:
+                    _tfh.write(title_text)
+                _fs = max(24, int(_card_h * 0.055))
+                # 0.8s 渐显 → 停 3s → 0.8s 渐隐(在 0.5s 画面淡入之后出现)
+                _alpha = "if(lt(t,0.8),0,if(lt(t,1.6),(t-0.8)/0.8,if(lt(t,4.6),1,if(lt(t,5.4),(5.4-t)/0.8,0))))"
+                _extra_vf.append(
+                    f"drawtext=textfile='{escape_drawtext_path(_tf)}':"
+                    f"fontfile='{escape_drawtext_path(_cjk_font())}':"
+                    f"fontsize={_fs}:fontcolor=white:alpha='{_alpha}':"
+                    f"x=(w-text_w)/2:y=h*0.72:shadowcolor=black@0.55:shadowx=2:shadowy=2"
+                )
+            if end_text and i == _last_main_idx and not _is_extra and duration > 3.0:
+                _ef = os.path.join(temp_dir, "end_card.txt")
+                with open(_ef, "w", encoding="utf-8") as _efh:
+                    _efh.write(end_text)
+                _fs = max(20, int(_card_h * 0.042))
+                _st = duration - 3.0   # 画面淡出的同时字浮上来,最后定在黑场上
+                _alpha = f"if(lt(t,{_st:.2f}),0,min(1,(t-{_st:.2f})/0.8))"
+                _extra_vf.append(
+                    f"drawtext=textfile='{escape_drawtext_path(_ef)}':"
+                    f"fontfile='{escape_drawtext_path(_cjk_font())}':"
+                    f"fontsize={_fs}:fontcolor=white:alpha='{_alpha}':text_align=C:line_spacing=10:"
+                    f"x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.55:shadowx=2:shadowy=2"
+                )
             if _extra_vf:
                 if '-vf' in cmd:
                     _vi = cmd.index('-vf') + 1
@@ -1664,9 +1705,34 @@ def render_video_ffmpeg(
                 print(f"Voice-highlight ducking (BGM → {_duck_level:.0%}) at: "
                       + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in duck_windows))
 
+            # AI 旁白窗口:BGM 压得比人声高光更深(旁白必须听得清,哪怕在副歌上),
+            # 0.35s 缓坡。窗口两端各加 0.15s 呼吸垫。
+            _nar_lines = [l for l in ((narration or {}).get("lines") or [])
+                          if l.get("file") and os.path.exists(l["file"]) and l.get("dur")]
+            nar_env = None
+            if _nar_lines:
+                _NAR_R = 0.35
+                _nar_level = 0.45
+                try:
+                    from src import config as _ncfg
+                    _nar_level = min(1.0, max(0.1, float(getattr(_ncfg, "NARRATION_BGM_LEVEL", 0.45))))
+                except Exception:  # noqa: BLE001
+                    pass
+                _nwin = [(max(0.0, float(l["at_sec"]) - 0.15), float(l["at_sec"]) + float(l["dur"]) + 0.15)
+                         for l in _nar_lines]
+                _nterms = [
+                    f"max(0,min(1,min((t-{a - _NAR_R:.2f})/{_NAR_R},({b + _NAR_R:.2f}-t)/{_NAR_R})))"
+                    for a, b in _nwin
+                ]
+                nar_env = "min(1,(" + "+".join(_nterms) + "))"
+                print(f"🎙️  AI narration: {len(_nar_lines)} line(s), BGM → {_nar_level:.0%} under: "
+                      + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in _nwin))
+
             bgm_volume_expr = f"({bgm_base_volume_expr})*({bgm_outro_fade_expr})"
             if duck_env:
                 bgm_volume_expr = f"({bgm_volume_expr})*(1-{1.0 - _duck_level:.2f}*{duck_env})"
+            if nar_env:
+                bgm_volume_expr = f"({bgm_volume_expr})*(1-{1.0 - _nar_level:.2f}*{nar_env})"
 
             if audio_start_time is not None and audio_duration is not None:
                 print(f"Audio crop: {audio_start_time:.2f}s - {audio_start_time + audio_duration:.2f}s (duration: {audio_duration:.2f}s)")
@@ -1700,6 +1766,9 @@ def render_video_ffmpeg(
                     # windows — full-volume voices jumped out of the mix (user
                     # feedback); the hook-dialogue region stays at 1.0 untouched
                     orig_volume_expr = f"min(1,({orig_volume_expr})+{_voice_level:.2f}*{duck_env})"
+                if nar_env:
+                    # 环境原声在旁白下面再让半档(旁白槽位本就避开了真实人声镜头)
+                    orig_volume_expr = f"({orig_volume_expr})*(1-0.5*{nar_env})"
                 filter_parts = []
 
                 orig_input_label = "0:a"
@@ -1727,9 +1796,27 @@ def render_video_ffmpeg(
                 bgm_filters = f"[{bgm_stage_label}]volume={escape_ffmpeg_expr(bgm_volume_expr)}:eval=frame"
                 bgm_filters += f",apad=whole_dur={total_duration + 1.0}[a1p]"
                 filter_parts.append(bgm_filters)
+                # 旁白轨:每句 adelay 到绝对时刻,合成一条 [nar] 与主混音相加
+                _mix_inputs = "[a0p][a1p]"
+                _mix_n = 2
+                if _nar_lines:
+                    for _ni, _nl in enumerate(_nar_lines):
+                        _ms = int(float(_nl["at_sec"]) * 1000)
+                        filter_parts.append(f"[{2 + _ni}:a]adelay={_ms}|{_ms}[nd{_ni}]")
+                    if len(_nar_lines) > 1:
+                        filter_parts.append(
+                            "".join(f"[nd{_ni}]" for _ni in range(len(_nar_lines)))
+                            + f"amix=inputs={len(_nar_lines)}:duration=longest:normalize=0[narmix]")
+                        _nar_label = "narmix"
+                    else:
+                        _nar_label = "nd0"
+                    filter_parts.append(
+                        f"[{_nar_label}]apad=whole_dur={total_duration + 1.0}[narp]")
+                    _mix_inputs += "[narp]"
+                    _mix_n = 3
                 # Normalize=0 prevents amix from dynamically changing BGM volume when original audio ends.
                 # Padding inputs ensures they don't unexpectedly drop out early.
-                filter_parts.append("[a0p][a1p]amix=inputs=2:duration=longest:normalize=0[amix]")
+                filter_parts.append(f"{_mix_inputs}amix=inputs={_mix_n}:duration=longest:normalize=0[amix]")
                 _afade = (f",afade=t=out:st={max(0.0, total_duration - 1.5):.2f}:d=1.5"
                           if fades else "")
                 filter_parts.append(
@@ -1747,6 +1834,7 @@ def render_video_ffmpeg(
                     '-i', temp_video,
                     '-stream_loop', '-1',
                     '-i', audio_path,
+                    *[x for _nl in _nar_lines for x in ('-i', _nl["file"])],
                     '-filter_complex', filter_complex,
                     '-map', '0:v:0',
                     '-map', '[aout]',
@@ -1781,11 +1869,32 @@ def render_video_ffmpeg(
 
                 _afade = (f",afade=t=out:st={max(0.0, total_duration - 1.5):.2f}:d=1.5"
                           if fades else "")
-                filter_parts.append(
-                    f"[{bgm_stage_label}]volume={escape_ffmpeg_expr(bgm_volume_expr)}:eval=frame,"
-                    f"apad=whole_dur={total_duration + 1.0},"
-                    f"atrim=duration={total_duration},asetpts=PTS-STARTPTS{_afade}[aout]"
-                )
+                if _nar_lines:
+                    filter_parts.append(
+                        f"[{bgm_stage_label}]volume={escape_ffmpeg_expr(bgm_volume_expr)}:eval=frame,"
+                        f"apad=whole_dur={total_duration + 1.0}[a1p]"
+                    )
+                    for _ni, _nl in enumerate(_nar_lines):
+                        _ms = int(float(_nl["at_sec"]) * 1000)
+                        filter_parts.append(f"[{2 + _ni}:a]adelay={_ms}|{_ms}[nd{_ni}]")
+                    if len(_nar_lines) > 1:
+                        filter_parts.append(
+                            "".join(f"[nd{_ni}]" for _ni in range(len(_nar_lines)))
+                            + f"amix=inputs={len(_nar_lines)}:duration=longest:normalize=0[narmix]")
+                        _nar_label = "narmix"
+                    else:
+                        _nar_label = "nd0"
+                    filter_parts.append(f"[{_nar_label}]apad=whole_dur={total_duration + 1.0}[narp]")
+                    filter_parts.append(
+                        f"[a1p][narp]amix=inputs=2:duration=longest:normalize=0,"
+                        f"atrim=duration={total_duration},asetpts=PTS-STARTPTS{_afade}[aout]"
+                    )
+                else:
+                    filter_parts.append(
+                        f"[{bgm_stage_label}]volume={escape_ffmpeg_expr(bgm_volume_expr)}:eval=frame,"
+                        f"apad=whole_dur={total_duration + 1.0},"
+                        f"atrim=duration={total_duration},asetpts=PTS-STARTPTS{_afade}[aout]"
+                    )
                 filter_complex = ";".join(filter_parts)
 
                 video_codec = [*_video_codec_args()[1:], '-pix_fmt', 'yuv420p'] if outro_duration > 0 else ['copy']
@@ -1795,6 +1904,7 @@ def render_video_ffmpeg(
                     '-i', temp_video,
                     '-stream_loop', '-1',
                     '-i', audio_path,
+                    *[x for _nl in _nar_lines for x in ('-i', _nl["file"])],
                     '-filter_complex', filter_complex,
                     '-c:v', *video_codec,
                     '-c:a', 'aac',
@@ -2108,6 +2218,24 @@ def main():
         default=-1.5,
         help='Target true peak (dBTP) for automatic loudness matching (default: -1.5)'
     )
+    parser.add_argument(
+        '--narration',
+        type=str,
+        default='',
+        help='AI 旁白 sidecar(narration_*.json):句子按绝对时刻混入,BGM 自动闪避'
+    )
+    parser.add_argument(
+        '--title-text',
+        type=str,
+        default='',
+        help='片头字幕(叠在第一个镜头上,如 "长白山 · 2025.12")'
+    )
+    parser.add_argument(
+        '--end-text',
+        type=str,
+        default='',
+        help='片尾字幕(随最后一个镜头淡出浮现,支持 \\n 换行)'
+    )
 
     args = parser.parse_args()
 
@@ -2353,6 +2481,24 @@ def main():
     except Exception as _e:  # noqa: BLE001
         print(f"(voice-highlight ducking skipped: {_e})")
 
+    # AI 旁白 sidecar(--narration narration.json):句子在绝对时刻混入
+    narration = None
+    if getattr(args, "narration", ""):
+        try:
+            with open(args.narration, "r", encoding="utf-8") as _nf:
+                _nd = json.load(_nf)
+            if _nd.get("enabled") and _nd.get("lines"):
+                _nbase = os.path.dirname(os.path.abspath(args.narration))
+                for _l in _nd["lines"]:
+                    if _l.get("file") and not os.path.isabs(_l["file"]):
+                        _l["file"] = os.path.join(_nbase, _l["file"])
+                narration = _nd
+                print(f"🎙️  Narration: {len(_nd['lines'])} line(s) from {os.path.basename(args.narration)}")
+            else:
+                print("🎙️  Narration file present but disabled/empty — skipped")
+        except Exception as _e:  # noqa: BLE001
+            print(f"⚠️  Narration file unreadable, skipped: {_e}")
+
     success = render_video_ffmpeg(
         video_path=args.video,
         clips=clips,
@@ -2390,6 +2536,9 @@ def main():
         color_grade=args.color_grade,
         letterbox=args.letterbox,
         fades=args.fades,
+        narration=narration,
+        title_text=args.title_text,
+        end_text=args.end_text.replace("\\n", "\n"),
     )
 
     if success:
@@ -2410,6 +2559,8 @@ def main():
                     "duration": round(float(audio_duration or 0.0), 2),
                 },
                 "duck_windows": [[round(a, 2), round(b, 2)] for a, b in (duck_windows or [])],
+                "narration": ([{"at_sec": l.get("at_sec"), "dur": l.get("dur"), "text": l.get("text")}
+                               for l in narration["lines"]] if narration else []),
                 "color_grade": args.color_grade,
                 "letterbox": bool(args.letterbox),
                 "fades": bool(args.fades),

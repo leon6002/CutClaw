@@ -3496,6 +3496,64 @@ class RenderRequest(BaseModel):
     color_grade: str = ""      # "" | "teal_orange" | "film" | "warm"
     letterbox: bool = False    # 2.35:1 cinematic bars inside the 16:9 frame
     fades: bool = True         # fade in from black + fade out to black w/ music
+    narration: bool = True     # 混入 AI 旁白(需先生成 narration sidecar 且其 enabled=true)
+    title_text: str = ""       # 片头字幕(叠在第一个镜头上)
+    end_text: str = ""         # 片尾字幕(随最后一个镜头淡出浮现)
+
+
+# ── AI 旁白 ─────────────────────────────────────────────────────────────────
+
+class NarrationGenRequest(BaseModel):
+    shot_point: str
+    voice: str = "yunxi"
+    instruction: str = ""
+
+
+class NarrationSaveRequest(BaseModel):
+    shot_point: str
+    voice: str = "yunxi"
+    enabled: bool = True
+    lines: list[dict] = []
+
+
+@app.get("/api/narration")
+def narration_get(shot_point: str):
+    from src.narration import narration_paths, VOICES
+    npath, _ = narration_paths(_resolve(shot_point))
+    if not os.path.exists(npath):
+        return {"exists": False, "voices": list(VOICES.keys())}
+    try:
+        with open(npath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"narration.json 损坏: {e}")
+    return {"exists": True, "voices": list(VOICES.keys()), **data}
+
+
+@app.post("/api/narration/generate")
+def narration_generate(body: NarrationGenRequest):
+    """LLM 写稿(1 次 agent 调用)+ edge-tts 配音(免费)。同步,约 20-60s。"""
+    from src.narration import generate
+    abs_point = _resolve(body.shot_point)
+    if not os.path.exists(abs_point):
+        raise HTTPException(404, "shot_point 不存在")
+    try:
+        data = generate(abs_point, voice=body.voice, instruction=body.instruction)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"旁白生成失败: {e}")
+    return data
+
+
+@app.post("/api/narration/save")
+def narration_save(body: NarrationSaveRequest):
+    """UI 编辑后保存;只有文本变化的句子会重新配音。"""
+    from src.narration import save
+    abs_point = _resolve(body.shot_point)
+    try:
+        data = save(abs_point, body.lines, body.voice, body.enabled)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"旁白保存失败: {e}")
+    return data
 
 
 @app.post("/api/render")
@@ -3575,10 +3633,25 @@ def render(body: RenderRequest):
         cmd += ["--letterbox"]
     if body.fades:
         cmd += ["--fades"]
+    if body.title_text.strip():
+        cmd += ["--title-text", body.title_text.strip()]
+    if body.end_text.strip():
+        cmd += ["--end-text", body.end_text.strip()]
     if body.add_ending and os.path.exists(ending):
         cmd += ["--ending-video", ending]
     if os.path.exists(font):
         cmd += ["--dialogue-font", font]
+    # AI 旁白:sidecar 存在且启用时自动混入(narration=False 可强制关)
+    if body.narration:
+        from src.narration import narration_paths
+        _npath, _ = narration_paths(abs_point)
+        if os.path.exists(_npath):
+            try:
+                _nd = json.load(open(_npath, encoding="utf-8"))
+                if _nd.get("enabled") and _nd.get("lines"):
+                    cmd += ["--narration", _npath]
+            except Exception:  # noqa: BLE001
+                pass
     job = Job("render")
     job.meta.update({"output": out, "ratio": body.ratio,
                      "source_quality": body.source_quality})
