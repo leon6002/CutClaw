@@ -777,7 +777,14 @@ function DetailView({
                       )}
                     </div>
                     <div className="max-h-[560px] space-y-1.5 overflow-y-auto pr-1">
-                      {details.highlight_pool.map((m: any, i: number) => (
+                      {[...details.highlight_pool].sort((a: any, b: any) => {
+                        // 细评优先排序:S→A→B→C,同层按细评均分;未细评的按旧池分垫底
+                        const t = (x: any) => (x.fine ? ["S", "A", "B", "C"].indexOf(x.fine.tier) : 9);
+                        if (t(a) !== t(b)) return t(a) - t(b);
+                        const fa = a.fine?.avg ?? -1, fb = b.fine?.avg ?? -1;
+                        if (fb !== fa) return fb - fa;
+                        return (b.score ?? 0) - (a.score ?? 0);
+                      }).map((m: any, i: number) => (
                         <div key={i}
                           className="cursor-pointer rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 hover:border-cyan-500/30"
                           onClick={() => seek(m.start)} title="点击跳转试看"
