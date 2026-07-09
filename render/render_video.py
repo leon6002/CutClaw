@@ -710,12 +710,45 @@ def _video_codec_args() -> list:
         except Exception:  # noqa: BLE001
             _NVENC_OK = False
         print(f"🎛️  Video encoder: {'h264_nvenc (GPU)' if _NVENC_OK else 'libx264 (CPU)'}")
+    # Explicit BT.709 tags on EVERY encode: one HLG source (e.g. iPhone HDR)
+    # among the clips once leaked bt2020/arib-std-b67 tags into the concat
+    # output, and players then tone-mapped the whole (actually SDR) film —
+    # "看起来像加了一层滤镜". Pixels are normalized to SDR at extraction
+    # (_sdr_normalize_filter); the tags here make the container honest.
+    _color_tags = ['-colorspace', 'bt709', '-color_trc', 'bt709',
+                   '-color_primaries', 'bt709']
     if _NVENC_OK:
         # p5 + vbr cq19 ≈ libx264 crf18 visually; -b:v 0 lets cq govern.
         # profile high matches what libx264 emitted before (concat-friendly).
         return ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr',
-                '-cq', '19', '-b:v', '0', '-profile:v', 'high']
-    return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
+                '-cq', '19', '-b:v', '0', '-profile:v', 'high', *_color_tags]
+    return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', *_color_tags]
+
+
+_COLOR_XFER_CACHE: dict = {}
+
+
+def _sdr_normalize_filter(path: str) -> str:
+    """Tonemap chain for HDR sources (HLG/PQ) → SDR BT.709; '' for SDR sources.
+
+    Without this, an HDR clip's pixels land in the SDR timeline with the wrong
+    transfer curve (washed-out), and its color tags can hijack the whole
+    concat output's metadata."""
+    if path not in _COLOR_XFER_CACHE:
+        try:
+            r = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=color_transfer,color_space',
+                 '-of', 'csv=p=0', path],
+                capture_output=True, text=True, timeout=20)
+            _COLOR_XFER_CACHE[path] = (r.stdout or '').strip().lower()
+        except Exception:  # noqa: BLE001
+            _COLOR_XFER_CACHE[path] = ''
+    info = _COLOR_XFER_CACHE[path]
+    if 'arib-std-b67' in info or 'smpte2084' in info or 'bt2020' in info:
+        return ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,'
+                'tonemap=hable,zscale=t=bt709:m=bt709:r=tv,format=yuv420p')
+    return ''
 
 
 def _source_has_audio(path: str) -> bool:
@@ -1433,6 +1466,19 @@ def render_video_ffmpeg(
                         '-avoid_negative_ts', 'make_zero',
                         clip_file
                     ]
+
+            # HDR source (HLG/PQ) → tonemap to SDR BT.709 FIRST (before crop/
+            # grade/text, which all assume SDR). SDR sources: no-op.
+            _sdr = _sdr_normalize_filter(source_video)
+            if _sdr:
+                if '-vf' in cmd:
+                    _vi = cmd.index('-vf') + 1
+                    cmd[_vi] = _sdr + "," + cmd[_vi]
+                else:
+                    _ti = cmd.index('-t') + 2
+                    cmd = cmd[:_ti] + ['-vf', _sdr] + cmd[_ti:]
+                if verbose:
+                    print(f"  Clip {i}: HDR source → tonemapped to SDR bt709 ({os.path.basename(source_video)})")
 
             # cinematic layer — applied per clip (clips are re-encoded anyway,
             # so grade/letterbox/fades cost zero extra passes)

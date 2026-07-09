@@ -3510,6 +3510,19 @@ def render(body: RenderRequest):
     # output_{ratio}.mp4 and saw each other's renders. Tag = hash of shot_point name.
     _sp_tag = hashlib.md5(os.path.basename(abs_point).encode("utf-8")).hexdigest()[:8]
     out = os.path.join(os.path.dirname(abs_point), f"output_{body.ratio.replace(':', 'x')}_{_sp_tag}.mp4")
+    # 同名成片不覆盖丢历史:上一版按其渲染时刻改名归档(连同 .render.json),
+    # 渲染页「历史版本」可回看/对比(比如 无调色 vs teal_orange)。
+    if os.path.exists(out):
+        _stamp = time.strftime("%m%d_%H%M%S", time.localtime(os.path.getmtime(out)))
+        _keep = os.path.splitext(out)[0] + f"_v{_stamp}.mp4"
+        try:
+            if not os.path.exists(_keep):
+                os.replace(out, _keep)
+                _side = os.path.splitext(out)[0] + ".render.json"
+                if os.path.exists(_side):
+                    os.replace(_side, os.path.splitext(_keep)[0] + ".render.json")
+        except OSError:
+            pass  # 被播放器占用等 → 维持旧行为(覆盖),不阻塞渲染
     ending = os.path.join(PROJECT_ROOT, "resource", "ending", "ending.mp4")
     font = os.path.join(PROJECT_ROOT, "resource", "font", "Pulp Fiction Italic M54.ttf")
 
@@ -4286,7 +4299,23 @@ def render_outputs(shot_point: str):
                 except Exception:  # noqa: BLE001
                     pass
             out.append(entry)
-    return {"outputs": out, "shot_point_exists": os.path.exists(abs_point),
+    # 被新渲染顶替的旧版(见 /api/render 的归档逻辑)
+    history = []
+    try:
+        import glob as _glob
+        for p in _glob.glob(os.path.join(d, f"output_*_{_sp_tag}_v*.mp4")):
+            _m = re.search(r"output_(\w+)_%s_v(\d+_\d+)\.mp4$" % _sp_tag, os.path.basename(p))
+            history.append({
+                "ratio": (_m.group(1).replace("x", ":") if _m else "?"),
+                "version": (_m.group(2) if _m else ""),
+                "path": p, "size_mb": round(os.path.getsize(p) / 1e6, 1),
+                "mtime": os.path.getmtime(p),
+            })
+        history.sort(key=lambda x: x["mtime"], reverse=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"outputs": out, "history": history,
+            "shot_point_exists": os.path.exists(abs_point),
             "has_ending_video": os.path.exists(os.path.join(PROJECT_ROOT, "resource", "ending", "ending.mp4"))}
 
 

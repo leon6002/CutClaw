@@ -43,6 +43,8 @@ export default function RenderView({
 }) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [outputs, setOutputs] = useState<Output[]>([]);
+  // 被新渲染顶替的旧版成片(服务端自动归档,不覆盖)
+  const [history, setHistory] = useState<{ ratio: string; version: string; path: string; size_mb: number; mtime: number }[]>([]);
   const [hasEnding, setHasEnding] = useState(false);
   const [addEnding, setAddEnding] = useState(false);
   const [transitionMode, setTransitionMode] = useState<"none" | "uniform" | "ai">("uniform");
@@ -134,6 +136,7 @@ export default function RenderView({
     if (!sp) { setOutputs([]); setSpExists(null); onOutputsCount?.(0); return; }
     api<any>(`/api/render/outputs?shot_point=${encodeURIComponent(sp)}`).then((r) => {
       setOutputs(r.outputs);
+      setHistory(r.history ?? []);
       setHasEnding(r.has_ending_video);
       setSpExists(!!r.shot_point_exists);
       onOutputsCount?.(r.outputs.length);
@@ -428,6 +431,25 @@ export default function RenderView({
                   <div className="flex h-[180px] w-full items-center justify-center rounded-lg border border-dashed border-white/10 text-xs text-slate-500">
                     还没有渲染结果 — 点击上方「渲染」
                   </div>
+                )}
+
+                {history.length > 0 && (
+                  <details className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-1.5 text-xs">
+                    <summary className="cursor-pointer text-slate-400">
+                      🕘 历史版本({history.length})— 重渲前的旧成片自动留底,不会被覆盖
+                    </summary>
+                    <div className="mt-1.5 space-y-1">
+                      {history.map((h) => (
+                        <div key={h.path} className="flex items-center gap-2 text-slate-400">
+                          <span className="text-slate-300">{h.ratio}</span>
+                          <span>{new Date(h.mtime * 1000).toLocaleString()}</span>
+                          <span>{h.size_mb}MB</span>
+                          <a className="text-cyan-400 hover:underline" href={mediaUrl(h.path)} target="_blank" rel="noreferrer">▶ 播放</a>
+                          <a className="text-cyan-400 hover:underline" href={mediaUrl(h.path)} download>下载</a>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
                 )}
 
                 <div className="mt-4">
