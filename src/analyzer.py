@@ -336,6 +336,11 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
         if progress_callback:
             progress_callback(stage, status, detail)
         if status == "start":
+            try:
+                from src.utils.llm_logger import set_llm_stage
+                set_llm_stage(stage)
+            except Exception:
+                pass
             print(f"▶ [Analyze] {stage}: {fn} {detail}")
         elif status == "done":
             print(f"✅ [Analyze] {stage} done {detail}")
@@ -463,6 +468,30 @@ def _analyze_video_inner(video_path: str, cache_dir: str, video_type: str = "fil
             _start_sec = sum(float(x) * m for x, m in zip(reversed(str(_clip_start).split(":")), [1, 60, 3600]))
             _end_sec = sum(float(x) * m for x, m in zip(reversed(str(_clip_end).split(":")), [1, 60, 3600]))
             if _end_sec <= _start_sec:
+                # 1 秒镜头(ckpt 命名如 "9_9",起止秒标签相同):再切子段没有意义。
+                # 以前这里静默 return,dense_segments 永远缺失 → 完整性检查把整个
+                # 分析永久打回(确定性失败,不是网络问题,重跑也没救)。改为用镜头级
+                # caption 合成唯一一段,标记来源。
+                _aa = _cd.get("action_atoms")
+                if isinstance(_aa, str):
+                    try:
+                        import ast as _ast
+                        _aa = _ast.literal_eval(_aa)
+                    except Exception:
+                        _aa = {}
+                _desc = (_aa or {}).get("event_summary", "") if isinstance(_aa, dict) else ""
+                _cd["dense_segments"] = [{
+                    "timestamp": "00:00:00 to 00:00:01",
+                    "cut_type": "single",
+                    "content_description": _desc or "1-second shot (degenerate range, no sub-segmentation)",
+                    # trim_shot 的缓存复用按绝对秒定位(缺了会退回现场 VLM 调用)
+                    "start_sec_abs": _start_sec,
+                    "end_sec_abs": _start_sec + 1.0,
+                    "_synthesized": "degenerate_1s_range",
+                }]
+                with open(_cp, "w", encoding="utf-8") as _f2:
+                    json.dump(_cd, _f2, ensure_ascii=False, indent=2)
+                _prog_emit("video_dense", len(_need_dense), _di, "done")
                 return
             _emit("dense_caption", "progress", f"{_cf}: {_clip_start}-{_clip_end}")
             _prog_emit("video_dense", len(_need_dense), _di, "start", label=_cf.replace(".json", ""))
@@ -748,6 +777,11 @@ def analyze_audio(
     Returns:
         The content_hash (cache key) for this audio file.
     """
+    try:
+        from src.utils.llm_logger import set_llm_stage
+        set_llm_stage("audio_analysis")
+    except Exception:
+        pass
     abs_path = os.path.abspath(audio_path)
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Audio not found: {abs_path}")

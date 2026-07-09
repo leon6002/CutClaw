@@ -178,6 +178,20 @@ def main():
     from src.analyzer import analyze_video, analyze_audio, merge_scene_summaries, get_scene_summaries_dir, get_analysis_path
     from src.utils.progress import emit_progress as _emit_prog
 
+    # Hash alias: 素材库标注与流水线共用 Output/analyzed/{hash} 缓存,但素材库
+    # 对 Immich 资产按稳定指纹(im-…)键控,而这里默认按文件字节 SHA-256 键控。
+    # 同一个文件两种键 = 已标注的素材整个重新分析(重新计费)。开跑前把项目里
+    # 每个路径解析到素材库登记的 content_hash,命中就钉住同一个缓存目录。
+    _alias: dict[str, str] = {}
+    try:
+        from src.asset_manager.index_store import load_index as _load_asset_index
+        for _ch, _ann in _load_asset_index().items():
+            _ap = getattr(getattr(_ann, "metadata", None), "absolute_path", "")
+            if _ap:
+                _alias[os.path.normcase(os.path.abspath(_ap))] = _ch
+    except Exception as _e:
+        print(f"⚠️  [Analyze] asset index unavailable for hash aliasing: {_e}")
+
     # Per-video "which one is analyzing now" signal for the canvas asset nodes
     # (label = basename so the UI matches it to the right node). Cached videos
     # flip to done instantly; only the un-analyzed ones dwell in "分析中".
@@ -185,7 +199,10 @@ def main():
     _emit_prog("video_analysis", len(_video_inputs), -1, "reset")
     for _i, vp in enumerate(_video_inputs):
         _emit_prog("video_analysis", len(_video_inputs), _i, "start", label=os.path.basename(vp))
-        vh = analyze_video(vp, video_type=config.VIDEO_TYPE)
+        _pinned = _alias.get(os.path.normcase(os.path.abspath(vp)))
+        if _pinned:
+            print(f"🔗 [Analyze] {os.path.basename(vp)} → 素材库缓存 {_pinned[:16]}")
+        vh = analyze_video(vp, video_type=config.VIDEO_TYPE, content_hash=_pinned)
         video_hashes.append(vh)
         _emit_prog("video_analysis", len(_video_inputs), _i, "done", label=os.path.basename(vp))
 

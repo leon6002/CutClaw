@@ -1393,7 +1393,7 @@ export default function AssetsView({
   const [annPanelOpen, setAnnPanelOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<"trip" | "score" | "time_desc" | "time_asc">("trip");
-  const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "local" | "none">("all");
+  const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "cloud_no" | "local" | "local_no" | "none">("all");
   const [tagFilter, setTagFilter] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
   // manual selection: video/image hashes (multi) + audio hash (single)

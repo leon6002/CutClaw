@@ -19,6 +19,7 @@ import AudioTimeline, { attachInstruments, parseSectionTimes } from "../componen
 import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
+import ApiCostPanel from "../components/ApiCostPanel";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
 import WorkflowCanvas, { CANVAS_STAGE_KEYS, type AssetInfo, type ShotInfo } from "../components/flow/WorkflowCanvas";
@@ -72,6 +73,8 @@ export default function EditorView({
   const [paramSugError, setParamSugError] = useState("");
   // multi-music fusion pre-step status (runs right before the pipeline)
   const [fusion, setFusion] = useState<{ state: "running" | "done" | "error"; detail: string } | null>(null);
+  // 跑前成本预估(缓存命中→¥0;未命中按历史单价×预期调用数)
+  const [estimate, setEstimate] = useState<any>(null);
   // inline media preview — one shared player, no detail page needed
   const [preview, setPreview] = useState<{ kind: "video" | "audio"; path: string } | null>(null);
   const previewToggle = (kind: "video" | "audio", path: string) =>
@@ -148,6 +151,21 @@ export default function EditorView({
     const t = window.setInterval(fetchShots, 2500);
     return () => { stop = true; window.clearInterval(t); };
   }, [pipelineJobId, pipelineStatus, p.id, job.status]);
+
+  // 跑前预估:素材/音乐/目标时长一变就重估(防抖,不打扰输入)
+  useEffect(() => {
+    if (p.videos.length === 0) { setEstimate(null); return; }
+    let stop = false;
+    const t = window.setTimeout(() => {
+      api<any>("/api/pipeline/estimate", {
+        method: "POST",
+        body: JSON.stringify({
+          video_paths: p.videos, audio_path: p.audio, target_length: p.targetLength,
+        }),
+      }).then((r) => { if (!stop) setEstimate(r); }).catch(() => { if (!stop) setEstimate(null); });
+    }, 800);
+    return () => { stop = true; window.clearTimeout(t); };
+  }, [p.videos, p.audio, p.targetLength]);
 
   const running = pipelineStatus === "running";
   const allVideoOptions = Array.from(new Set([...p.videos, ...videoFiles]));
@@ -565,6 +583,21 @@ export default function EditorView({
                 {fusion.state === "done" ? "✓ " : ""}步骤 0 · BGM 融合:{fusion.detail}
               </div>
             )}
+            {estimate && !running && (
+              <div className="mb-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.05] px-3 py-2 text-xs text-amber-200/90">
+                💰 预估本次成本 <b className="text-amber-300">
+                  ¥{estimate.est_cost_cny}–{estimate.est_cost_cny_high}
+                </b>
+                <span className="text-amber-400/60">(${estimate.est_cost_usd}–{estimate.est_cost_usd_high})</span>
+                <span className="ml-2 text-slate-400">
+                  {estimate.cached_files}/{estimate.files?.length ?? 0} 个素材已缓存(¥0)
+                  {estimate.uncached_files > 0 && (
+                    <> · {estimate.uncached_files} 个需分析(约 {estimate.est_vlm_calls} 次视觉调用)</>
+                  )}
+                  · 剪辑约 {estimate.est_agent_calls} 次文本调用
+                </span>
+              </div>
+            )}
             <div className="flex gap-2">
               <Button
                 className="flex-1 gap-1.5 bg-cyan-500 font-semibold text-slate-950 shadow-[0_0_18px_rgba(34,211,238,0.35)] hover:bg-cyan-400"
@@ -605,6 +638,7 @@ export default function EditorView({
           </CardHeader>
           <CardContent>
             <AgentFlow steps={PIPELINE_STEPS} stages={stagesView} />
+            {pipelineJobId && <ApiCostPanel jobId={pipelineJobId} running={running} />}
 
             {/* monitor view toggle: node canvas (agents) / dense grid */}
             <div className="mb-2 flex items-center gap-1 text-xs">

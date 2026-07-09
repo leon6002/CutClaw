@@ -231,6 +231,11 @@ def plan_bgm_mix(paths: list, target_sec: float = 180.0, brief: str = "") -> tup
     the energy arc (open → build → peak → resolve); every timestamp comes
     from the signal analysis, joins land on bar lines downstream. Any LLM
     failure falls back to a deterministic energy-peak arrangement."""
+    try:
+        from src.utils.llm_logger import set_llm_stage
+        set_llm_stage("bgm_fusion")
+    except Exception:
+        pass
     infos = [_measured_segments(p) for p in paths]
     usable = [i for i in infos if i["segments"]]
     if len(usable) < 2:

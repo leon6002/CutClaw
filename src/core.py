@@ -2429,6 +2429,11 @@ class ParallelShotOrchestrator:
             print(f"[Parallel] subagent saved: section={key[0]} shot={key[1]}")
 
     def run_parallel(self, shot_plan_path: str):
+        try:
+            from src.utils.llm_logger import set_llm_stage
+            set_llm_stage("editor")
+        except Exception:
+            pass
         with open(shot_plan_path, 'r', encoding='utf-8') as f:
             structure_proposal = json.load(f)
 

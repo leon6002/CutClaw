@@ -1667,6 +1667,11 @@ class Screenwriter:
 
     def run(self, instruction) -> dict:
         """Run the screenwriter pipeline to generate a shot plan."""
+        try:
+            from src.utils.llm_logger import set_llm_stage
+            set_llm_stage("screenwriter")
+        except Exception:
+            pass
         if self.output_path and os.path.exists(self.output_path):
             try:
                 with open(self.output_path, 'r', encoding='utf-8') as f:

@@ -515,21 +515,12 @@ def process_video(
     pbar = tqdm(total=0, desc="Captioning clips")
     loop = asyncio.new_event_loop()
     try:
-        # First pass timeout bumped 30->90s: the VLM endpoint (proxied Gemini) is
-        # slow, and 30s made many clips "fail" only to succeed on retry — wasting a
-        # retry round and flooding the UI with red. 90s lets most pass first time.
-        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=90))
-
-        # Retry failed clips (already have arrays in memory)
-        timeouts = [120, 120]
-        for attempt, timeout in enumerate(timeouts):
-            if not failed:
-                break
-            print(f"  🔄 [VideoCaption] {len(failed)} clips failed, retrying... ({attempt + 1}/{len(timeouts)})")
-            pbar.total += len(failed)
-            pbar.refresh()
-            is_last = (attempt == len(timeouts) - 1)
-            failed = loop.run_until_complete(_run_overlapped(iter(failed), pbar, timeout=timeout, is_last_attempt=is_last))
+        # Single cloud pass, timeout 300s, NO retries. The proxied endpoint's
+        # normal latency approaches the old 90s limit, so timeouts mostly hit
+        # requests the server had already processed — every retry re-billed the
+        # full clip. One generous window; whatever still fails goes to the
+        # local-VLM fallback below or stays resumable via per-clip ckpt.
+        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=300))
     finally:
         loop.close()
 
@@ -568,7 +559,7 @@ def process_video(
         # Raising keeps the analysis in "incomplete" state; the per-clip ckpt
         # files mean the next run retries ONLY the missing clips.
         raise RuntimeError(
-            f"{len(failed)} clip(s) failed captioning after retries — "
+            f"{len(failed)} clip(s) failed captioning (no auto-retry — 重试纪律) — "
             f"analysis left resumable; re-run to retry only the missing clips"
         )
 

@@ -32,7 +32,62 @@ _STATE = {
     "prompt_tokens": 0,
     "completion_tokens": 0,
     "total_tokens": 0,
+    "cost_usd": 0.0,
+    "media_bytes": 0,
+    "images": 0,
+    "stage": "",
 }
+
+
+def set_llm_stage(stage: str):
+    """Tag subsequent LLM calls with the pipeline stage (成本可视化按阶段聚合).
+
+    Stages are sequential per process, so a module-level tag is accurate even
+    when a stage fans out to worker threads (they all belong to that stage).
+    """
+    with _LOCK:
+        _STATE["stage"] = stage or ""
+
+
+def _media_stats(messages) -> tuple[int, int]:
+    """(image_count, payload_bytes) of base64 media in the request messages.
+
+    base64 chars × 3/4 ≈ raw bytes. Counts image_url data: URLs and any
+    input_audio/file parts — the things that dominate multimodal cost.
+    """
+    imgs = 0
+    b = 0
+    for m in messages or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype in ("image_url", "image", "input_image"):
+                url = part.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if isinstance(url, str) and url.startswith("data:"):
+                    imgs += 1
+                    b += int(len(url) * 0.75)
+            elif ptype in ("input_audio", "audio", "file"):
+                data = part.get("input_audio") or part.get("file") or {}
+                if isinstance(data, dict):
+                    payload = data.get("data") or data.get("file_data") or ""
+                    if isinstance(payload, str):
+                        b += int(len(payload) * 0.75)
+    return imgs, b
+
+
+def _call_cost_usd(response_obj) -> float:
+    """Cost of one call via litellm's price table (0.0 when unknown/local)."""
+    try:
+        import litellm
+        return float(litellm.completion_cost(completion_response=response_obj) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _sanitize_content(content):
@@ -152,13 +207,19 @@ def _write_record(record: dict):
 
 def _record_call(kwargs, response_obj, start_time, end_time, ok: bool, error=None):
     usage = _extract_usage(response_obj) if ok else {}
+    imgs, media_b = _media_stats((kwargs or {}).get("messages"))
+    cost = _call_cost_usd(response_obj) if ok else 0.0
     with _LOCK:
         _STATE["calls"] += 1
+        _STATE["images"] += imgs
+        _STATE["media_bytes"] += media_b
+        stage = _STATE["stage"]
         if ok:
             _STATE["success"] += 1
             _STATE["prompt_tokens"] += usage.get("prompt_tokens") or 0
             _STATE["completion_tokens"] += usage.get("completion_tokens") or 0
             _STATE["total_tokens"] += usage.get("total_tokens") or 0
+            _STATE["cost_usd"] += cost
         else:
             _STATE["failure"] += 1
 
@@ -166,7 +227,10 @@ def _record_call(kwargs, response_obj, start_time, end_time, ok: bool, error=Non
         "ts": _dt.datetime.now().isoformat(timespec="seconds"),
         "status": "success" if ok else "failure",
         "model": (kwargs or {}).get("model"),
+        "stage": stage,
         "latency_s": _latency_seconds(start_time, end_time),
+        "cost_usd": round(cost, 6),
+        "media": {"images": imgs, "bytes": media_b},
         "request": {
             "messages": _sanitize_messages((kwargs or {}).get("messages")),
             "num_tools": len((kwargs or {}).get("tools") or []),
@@ -255,6 +319,9 @@ def print_llm_summary():
         pt = _STATE["prompt_tokens"]
         ct = _STATE["completion_tokens"]
         tt = _STATE["total_tokens"]
+        cost = _STATE["cost_usd"]
+        imgs = _STATE["images"]
+        mb = _STATE["media_bytes"] / 1048576
         path = _STATE["log_path"]
     print(f"\n{'='*60}")
     print("📊 LLM Usage Summary")
@@ -262,5 +329,7 @@ def print_llm_summary():
     print(f"  prompt tokens      : {pt:,}")
     print(f"  completion tokens  : {ct:,}")
     print(f"  total tokens       : {tt:,}")
+    print(f"  media uploaded     : {imgs} images · {mb:.1f} MB")
+    print(f"  estimated cost     : ${cost:.4f} (≈¥{cost * 7.2:.2f})")
     print(f"  detailed log       : {path}")
     print(f"{'='*60}\n")

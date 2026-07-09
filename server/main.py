@@ -3232,6 +3232,232 @@ def pipeline_current(since: int = 0, project_id: str = ""):
     return {"job": job.to_dict(since)}
 
 
+# ── API 成本可视化 ──────────────────────────────────────────────────────────
+# 流水线子进程经 llm_logger 把每次 LLM 调用(token/媒体体积/阶段/成本)写进
+# llm_calls_*.jsonl;这里聚合成实时账单。预估端点按"缓存命中→¥0,未命中→
+# 历史单价×预期调用数"给跑前报价。
+
+_USAGE_CACHE: dict = {}   # path -> (size, parsed_totals) 避免每次轮询重读全文件
+
+_CNY = 7.2  # 展示用近似汇率
+
+
+def _price_per_token(model: str) -> tuple[float, float]:
+    """价格表按 provider/model 键控;日志里常只有裸模型名 → 逐个前缀试."""
+    try:
+        import litellm
+    except Exception:
+        return 0.0, 0.0
+    candidates = [model] if "/" in model else [
+        model, f"gemini/{model}", f"deepseek/{model}", f"openai/{model}", f"ollama/{model}"]
+    for cand in candidates:
+        try:
+            i, o = litellm.cost_per_token(model=cand, prompt_tokens=1_000_000,
+                                          completion_tokens=1_000_000)
+            if i or o:
+                return (i or 0.0) / 1e6, (o or 0.0) / 1e6
+        except Exception:
+            continue
+    return 0.0, 0.0
+
+
+def _llm_log_path_for_job(job) -> str | None:
+    import re as _re
+    for l in job.lines[:200]:
+        m = _re.search(r"\[LLM Log\].*?to:\s*(.+llm_calls_\S+\.jsonl)", str(l))
+        if m:
+            p = m.group(1).strip()
+            return p if os.path.isabs(p) else _resolve(p)
+    return None
+
+
+def _aggregate_llm_log(path: str) -> dict:
+    """Sum one llm_calls jsonl → totals + by_stage + by_model (增量缓存)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    cached = _USAGE_CACHE.get(path)
+    if cached and cached[0] == size:
+        return cached[1]
+    totals = {"calls": 0, "ok": 0, "fail": 0, "prompt_tokens": 0,
+              "completion_tokens": 0, "cost_usd": 0.0, "images": 0, "media_bytes": 0}
+    stages: dict = {}
+    models: dict = {}
+    _prices: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                u = r.get("usage") or {}
+                pt, ct = u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0
+                model = r.get("model") or "?"
+                cost = r.get("cost_usd")
+                if cost is None:  # 旧格式日志:按价格表现算
+                    if model not in _prices:
+                        _prices[model] = _price_per_token(model)
+                    pi, po = _prices[model]
+                    cost = pt * pi + ct * po
+                media = r.get("media") or {}
+                ok = r.get("status") == "success"
+                totals["calls"] += 1
+                totals["ok" if ok else "fail"] += 1
+                totals["prompt_tokens"] += pt
+                totals["completion_tokens"] += ct
+                totals["cost_usd"] += cost or 0.0
+                totals["images"] += media.get("images") or 0
+                totals["media_bytes"] += media.get("bytes") or 0
+                for key, bucket in ((r.get("stage") or "(未标注)", stages), (model, models)):
+                    b = bucket.setdefault(key, {"calls": 0, "prompt_tokens": 0,
+                                                "completion_tokens": 0, "cost_usd": 0.0,
+                                                "images": 0, "media_bytes": 0})
+                    b["calls"] += 1
+                    b["prompt_tokens"] += pt
+                    b["completion_tokens"] += ct
+                    b["cost_usd"] += cost or 0.0
+                    b["images"] += media.get("images") or 0
+                    b["media_bytes"] += media.get("bytes") or 0
+    except OSError:
+        return {}
+    out = {"totals": totals,
+           "by_stage": [{"stage": k, **v} for k, v in stages.items()],
+           "by_model": [{"model": k, **v} for k, v in models.items()]}
+    _USAGE_CACHE[path] = (size, out)
+    if len(_USAGE_CACHE) > 8:
+        _USAGE_CACHE.pop(next(iter(_USAGE_CACHE)))
+    return out
+
+
+@app.get("/api/pipeline/usage")
+def pipeline_usage(job_id: str = ""):
+    """当前(或指定)流水线运行的实时 API 账单."""
+    job = JOBS.get(job_id or PIPELINE_JOB_ID or "")
+    if not job:
+        return {"available": False, "reason": "no pipeline job"}
+    path = _llm_log_path_for_job(job)
+    if not path or not os.path.exists(path):
+        return {"available": False, "reason": "log not started yet",
+                "running": job.status == "running"}
+    agg = _aggregate_llm_log(path)
+    if not agg:
+        return {"available": False, "reason": "log unreadable"}
+    return {"available": True, "running": job.status == "running",
+            "job_id": job.id, "log_path": path, "cny_rate": _CNY, **agg}
+
+
+class EstimateRequest(BaseModel):
+    video_paths: list[str] = []
+    audio_path: str = ""
+    target_length: float = 180.0
+
+
+def _analysis_cached(ch: str) -> bool:
+    """素材分析是否已完整缓存(镜头/描述/场景都在)."""
+    base = _resolve(os.path.join("Output", "analyzed", ch))
+    return (os.path.isdir(os.path.join(base, "captions", "scenes"))
+            and os.path.isdir(os.path.join(base, "captions", "ckpt")))
+
+
+def _recent_call_rate(model: str, default: float) -> float:
+    """该模型近期日志的平均单次调用成本(自校准;无历史时用保守常数)."""
+    import glob as _glob
+    logs = sorted(_glob.glob(_resolve(os.path.join("Output", "logs", "llm_calls_*.jsonl"))),
+                  key=os.path.getmtime)[-5:]
+    tot, n = 0.0, 0
+    pi, po = _price_per_token(model)
+    short = model.split("/")[-1]
+    for lp in logs:
+        try:
+            with open(lp, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if (r.get("model") or "").split("/")[-1] != short or r.get("status") != "success":
+                        continue
+                    u = r.get("usage") or {}
+                    c = r.get("cost_usd")
+                    if c is None:
+                        c = (u.get("prompt_tokens") or 0) * pi + (u.get("completion_tokens") or 0) * po
+                    tot += c
+                    n += 1
+        except OSError:
+            continue
+    return (tot / n) if n >= 10 else default
+
+
+@app.post("/api/pipeline/estimate")
+def pipeline_estimate(body: EstimateRequest):
+    """跑前成本预估:缓存命中的素材 ¥0,未命中按时长推调用数 × 历史单价."""
+    import src.config as config
+    from src.asset_manager.scanner import compute_content_hash
+    from src.asset_manager.index_store import load_index
+
+    alias: dict[str, str] = {}
+    try:
+        for ch, ann in load_index().items():
+            ap = getattr(getattr(ann, "metadata", None), "absolute_path", "")
+            if ap:
+                alias[os.path.normcase(os.path.abspath(ap))] = ch
+    except Exception:
+        pass
+
+    vlm_rate = _recent_call_rate(cfg("VIDEO_ANALYSIS_MODEL", config.VIDEO_ANALYSIS_MODEL), 0.011)
+    agent_rate = _recent_call_rate(cfg("AGENT_LITELLM_MODEL", config.AGENT_LITELLM_MODEL), 0.0012)
+
+    files = []
+    vlm_calls = 0
+    for vp in body.video_paths:
+        ap = _resolve(vp)
+        ch = alias.get(os.path.normcase(os.path.abspath(ap))) or compute_content_hash(ap)
+        cached = bool(ch) and _analysis_cached(ch)
+        dur = 0.0
+        calls = 0
+        if not cached and os.path.exists(ap):
+            try:
+                from src.asset_manager.scanner import _probe_via_ffprobe
+                dur = float(_probe_via_ffprobe(ap, "format=duration").get("duration") or 0)
+            except Exception:
+                dur = 0.0
+            # 经验模型:片段≈27s 一段;每段 1 次描述 + 1 次密集描述;每 ~220s 一次场景分析
+            clips = max(1, int(dur / 27 + 0.5))
+            calls = clips * 2 + max(1, int(dur / 220 + 0.5))
+            vlm_calls += calls
+        files.append({"name": os.path.basename(vp), "cached": cached,
+                      "duration_sec": round(dur), "est_vlm_calls": calls})
+
+    # 音频:命中缓存 ¥0,否则约 8 次文本调用(能量段落 + LLM 描述)
+    audio_calls = 0
+    if body.audio_path:
+        ach = compute_content_hash(_resolve(body.audio_path))
+        acached = bool(ach) and os.path.exists(
+            _resolve(os.path.join("Output", "analyzed", ach, "captions.json")))
+        if not acached:
+            audio_calls = 8
+
+    # 编剧 ~6 次 + 剪辑每分镜 ~3 次(密集描述走缓存,剪辑 Agent 是纯文本模型)
+    shots = max(1, int(body.target_length / 3.3))
+    agent_calls = 6 + shots * 3 + audio_calls
+
+    est = vlm_calls * vlm_rate + agent_calls * agent_rate
+    return {
+        "files": files,
+        "cached_files": sum(1 for f in files if f["cached"]),
+        "uncached_files": sum(1 for f in files if not f["cached"]),
+        "est_vlm_calls": vlm_calls, "est_agent_calls": agent_calls,
+        "vlm_rate_usd": round(vlm_rate, 5), "agent_rate_usd": round(agent_rate, 5),
+        "est_cost_usd": round(est, 4),
+        "est_cost_usd_high": round(est * 1.4, 4),   # ±40%:镜头数只能按时长猜
+        "est_cost_cny": round(est * _CNY, 2),
+        "est_cost_cny_high": round(est * 1.4 * _CNY, 2),
+        "cny_rate": _CNY,
+    }
+
+
 @app.get("/api/project/recent")
 def project_recent(limit: int = 10):
     """Most recent shot_point results on disk — works regardless of id scheme."""
