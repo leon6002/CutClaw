@@ -2116,6 +2116,48 @@ def asset_fine_review(body: FineReviewRequest):
     return {"status": "started"}
 
 
+# 批量细评:一个后台线程串行跑(并发多素材会触发 Gemini 503),全局状态轮询
+_FR_BATCH = {"running": False, "current": "", "done": 0, "total": 0, "errors": 0}
+
+
+class FineReviewBatchRequest(BaseModel):
+    content_hashes: list[str]
+
+
+@app.post("/api/assets/fine_review_batch")
+def asset_fine_review_batch(body: FineReviewBatchRequest):
+    """批量细评选中的素材(串行,断点续评——已评过的段落自动跳过)。"""
+    if _FR_BATCH["running"]:
+        raise HTTPException(409, "已有批量细评在跑")
+    hashes = [h for h in body.content_hashes if h]
+    if not hashes:
+        raise HTTPException(400, "没有可细评的素材(需先标注)")
+    _FR_BATCH.update({"running": True, "current": "", "done": 0,
+                      "total": len(hashes), "errors": 0})
+
+    def _run():
+        from src.analyzer import _ensure_ffmpeg_on_path
+        _ensure_ffmpeg_on_path()
+        from src.fine_review import fine_review_source
+        for ch in hashes:
+            _FR_BATCH["current"] = ch
+            try:
+                fine_review_source(ch)
+            except Exception as e:  # noqa: BLE001
+                _FR_BATCH["errors"] += 1
+                print(f"⚠️ [FineReview] batch: {ch[:16]} failed: {str(e)[:100]}")
+            _FR_BATCH["done"] += 1
+        _FR_BATCH.update({"running": False, "current": ""})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "total": len(hashes)}
+
+
+@app.get("/api/assets/fine_review_batch/status")
+def asset_fine_review_batch_status():
+    return dict(_FR_BATCH)
+
+
 class SoundHighlightRequest(BaseModel):
     content_hash: str
     path: str          # media path the player already uses

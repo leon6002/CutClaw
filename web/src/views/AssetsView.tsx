@@ -1476,6 +1476,27 @@ export default function AssetsView({
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<"trip" | "score" | "time_desc" | "time_asc">("trip");
   const [annFilter, setAnnFilter] = useState<"all" | "cloud" | "cloud_no" | "local" | "local_no" | "none">("all");
+  // 🔬 批量细评(服务端串行队列,轮询进度)
+  const [frBatch, setFrBatch] = useState<{ running: boolean; done: number; total: number; errors?: number } | null>(null);
+  useEffect(() => {
+    if (!frBatch?.running) return;
+    const t = window.setInterval(async () => {
+      try {
+        const s = await api<any>("/api/assets/fine_review_batch/status");
+        setFrBatch(s);
+        if (!s.running) window.clearInterval(t);
+      } catch { /* keep polling */ }
+    }, 3000);
+    return () => window.clearInterval(t);
+  }, [frBatch?.running]);
+  const startFineBatch = async (hashes: string[]) => {
+    try {
+      await api("/api/assets/fine_review_batch", {
+        method: "POST", body: JSON.stringify({ content_hashes: hashes }),
+      });
+      setFrBatch({ running: true, done: 0, total: hashes.length });
+    } catch (e: any) { window.alert(e.message); }
+  };
   const [tagFilter, setTagFilter] = useState("");
   const [detail, setDetail] = useState<Asset | null>(null);
   // manual selection: video/image hashes (multi) + audio hash (single)
@@ -2532,6 +2553,23 @@ export default function AssetsView({
                   }}>
                   🖥 本地标注 ({vids.length})
                 </Button>
+                {(() => {
+                  const annVids = vids.filter((a) => a.annotated || a.annotated_local);
+                  return (
+                    <Button variant="outline" size="sm"
+                      className="h-7 gap-1 border-fuchsia-500/30 bg-fuchsia-500/[0.08] text-xs text-fuchsia-300 hover:bg-fuchsia-500/15"
+                      disabled={busy || annVids.length === 0 || !!frBatch?.running}
+                      title="VLM 逐段分维度细评选中视频(需已标注;约 每视频段数÷4 次视觉调用;已评段落自动跳过)"
+                      onClick={() => {
+                        if (!window.confirm(`对 ${annVids.length} 个已标注视频批量细评?\n约 ${annVids.length * 8} 次视觉调用(计费,已评过的段落自动跳过)。`)) return;
+                        startFineBatch(annVids.map((a) => a.content_hash));
+                      }}>
+                      {frBatch?.running
+                        ? <><Loader2 className="h-3 w-3 animate-spin" /> 细评 {frBatch.done}/{frBatch.total}</>
+                        : <>🔬 批量细评 ({annVids.length})</>}
+                    </Button>
+                  );
+                })()}
                 <span className="mx-1 h-4 w-px bg-white/10" />
                 {/* project ops */}
                 {pickApplied ? (
