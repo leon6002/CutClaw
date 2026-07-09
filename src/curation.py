@@ -19,6 +19,7 @@ the project step only merges them and maps moments onto merged scene indices.
 """
 import json
 import os
+import re
 
 _POOL_VERSION = 8   # v8: long-take chains — contiguous segments merge into ≤12s
                     # candidates so slow-pacing slots (5-9s) have real supply
@@ -371,6 +372,12 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
     # project-pool time so cross-clip (and cross-source) sameness is caught.
     _cluster_pool(pool)
 
+    # ── 评分 v9(§17):百分位归一 + 事件性 + 稀缺度 + 空镜否决 ──────────
+    # 旧公式绝对值相加,白山项目 top15 全部饱和在 0.92——系统丧失区分度;
+    # 且"匀速滑过的空镜"稳定+清晰就能拿高分,用户点名"镜头无意义"。
+    # 全部吃 moment 里已存的字段,在项目池层重算,无需重建任何缓存。
+    _score_reform_v9(pool)
+
     pool.sort(key=lambda m: -m["score"])
 
     # Per-look retention: a visually homogeneous source (slow aerial) floods
@@ -399,6 +406,92 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
     for i, m in enumerate(pool):
         m["id"] = f"M{i}"
     return pool
+
+
+# 事件动词:画面里"有事发生"(转身/挥手/笑/摔/指/停下)vs 匀速滑过。
+# 挖的是密集描述文本(英文),不花一分钱。
+_EVENT_STRONG = re.compile(
+    r"\b(jump|leap|laugh|smil\w*|wave|wav(es|ing)|hug|fall\w*|tumbl\w*|spray|splash|"
+    r"looks? back|look(s|ing) (at|toward)s? the camera|point(s|ing)|gestur\w*|"
+    r"celebrat\w*|high.five|danc\w*|stands? up|sits? down|stops? (and|to)|"
+    r"turn(s|ing)? (his|her|their) head)\b", re.I)
+_EVENT_MILD = re.compile(
+    r"\b(turn(s|ing)|approach\w*|pass(es|ing) (close|by)|reveal(s|ing)|"
+    r"child\w*|kid s?|runs?|walking toward)\b", re.I)
+
+
+def _event_strength(desc: str) -> float:
+    """1.0 = 明确的瞬间/动作;0.5 = 有变化;0 = 匀速无事件。"""
+    t = desc or ""
+    if _EVENT_STRONG.search(t):
+        return 1.0
+    if _EVENT_MILD.search(t):
+        return 0.5
+    return 0.0
+
+
+def _score_reform_v9(pool: list) -> None:
+    """项目池层重打分(LOGIC.md §17):
+
+    - content/stability/rarity 按**项目内百分位**归一(排名/N)——绝对分
+      饱和的数学根治,永远有区分度;
+    - event(动词挖掘)与 rarity(1/√簇规模)是新维度:第 15 个同款跟拍
+      自动掉价,"有事发生"的瞬间升值;
+    - 人脸小权重(用户:风景为主人脸少)、口味加成忽略不计但保留增量;
+    - 空镜否决:无人+无事件+无人声 → 乘 0.6 并标记(封不进菜单前列);
+    - 旧 score 里的口味/宝石/红心加成以 delta 形式原样保留。
+    """
+    if len(pool) < 4:
+        return
+    # 簇规模(rarity 的分母);cluster None = 独一无二
+    _csize: dict = {}
+    for m in pool:
+        c = m.get("cluster")
+        if c is not None:
+            _csize[c] = _csize.get(c, 0) + 1
+
+    def _pct(values: list) -> dict:
+        order = sorted(range(len(values)), key=lambda i: values[i])
+        n = max(1, len(values) - 1)
+        out = {}
+        for rank, i in enumerate(order):
+            out[i] = rank / n
+        return out
+
+    content_raw = [float(m.get("vlm_q") or 3) for m in pool]
+    stab_raw = [float(m.get("stability", -1)) if float(m.get("stability", -1)) >= 0 else 5.5
+                for m in pool]
+    rar_raw = [1.0 / (_csize.get(m.get("cluster"), 1) ** 0.5) for m in pool]
+    c_pct, s_pct, r_pct = _pct(content_raw), _pct(stab_raw), _pct(rar_raw)
+
+    empties = 0
+    for i, m in enumerate(pool):
+        base_old = (0.40 * (float(m.get("vlm_q") or 3) / 5.0)
+                    + 0.40 * ((float(m.get("stability", -1)) / 10.0)
+                              if float(m.get("stability", -1)) >= 0 else 0.55)
+                    + 0.15 * (1.0 if m.get("sound") else 0.0)
+                    + 0.05 * (1.0 if m.get("people") else 0.0))
+        delta = float(m.get("score") or 0) - base_old   # 口味/宝石/红心加成
+        ev = _event_strength(m.get("desc") or "")
+        comp = (0.30 * c_pct[i] + 0.25 * s_pct[i] + 0.15 * ev
+                + 0.15 * r_pct[i]
+                + 0.10 * (1.0 if m.get("sound") else 0.0)
+                + 0.05 * (1.0 if m.get("people") else 0.0))
+        if not (m.get("people") or m.get("sound") or ev > 0):
+            comp *= 0.6
+            m["empty_shot"] = True   # 无人无事无声的空镜——呼吸位可用,前列免谈
+            empties += 1
+        m["event"] = ev
+        m["rarity"] = round(rar_raw[i], 3)
+        m["score"] = round(max(0.0, comp + delta), 3)
+    # 分层标签(菜单/UI 展示用):强制分布,"都很好"被制度性禁止
+    ranked = sorted(pool, key=lambda m: -m["score"])
+    for rank, m in enumerate(ranked):
+        q = rank / max(1, len(ranked))
+        m["tier"] = "S" if q < 0.10 else "A" if q < 0.30 else "B" if q < 0.70 else "C"
+    print(f"🏷️  [Curation] v9 rescore: {len(pool)} moments · "
+          f"{sum(1 for m in pool if m.get('event') == 1.0)} strong-event · "
+          f"{empties} empty shots demoted · S={sum(1 for m in pool if m['tier'] == 'S')}")
 
 
 def build_anchor_budget(pool: list, n_slots: int,
