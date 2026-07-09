@@ -21,7 +21,7 @@ import json
 import os
 import re
 
-_POOL_VERSION = 8   # v8: long-take chains — contiguous segments merge into ≤12s
+_POOL_VERSION = 9   # v9: 最近轴倾斜测量(旧版 ±25° 窗口对 45° 歪斜全盲)+ tilt 入 detail
                     # candidates so slow-pacing slots (5-9s) have real supply
                     # (v7: camera-motion signature per moment)
 
@@ -200,7 +200,9 @@ def _source_pool(content_hash: str) -> list:
             _st = measure_stability(src_path, s, e, samples=3)
             stab = float(_st.get("score", -1))
             stab_detail = {"rel_sharp": _st.get("rel_sharp"),
-                           "disorder": _st.get("disorder")}
+                           "disorder": _st.get("disorder"),
+                           "tilt": _st.get("tilt"),
+                           "tilt_min": _st.get("tilt_min")}
             _motion = _st.get("motion") or {"type": "unmeasured"}
             if 0 <= stab < 3.5:
                 continue      # measured blur/violent motion — never a highlight
@@ -296,7 +298,8 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
             mm["scene"] = best
             _fk = f"{float(m.get('start') or 0):.1f}:{float(m.get('end') or 0):.1f}"
             if _fk in _fr:
-                mm["fine"] = _fr[_fk]
+                from src.fine_review import apply_measured_caps
+                mm["fine"] = apply_measured_caps(_fr[_fk], mm)
             pool.append(mm)
 
     # user taste memory: rejected ranges depress the score (stacking, capped);

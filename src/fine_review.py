@@ -216,6 +216,37 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
     return data
 
 
+def apply_measured_caps(v: dict, m: dict) -> dict:
+    """实测数据对 VLM 主观分的确定性封顶(消费时套用,缓存结论保持原样)。
+
+    案例:云台歪 45° 的段落,VLM 看两帧把歪斜当"动感视角"给构图 7/S 级
+    ——可实测的缺陷不让模型说了算。倾斜 ≥8° 构图封 4、tier 封 B;
+    ≥15° 构图封 2、tier 封 C,点评追加实测角度。
+    """
+    _sd = m.get("stability_detail") or {}
+    # 判持续性倾斜(样本最小角):压弯/动态倾斜有回正瞬间不触发,云台锁歪才触发
+    tilt = _sd.get("tilt_min", _sd.get("tilt"))
+    if tilt is None or float(tilt) < 12.0:
+        return v
+    t = float(tilt)
+    v = dict(v)
+    dims = dict(v.get("dims") or {})
+    cap = 4.0 if t < 25.0 else 2.0
+    if dims.get("composition") is not None and float(dims["composition"]) > cap:
+        dims["composition"] = cap
+    v["dims"] = dims
+    vals = [float(x) for x in dims.values() if x is not None]
+    if vals:
+        v["avg"] = round(sum(vals) / len(vals), 2)
+    _order = {"S": 0, "A": 1, "B": 2, "C": 3}
+    _floor = "B" if t < 25.0 else "C"
+    if _order.get(v.get("tier"), 2) < _order[_floor]:
+        v["tier"] = _floor
+    v["critique"] = f"{str(v.get('critique') or '')[:50]}(持续倾斜{t:.0f}°,构图封顶)"
+    v["tilt_capped"] = t
+    return v
+
+
 def load_fine_review(content_hash: str) -> dict:
     """{ 'start:end': verdict } — 池合并/详情页共用。"""
     from src.analyzer import get_analysis_path

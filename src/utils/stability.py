@@ -163,17 +163,20 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
                     mxs.append(_sig[0])
                     mys.append(_sig[1])
                     rads.append(_sig[2])
-            # camera roll: near-vertical structures (trees/poles) deviating
-            # from vertical = crooked gimbal. Needs enough lines to trust.
+            # camera roll:结构线到最近坐标轴(水平/竖直)的偏差。旧版只看
+            # "±25° 内接近竖直"的线——云台歪到 45° 时竖直结构全躺在窗口外,
+            # 一条都采不到 → 倾斜"未测"零惩罚(用户抓到 45° 歪斜段实测 7.9)。
+            # 最近轴偏差能测满 0-45°:直片的地平线/杆子贴轴(偏差~2°),
+            # 歪片全体偏离。
             _edges = cv2.Canny(g0, 60, 160)
             _lines = cv2.HoughLinesP(_edges, 1, np.pi / 180, threshold=40,
                                      minLineLength=40, maxLineGap=6)
             if _lines is not None:
                 _devs = []
                 for _l in _lines[:, 0]:
-                    _ang = np.degrees(np.arctan2(float(_l[3] - _l[1]), float(_l[2] - _l[0])))
-                    if abs(abs(_ang) - 90) <= 25:
-                        _devs.append(abs(abs(_ang) - 90))
+                    _ang = abs(np.degrees(np.arctan2(float(_l[3] - _l[1]),
+                                                     float(_l[2] - _l[0])))) % 90.0
+                    _devs.append(min(_ang, 90.0 - _ang))
                 if len(_devs) >= 6:
                     tilts.append(float(np.median(_devs)))
 
@@ -193,11 +196,14 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
     # Gentle glides measure ~0.02-0.29 widths/s (keep full marks); beyond
     # 0.30 w/s the motion starts to dominate the frame and gets penalized.
     speed_pen = min(1.0, max(0.0, (speed - 0.30) / 0.45))
-    # TILT penalty — user found a shot with a badly crooked gimbal (measured
-    # 9.1° vs 1.8° for straight footage). Requires ≥2 frames with enough
-    # vertical structure; unmeasurable scenes (open water/sky) are exempt.
+    # TILT penalty — 判"持续性"歪斜,不判动态倾斜:滑雪 POV 压弯时倾角大
+    # 但会回正(样本间波动),云台锁歪是恒定的。取样本【最小】倾角作为持续
+    # 倾斜的保守估计;中位数仅作报告。惩罚从 8° 起步、20° 拉满(旧的 4-9°
+    # 曲线在最近轴测量下会把整库 POV 素材屠掉:109 段→50 段)。
     tilt = round(float(np.median(tilts)), 1) if len(tilts) >= 2 else None
-    tilt_pen = min(1.0, max(0.0, (tilt - 4.0) / 5.0)) if tilt is not None else 0.0
+    tilt_min = round(float(np.min(tilts)), 1) if len(tilts) >= 2 else None
+    tilt_pen = (min(1.0, max(0.0, (tilt_min - 8.0) / 12.0))
+                if tilt_min is not None else 0.0)
     score = (sharp_score * (1.0 - 0.5 * disorder_pen)
              * (1.0 - 0.6 * speed_pen) * (1.0 - 0.7 * tilt_pen))
     return {
@@ -208,6 +214,7 @@ def _measure(video_path: str, start_sec: float, end_sec: float, samples: int) ->
         "disorder": round(disorder, 3),
         "speed": round(speed, 3),
         "tilt": tilt,
+        "tilt_min": tilt_min,   # 持续性倾斜(样本最小值)——缺陷判定用这个
         "motion": motion,
     }
 

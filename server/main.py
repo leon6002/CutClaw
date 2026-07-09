@@ -2043,12 +2043,12 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
             _moments = _hd.get("moments", [])
             # 细评结论随行(标注时逐片段精细化评判 → 详情页图形化)
             try:
-                from src.fine_review import load_fine_review
+                from src.fine_review import load_fine_review, apply_measured_caps
                 _fr = load_fine_review(content_hash)
                 for _m in _moments:
                     _k = f"{float(_m.get('start') or 0):.1f}:{float(_m.get('end') or 0):.1f}"
                     if _k in _fr:
-                        _m["fine"] = _fr[_k]
+                        _m["fine"] = apply_measured_caps(_fr[_k], _m)
             except Exception:  # noqa: BLE001
                 pass
             result["highlight_pool"] = sorted(
