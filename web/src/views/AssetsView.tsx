@@ -797,6 +797,21 @@ function DetailView({
                             </Badge>
                             {m.sound && <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300">🎙 人声 +15%</Badge>}
                             {m.people && <Badge variant="outline" className="border-white/15 bg-white/[0.05] text-[10px] text-slate-300">👤 有人 +5%</Badge>}
+                            {(() => {
+                              // 长镜链标注:同起点存在更短条目 = 本条是连续片段拼成的长版本。
+                              // 两个版本服务不同槽位(快切用短/呼吸用长),成片里同源区间互斥,只会用其一。
+                              const isChain = details.highlight_pool!.some((x: any) =>
+                                x !== m && Math.abs(x.start - m.start) < 0.2 && x.end < m.end - 0.5);
+                              const isBase = details.highlight_pool!.some((x: any) =>
+                                x !== m && Math.abs(x.start - m.start) < 0.2 && x.end > m.end + 0.5);
+                              return isChain
+                                ? <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-300"
+                                    title="连续片段拼成的长版本,与短版本服务不同槽位;成片里两者互斥只用其一">🔗 长镜链</Badge>
+                                : isBase
+                                  ? <Badge variant="outline" className="border-white/10 bg-white/[0.03] text-[10px] text-slate-500"
+                                      title="此片段另有长镜链版本;成片里两者互斥只用其一">短版</Badge>
+                                  : null;
+                            })()}
                           </div>
                           <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10.5px] text-slate-400">
                             <span className="flex items-center gap-1.5">
