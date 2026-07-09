@@ -874,8 +874,16 @@ def generate_shot_plan(
                     _mo = (m.get("motion") or {}).get("type") or ""
                     if _mo and _mo != "unmeasured":
                         _lk += f" | cam {_mo}"
+                    # L3 审美精评:分层 + 选片师一句话理由(编剧据此优先排 S/A)
+                    _l3 = ""
+                    if m.get("l3_tier"):
+                        _l3 = f" | grade {m['l3_tier']}"
+                        if m.get("l3_why"):
+                            _l3 += f"({m['l3_why'][:20]})"
+                    if m.get("empty_shot"):
+                        _l3 += " | SCENERY-ONLY(breathing shot material, not a highlight)"
                     _lines.append(
-                        f"- {m['id']} | scene {m.get('scene', '?')}{_lk} | "
+                        f"- {m['id']} | scene {m.get('scene', '?')}{_lk}{_l3} | "
                         f"{m['start']:.1f}-{m['end']:.1f}s ({m['duration']:.1f}s) | "
                         f"quality {m.get('score', 0) * 10:.1f}/10{_v}{_t} | {m.get('desc', '')[:160]}")
                 _n_voice = sum(1 for m in _cands if m.get("sound"))
@@ -906,6 +914,9 @@ def generate_shot_plan(
                     "push_in → push_in) or settles into stillness (moving → static). Avoid "
                     "REVERSING direction between neighbors (pan_left → pan_right jolts the eye).\n"
                     + _voice_rule +
+                    "- GRADE: moments carry an aesthetic grade (S best → C) judged by a curator "
+                    "model comparing actual frames. Lead sections with S/A moments; SCENERY-ONLY "
+                    "moments are breathing material between highlights, never the emotional peaks.\n"
                     "- \"anchor_id\": null is allowed ONLY when every listed moment is already used "
                     "or truly none fits the segment — scarcity is the only excuse, not preference.\n"
                     "quality is MEASURED (blur/shake + content). Capture times give the journey order.\n"

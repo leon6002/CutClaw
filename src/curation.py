@@ -378,7 +378,14 @@ def build_highlight_pool(content_hashes: list, merged_scenes_dir: str) -> list:
     # 全部吃 moment 里已存的字段,在项目池层重算,无需重建任何缓存。
     _score_reform_v9(pool)
 
+    # L3 审美精评:VLM 对 top 时刻分组排序(结论全局缓存,重跑不重付)
+    _l3_aesthetic_rescore(pool)
+
     pool.sort(key=lambda m: -m["score"])
+    # L3 合入后分数变了 → 按最终排名重发 tier(强制分布)
+    for _rank, m in enumerate(pool):
+        _q = _rank / max(1, len(pool))
+        m["tier"] = "S" if _q < 0.10 else "A" if _q < 0.30 else "B" if _q < 0.70 else "C"
 
     # Per-look retention: a visually homogeneous source (slow aerial) floods
     # the pool with near-identical high scorers. Keep cap+1 per cluster (one
@@ -492,6 +499,158 @@ def _score_reform_v9(pool: list) -> None:
     print(f"🏷️  [Curation] v9 rescore: {len(pool)} moments · "
           f"{sum(1 for m in pool if m.get('event') == 1.0)} strong-event · "
           f"{empties} empty shots demoted · S={sum(1 for m in pool if m['tier'] == 'S')}")
+
+
+_L3_VERSION = 1
+_L3_TIER_SCORE = {"S": 1.0, "A": 0.7, "B": 0.4, "C": 0.15}
+
+
+def _l3_cache_path() -> str:
+    return os.path.join("Output", "asset_index", "aesthetic_scores.json")
+
+
+def _l3_key(m: dict) -> str:
+    return f"{m.get('source_hash')}:{float(m.get('start') or 0):.1f}:{float(m.get('end') or 0):.1f}:v{_L3_VERSION}"
+
+
+def _l3_frame_b64(m: dict) -> str | None:
+    """时刻中间帧 → 640px JPEG base64(给 VLM 排序看的)。"""
+    import base64
+    import subprocess
+    import tempfile
+    mid = (float(m.get("start") or 0) + float(m.get("end") or 0)) / 2
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+        out = tf.name
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", f"{mid:.2f}", "-i", m["video_path"],
+             "-frames:v", "1", "-vf", "scale=640:-2", out],
+            capture_output=True, timeout=60)
+        if r.returncode != 0 or not os.path.getsize(out):
+            return None
+        with open(out, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def _l3_aesthetic_rescore(pool: list) -> None:
+    """L3 审美精评(LOGIC.md §17):VLM **排序而不是打分**。
+
+    绝对打分挤在 3-4 分(v8 饱和的根源之一);6 帧一组、组内强制分层
+    (最多 1 个 S、至少 1 个 C)的 listwise 排序区分度好一个量级。只评
+    v9 分数 top L3_RESCORE_TOP 的时刻;结论按 (素材指纹+区间) 全局缓存
+    (aesthetic_scores.json)——重跑/跨项目复用素材都不重付。失败的组
+    保持 v9 分,不重试(重试纪律)。最终分 = 0.65×v9 + 0.35×L3。
+    """
+    from src import config
+    if not getattr(config, "L3_RESCORE", True) or len(pool) < 12:
+        return
+    top_n = int(getattr(config, "L3_RESCORE_TOP", 120))
+    ranked = sorted(pool, key=lambda m: -m["score"])[:top_n]
+
+    cache = {}
+    try:
+        with open(_l3_cache_path(), "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:  # noqa: BLE001
+        cache = {}
+
+    todo = [m for m in ranked if _l3_key(m) not in cache]
+    if todo:
+        try:
+            from src.utils.llm_logger import set_llm_stage
+            set_llm_stage("aesthetic_rescore")
+        except Exception:  # noqa: BLE001
+            pass
+        import litellm
+        import random
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        rng = random.Random(42)
+        rng.shuffle(todo)          # 混源分组:同组尽量来自不同文件,对照才有意义
+        groups = [todo[i:i + 6] for i in range(0, len(todo), 6)]
+        print(f"🎨 [Curation] L3 精评: {len(todo)} 个时刻未缓存 → {len(groups)} 组 VLM 排序"
+              f"(每组 6 帧,计费:视觉模型 {len(groups)} 次调用,4 路并行)")
+        _lock = threading.Lock()
+
+        def _flush():
+            # 每组即时落盘——付费结论一条都不能因中断丢失
+            try:
+                os.makedirs(os.path.dirname(_l3_cache_path()), exist_ok=True)
+                with open(_l3_cache_path(), "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=1)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _judge(gi_grp):
+            gi, grp = gi_grp
+            frames = [(m, _l3_frame_b64(m)) for m in grp]
+            frames = [(m, b) for m, b in frames if b]
+            if len(frames) < 3:
+                return
+            content = [{"type": "text", "text":
+                        "你是旅拍回忆混剪的选片师。下面是同一批素材里的 %d 个候选画面(编号 1-%d,按顺序)。"
+                        "从「值得进成片」的角度综合判断:构图、光影、瞬间感(有没有事发生)、情绪价值。"
+                        "把它们分层,**必须拉开档次:最多 1 个 S,至少 1 个 C**,不许全部同档。"
+                        "只输出 JSON 数组:[{\"idx\": <1-%d>, \"tier\": \"S|A|B|C\", \"why\": \"<15字内理由>\"}]"
+                        % (len(frames), len(frames), len(frames))}]
+            for _mi, (_m, b64) in enumerate(frames):
+                content.append({"type": "text", "text": f"画面 {_mi + 1}:"})
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+            kwargs = dict(model=config.VIDEO_ANALYSIS_MODEL,
+                          messages=[{"role": "user", "content": content}],
+                          max_tokens=2048, temperature=0.0, timeout=150)
+            if getattr(config, "VIDEO_ANALYSIS_ENDPOINT", ""):
+                kwargs["api_base"] = config.VIDEO_ANALYSIS_ENDPOINT
+            if getattr(config, "VIDEO_ANALYSIS_API_KEY", ""):
+                kwargs["api_key"] = config.VIDEO_ANALYSIS_API_KEY
+            try:
+                raw = litellm.completion(**kwargs)
+                txt = (raw.choices[0].message.content or "").strip()
+                m_arr = re.search(r"\[.*\]", txt, re.S)
+                verdicts = json.loads(m_arr.group(0)) if m_arr else []
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️  [Curation] L3 组 {gi + 1}/{len(groups)} 失败(保持 v9 分,不重试): {str(e)[:120]}")
+                return
+            with _lock:
+                for v in verdicts:
+                    try:
+                        mi = int(v.get("idx")) - 1
+                        tier = str(v.get("tier", "")).strip().upper()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if 0 <= mi < len(frames) and tier in _L3_TIER_SCORE:
+                        cache[_l3_key(frames[mi][0])] = {
+                            "tier": tier, "why": str(v.get("why") or "")[:60]}
+                _flush()
+                print(f"🎨 [Curation] L3 组 {gi + 1}/{len(groups)} ✓")
+
+        _workers = max(1, int(getattr(config, "L3_WORKERS", 2)))  # 4 路曾触发 Gemini 503
+        with ThreadPoolExecutor(max_workers=_workers) as ex:
+            list(ex.map(_judge, enumerate(groups)))
+
+    hit = 0
+    for m in ranked:
+        v = cache.get(_l3_key(m))
+        if not v:
+            continue
+        hit += 1
+        m["l3_tier"] = v["tier"]
+        m["l3_why"] = v.get("why", "")
+        m["score"] = round(0.65 * m["score"] + 0.35 * _L3_TIER_SCORE[v["tier"]], 3)
+    if hit:
+        _tc = {}
+        for m in ranked:
+            if m.get("l3_tier"):
+                _tc[m["l3_tier"]] = _tc.get(m["l3_tier"], 0) + 1
+        print(f"🎨 [Curation] L3 精评合入 {hit}/{len(ranked)} 个时刻: {_tc}")
 
 
 def build_anchor_budget(pool: list, n_slots: int,
