@@ -633,6 +633,17 @@ shot_point.json（多源 clip 各带 video_path）
 
 ---
 
+## 18. 选材透明化(决策链记账)
+
+> 动机(2026-07-10,用户:"把怎么选取视频做得更透明,细化到每一个步骤")。从 547 个池时刻到 26 个成片镜头之间的全部决策,此前只散落在 print 里。
+
+- **记账**(零 API,`src/selection_trace.py` 单例):Screenwriter.run 开跑 `start(selection_trace_{tag}.json)`;预算器以最终配额重放一遍选择捕获**每条被拒时刻+原因**(cluster_quota/source_quota/interval_overlap)连同菜单落盘;`_attach_anchors` 记每次**换锚修复**(原锚/原因/改选);剪辑落点方式(`pick_method`: anchored/agent/fallback + note)直接写进 shot_point 条目随现有管道走。未 start 时全部空操作(预算器被他路复用)。
+- **聚合**:GET `/api/pipeline/selection_trace?shot_point=` — 合并 trace + 项目池(时刻明细:细评 tier/点评/池分/稀缺/事件/簇)+ shot_plan(槽位)+ shot_point(落点),输出漏斗统计、菜单(标记已用)、被拒清单、修复事件、**每镜头证据链**。
+- **UI**:①流水线状态卡「选材漏斗」绿条(池→looks→菜单→锚定,淘汰原因统计),展开三 tab:菜单(✓绿底=编剧采用)/被拒(带原因)/修复;②镜头预览浮层(ClipPlayer)新增「🧭 选材依据」:槽位→候选时刻(tier/点评/池分/稀缺/look/cam)→换锚历史→落点方式。
+- 旧成片无 trace 文件时返回提示"重跑一次即可获得完整决策链"(池/细评部分仍可显示)。
+
+---
+
 ## 附：历史决策否决清单（别再提议）
 
 - ❌ 均匀降帧省 token —— 损失画面信息，被明确否决（"不能在输出质量上妥协"）。

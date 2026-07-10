@@ -3631,6 +3631,119 @@ def pipeline_estimate(body: EstimateRequest):
     }
 
 
+@app.get("/api/pipeline/selection_trace")
+def pipeline_selection_trace(shot_point: str):
+    """选材透明化(§18):漏斗 + 菜单/被拒 + 修复 + 每镜头证据链。
+
+    聚合 selection_trace_*.json(编剧运行时记账)、项目高光池(时刻明细)、
+    shot_plan(槽位/锚点)、shot_point(落点方式)。全部读缓存,零 API。"""
+    abs_point = _resolve(shot_point)
+    proj_dir = os.path.dirname(abs_point)
+    base = os.path.basename(abs_point)
+    trace_path = os.path.join(proj_dir, base.replace("shot_point_", "selection_trace_"))
+    plan_path = abs_point.replace("shot_point_", "shot_plan_")
+
+    def _load(p, default):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:  # noqa: BLE001
+            return default
+
+    trace = _load(trace_path, {})
+    pool = _load(os.path.join(proj_dir, "highlight_pool.json"), {}).get("moments", [])
+    plan = _load(plan_path, {})
+    point = _load(abs_point, [])
+    if not (trace or pool):
+        return {"available": False,
+                "reason": "该结果生成于选材记账功能之前 — 重跑一次流水线即可获得完整决策链"}
+
+    by_id = {m.get("id"): m for m in pool}
+
+    def _brief(mid):
+        m = by_id.get(mid) or {}
+        f = m.get("fine") or {}
+        return {
+            "id": mid, "start": m.get("start"), "end": m.get("end"),
+            "duration": m.get("duration"),
+            "video": os.path.basename(str(m.get("video_path") or "")),
+            "video_path": m.get("video_path"),
+            "desc": str(m.get("desc") or "")[:140],
+            "score": m.get("score"), "tier": m.get("tier"),
+            "fine_tier": f.get("tier") or m.get("l3_tier"),
+            "critique": f.get("critique") or m.get("l3_why") or "",
+            "fine_mode": f.get("mode"),
+            "event": m.get("event"), "rarity": m.get("rarity"),
+            "sound": m.get("sound"), "people": m.get("people"),
+            "empty_shot": m.get("empty_shot"),
+            "cluster": m.get("cluster"),
+            "cam": (m.get("motion") or {}).get("type"),
+            "stability": m.get("stability"),
+        }
+
+    # 漏斗数字
+    clusters = {}
+    for m in pool:
+        c = m.get("cluster")
+        if c is not None:
+            clusters[c] = clusters.get(c, 0) + 1
+    rejects = trace.get("rejects", [])
+    rej_stats: dict = {}
+    for r in rejects:
+        rej_stats[r.get("reason", "?")] = rej_stats.get(r.get("reason", "?"), 0) + 1
+
+    # 每镜头证据链:plan shots(槽位+锚) × repairs × point(落点)
+    shots = []
+    plan_shots = []
+    for sec in plan.get("video_structure", []):
+        sp = sec.get("shot_plan")
+        if isinstance(sp, dict):
+            plan_shots.extend(sp.get("shots", []))
+    repairs = {r.get("shot"): r for r in trace.get("repairs", [])}
+    point_by_order = list(point) if isinstance(point, list) else []
+    for i, s in enumerate(plan_shots):
+        aid = s.get("anchor_id")
+        entry = {
+            "shot": i,
+            "slot": {"duration": s.get("time_duration"), "emotion": s.get("emotion"),
+                     "beat": s.get("visual_beat")},
+            "anchor": _brief(aid) if aid else None,
+            "repair": repairs.get(i),
+        }
+        if i < len(point_by_order):
+            p = point_by_order[i]
+            entry["section_idx"] = p.get("section_idx")
+            entry["shot_idx"] = p.get("shot_idx")
+            entry["pick"] = {
+                "method": p.get("pick_method") or ("anchored" if p.get("anchored")
+                                                   else "fallback" if p.get("fallback") else "agent"),
+                "note": p.get("pick_note") or "",
+                "range": [c.get("start") for c in (p.get("clips") or [])[:1]]
+                         + [(p.get("clips") or [{}])[-1].get("end")],
+                "video": os.path.basename(str(p.get("video_path") or "")),
+            }
+        shots.append(entry)
+
+    return {
+        "available": True,
+        "funnel": {
+            "pool_total": len(pool),
+            "looks": len(clusters),
+            "menu": len(trace.get("menu", [])),
+            "reject_stats": rej_stats,
+            "anchored": sum(1 for s in plan_shots if s.get("anchor_id")),
+            "shots": len(plan_shots),
+            "repairs": len(trace.get("repairs", [])),
+            "caps": (trace.get("meta") or {}).get("caps"),
+        },
+        "menu": [_brief(mid) for mid in trace.get("menu", [])],
+        "menu_used": [s.get("anchor_id") for s in plan_shots if s.get("anchor_id")],
+        "rejects": [dict(_brief(r.get("id")), reason=r.get("reason")) for r in rejects],
+        "repairs": trace.get("repairs", []),
+        "shots": shots,
+    }
+
+
 @app.get("/api/project/recent")
 def project_recent(limit: int = 10):
     """Most recent shot_point results on disk — works regardless of id scheme."""

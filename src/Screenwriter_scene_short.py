@@ -1229,6 +1229,11 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         if sub is not None:
             print(f"🔧 [Curation] shot {pos + 1}: {reason} → substituted {sub['id']} "
                   f"(look {sub.get('cluster') or '—'}, {sub.get('score', 0) * 10:.1f}/10)")
+            try:
+                from src import selection_trace
+                selection_trace.record_repair(pos, aid, reason, sub["id"])
+            except Exception:  # noqa: BLE001
+                pass
             # _commit rewrites content/visuals/scene to the REAL footage it now shows
             _commit(shot, sub, pos)
             repaired += 1
@@ -1238,6 +1243,11 @@ def _attach_anchors(shot_plan: dict, scene_folder_path: str | None):
         shot.pop("anchor_id", None)
         stripped += 1
         print(f"🎬 [Curation] shot {pos + 1}: {reason}, no valid substitute left — agent will pick")
+        try:
+            from src import selection_trace
+            selection_trace.record_repair(pos, aid, reason, "agent")
+        except Exception:  # noqa: BLE001
+            pass
 
     if n or stripped:
         _looks = len([c for c in c_used if c_used[c]])
@@ -1777,6 +1787,14 @@ class Screenwriter:
             from src.utils.llm_logger import set_llm_stage
             set_llm_stage("screenwriter")
         except Exception:
+            pass
+        # 选材决策链(§18):菜单接纳/拒绝、换锚修复全程记账,跟着 shot_plan 走
+        try:
+            from src import selection_trace
+            if self.output_path:
+                selection_trace.start(
+                    self.output_path.replace("shot_plan_", "selection_trace_"))
+        except Exception:  # noqa: BLE001
             pass
         if self.output_path and os.path.exists(self.output_path):
             try:

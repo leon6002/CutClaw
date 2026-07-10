@@ -698,16 +698,25 @@ def build_anchor_budget(pool: list, n_slots: int,
 
     _hearts = load_hearts()   # hearted sources earn one extra menu slot
 
-    def _select(cm: int, sm: int) -> list:
+    def _select(cm: int, sm: int, rejects: list | None = None) -> list:
         by_c: dict = {}
         by_s: dict = {}
         by_iv: dict = {}   # source_hash -> [(start,end)] 已选区间
         chosen = []
+
+        def _rej(m, why):
+            if rejects is not None:
+                rejects.append({"id": m.get("id"), "reason": why,
+                                "cluster": m.get("cluster"),
+                                "tier": (m.get("fine") or {}).get("tier") or m.get("l3_tier")})
+
         for m in ordered:
             c, s = m.get("cluster"), m.get("source_hash")
             if c is not None and by_c.get(c, 0) >= cm:
+                _rej(m, "cluster_quota")
                 continue
             if by_s.get(s, 0) >= (sm + 1 if s in _hearts else sm):
+                _rej(m, "source_quota")
                 continue
             # 同源区间互斥:精华时刻和长镜链常覆盖同一段画面(如 134-138s 与
             # 134-146s),分数排序下先到者赢,重叠>30%(按较短者算)的后来者
@@ -721,6 +730,7 @@ def build_anchor_budget(pool: list, n_slots: int,
                     _dup = True
                     break
             if _dup:
+                _rej(m, "interval_overlap")
                 continue
             chosen.append(m)
             if c is not None:
@@ -774,6 +784,21 @@ def build_anchor_budget(pool: list, n_slots: int,
               + ("" if _have >= breath_min else f" (pool only has {_have})"))
 
     chosen.sort(key=lambda m: -m.get("score", 0))
+
+    # 选材透明化(§18):以最终配额重放一遍选择,捕获每条被拒时刻及原因,
+    # 连同菜单一起写进决策链(未 start 时是空操作)
+    try:
+        from src import selection_trace
+        if selection_trace.active():
+            _rejs: list = []
+            _select(cmax, smax, rejects=_rejs)
+            _in_menu = {m.get("id") for m in chosen}
+            _rejs = [r for r in _rejs if r["id"] not in _in_menu]  # 呼吸保底注入的不算被拒
+            selection_trace.record_menu(chosen, _rejs)
+            selection_trace.set_meta(pool_total=len(pool), menu=len(chosen),
+                                     caps={"look": cmax, "source": smax})
+    except Exception:  # noqa: BLE001
+        pass
     return chosen
 
 

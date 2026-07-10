@@ -20,6 +20,7 @@ import { RoleModelSelect } from "../components/ModelConfig";
 import JobLog from "../components/JobLog";
 import AgentFlow from "../components/AgentFlow";
 import ApiCostPanel from "../components/ApiCostPanel";
+import SelectionFunnel from "../components/SelectionFunnel";
 import TaskGrids from "../components/TaskGrids";
 import AgentWorkbench from "../components/AgentWorkbench";
 import WorkflowCanvas, { CANVAS_STAGE_KEYS, type AssetInfo, type ShotInfo } from "../components/flow/WorkflowCanvas";
@@ -75,6 +76,8 @@ export default function EditorView({
   const [fusion, setFusion] = useState<{ state: "running" | "done" | "error"; detail: string } | null>(null);
   // 跑前成本预估(缓存命中→¥0;未命中按历史单价×预期调用数)
   const [estimate, setEstimate] = useState<any>(null);
+  // 选材决策链(漏斗 + 每镜头证据,§18)
+  const [selTrace, setSelTrace] = useState<any>(null);
   // inline media preview — one shared player, no detail page needed
   const [preview, setPreview] = useState<{ kind: "video" | "audio"; path: string } | null>(null);
   const previewToggle = (kind: "video" | "audio", path: string) =>
@@ -151,6 +154,21 @@ export default function EditorView({
     const t = window.setInterval(fetchShots, 2500);
     return () => { stop = true; window.clearInterval(t); };
   }, [pipelineJobId, pipelineStatus, p.id, job.status]);
+
+  // 选材决策链:shot_point 就绪后拉一次(运行结束再刷一次拿完整落点)
+  useEffect(() => {
+    if (!p.shotPoint) { setSelTrace(null); return; }
+    api<any>(`/api/pipeline/selection_trace?shot_point=${encodeURIComponent(p.shotPoint)}`)
+      .then(setSelTrace).catch(() => setSelTrace(null));
+  }, [p.shotPoint, job.status]);
+
+  // (section_idx, shot_idx) → 证据链条目,给镜头预览浮层用
+  const evidenceFor = (s: ShotInfo | null) => {
+    if (!s || !selTrace?.shots) return undefined;
+    return selTrace.shots.find((e: any) =>
+      e.section_idx === (s as any).section_idx && e.shot_idx === (s as any).shot_idx)
+      ?? selTrace.shots[(shots ?? []).indexOf(s)];
+  };
 
   // 跑前预估:素材/音乐/目标时长一变就重估(防抖,不打扰输入)
   useEffect(() => {
@@ -639,6 +657,7 @@ export default function EditorView({
           <CardContent>
             <AgentFlow steps={PIPELINE_STEPS} stages={stagesView} />
             {pipelineJobId && <ApiCostPanel jobId={pipelineJobId} running={running} />}
+            <SelectionFunnel trace={selTrace} />
 
             {/* monitor view toggle: node canvas (agents) / dense grid */}
             <div className="mb-2 flex items-center gap-1 text-xs">
@@ -680,7 +699,7 @@ export default function EditorView({
                   // overlay renders INSIDE the canvas (also visible in fullscreen);
                   // priority: clip preview → asset annotation → agent workbench.
                   overlay={clipView ? (
-                    <ClipPlayer shot={clipView} onClose={() => setClipView(null)} />
+                    <ClipPlayer shot={clipView} onClose={() => setClipView(null)} evidence={evidenceFor(clipView)} />
                   ) : assetView ? (
                     <AssetPanel asset={assetView} onClose={() => setAssetView(null)} />
                   ) : wb && (job.meta.tasks ?? {})[wb.task] ? (

@@ -261,6 +261,8 @@ def commit(
         "is_stitched": len(clips) > 1,
         "clips": result_clips,
         "video_path": video_path or "",
+        "pick_method": "agent",
+        "pick_note": "剪辑 Agent 自由挑选(经密集描述缓存 + 审查工具)",
     }
 
     # Add protagonist frame detection data if available
@@ -2124,6 +2126,10 @@ class ParallelShotOrchestrator:
                        "duration": round(e - s, 2), "video_path": src}],
             "video_path": src,
             "anchored": True,
+            # 选材透明化(§18):落点方式随 shot_point 走
+            "pick_method": "anchored",
+            "pick_note": f"锚点时刻内锁窗 {s_h}-{e_h}(零模型调用"
+                         + (",人声窗锁定)" if shot.get("anchor", {}).get("sound") else ")"),
         }
 
     def _fallback_pick(self, shot, sec_idx, shot_idx, forbidden_ranges):
@@ -2281,6 +2287,8 @@ class ParallelShotOrchestrator:
             "clips": [{"shot": 1, "start": s_h, "end": e_h, "duration": dur, "video_path": src or ""}],
             "video_path": src or "",
             "fallback": True,
+            "pick_method": "fallback",
+            "pick_note": "Agent 未能提交,确定性兜底在指定素材上取空闲窗口(防成片留洞)",
         }
 
     def _detect_conflicts(self, results: dict, keep_ranges: list) -> tuple[dict, set]:
