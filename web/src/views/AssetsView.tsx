@@ -855,19 +855,21 @@ function DetailView({
                             </Badge>
                             {m.sound && <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300">🎙 人声 +15%</Badge>}
                             {m.people && <Badge variant="outline" className="border-white/15 bg-white/[0.05] text-[10px] text-slate-300">👤 有人 +5%</Badge>}
-                            {m.dover && (
-                              <span className="flex items-center gap-1.5 text-[10.5px] text-sky-300/90"
-                                title="DOVER 本地视频质量模型(整段时序分析):技术=清晰/噪点/抖动,美学=画面观感">
-                                DOVER 技{Math.round(m.dover.technical * 100)}
-                                <span className="inline-block h-1.5 w-9 overflow-hidden rounded-full bg-white/[0.08]">
-                                  <span className="block h-full bg-sky-400" style={{ width: `${m.dover.technical * 100}%` }} />
-                                </span>
-                                美{Math.round(m.dover.aesthetic * 100)}
-                                <span className="inline-block h-1.5 w-9 overflow-hidden rounded-full bg-white/[0.08]">
-                                  <span className="block h-full bg-teal-400" style={{ width: `${m.dover.aesthetic * 100}%` }} />
-                                </span>
-                              </span>
-                            )}
+                            {(() => {
+                              // DOVER 定位=段级硬缺陷旗(用户实测:单文件内分数几乎恒定,
+                              // 双条无参考意义)。只在技术分显著低于本文件中位时亮旗。
+                              if (!m.dover) return null;
+                              const techs = details.highlight_pool!
+                                .map((x: any) => x.dover?.technical).filter((x: any) => x != null).sort((a: number, b: number) => a - b);
+                              if (techs.length < 5) return null;
+                              const med = techs[Math.floor(techs.length / 2)];
+                              return m.dover.technical < med - 0.03
+                                ? <Badge variant="outline" className="border-red-500/40 bg-red-500/10 text-[10px] text-red-300"
+                                    title={`DOVER 技术分 ${Math.round(m.dover.technical * 100)},显著低于本文件中位 ${Math.round(med * 100)} — 疑似糊/狂晃等硬缺陷`}>
+                                    ⚠ 画质异常
+                                  </Badge>
+                                : null;
+                            })()}
                             {(() => {
                               // 长镜链标注:同起点存在更短条目 = 本条是连续片段拼成的长版本。
                               // 两个版本服务不同槽位(快切用短/呼吸用长),成片里同源区间互斥,只会用其一。

@@ -2212,14 +2212,26 @@ def asset_dover(body: DoverRequest):
     except OSError:
         pass
     _ffmpeg = os.path.join(PROJECT_ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+    # 最小干净 PATH:后端进程的 PATH 被 _ensure_ffmpeg_on_path 前置了 anaconda
+    # 的 Library\bin,venv 的 CUDA torch import 时被那套 DLL 遮蔽秒崩(手动跑
+    # 正常、API 拉起秒死,0xC06D007F 家族)。子进程只给 venv/ffmpeg/系统目录。
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    for _k in ("PYTHONPATH", "PYTHONHOME", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"):
+        env.pop(_k, None)
+    _sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    env["PATH"] = os.pathsep.join([
+        os.path.join(PROJECT_ROOT, "tools", "DOVER", "venv", "Scripts"),
+        os.path.dirname(_ffmpeg),
+        os.path.join(_sysroot, "System32"), _sysroot,
+    ])
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    _log = open(os.path.join(PROJECT_ROOT, "tools", "DOVER", "last_run.log"), "w")
     subprocess.Popen(
-        [_dover_py, _dover_script, "--cache-dir", cache_dir,
+        [_dover_py, "-u", _dover_script, "--cache-dir", cache_dir,
          "--ffmpeg", _ffmpeg if os.path.exists(_ffmpeg) else "ffmpeg"],
         cwd=os.path.join(PROJECT_ROOT, "tools", "DOVER"), env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        stdout=_log, stderr=subprocess.STDOUT, **kwargs)
     return {"status": "started"}
 
 
