@@ -65,6 +65,32 @@ def _frame_b64(path: str, at: float) -> str | None:
             pass
 
 
+def _clip_b64(path: str, start: float, end: float) -> str | None:
+    """时刻的真视频片段(≤12s,640px,带音频——人声笑声也是评判依据)。"""
+    dur = min(12.0, max(1.0, end - start))
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+        out = tf.name
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{dur:.2f}",
+             "-i", path, "-vf", "scale=640:-2", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "28", "-c:a", "aac", "-b:a", "64k", out],
+            capture_output=True, timeout=180)
+        if r.returncode != 0 or not os.path.getsize(out):
+            return None
+        if os.path.getsize(out) > 15_000_000:   # 内嵌 base64 的安全上限
+            return None
+        with open(out, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
 _PROMPT = """你是一位经验丰富的旅拍选片师,正在为一部**家庭旅行回忆混剪**筛选素材。下面给出 %d 个候选片段,每个片段两帧(起始帧、中段帧,按顺序排列)。
 
 重要背景:这是普通人的旅行记录,不是商业广告片。**评判标准是"放进回忆混剪里好不好",不是"够不够上杂志"**——戴口罩、游客姿势、随手拍都是真实旅行的一部分,真实感本身有价值;真正该扣分的是:画面糊/晃、主体不明、构图混乱、没有任何看点的纯过场。
@@ -82,8 +108,34 @@ _PROMPT = """你是一位经验丰富的旅拍选片师,正在为一部**家庭�
 [{"idx": <1-%d>, "composition": n, "light": n, "subject_moment": n, "emotion": n, "tier": "S|A|B|C", "critique": "<点评>"}]"""
 
 
-def fine_review_source(content_hash: str, workers: int = 2) -> dict:
-    """对一个素材的全部池时刻做细评。可续跑;返回 fine_review 数据。"""
+_PROMPT_VIDEO = """你是一位经验丰富的旅拍选片师,正在为一部**家庭旅行回忆混剪**筛选素材。请观看这段视频片段(含声音)。
+
+重要背景:这是普通人的旅行记录,不是商业广告片。**评判标准是"放进回忆混剪里好不好"**——真实感本身有价值;该扣分的是:画面糊/晃、主体不明、构图混乱、没有任何看点的纯过场。
+
+你比看静帧的评审多了两样证据,务必用上:
+- **过程**:动作的起止和变化(转身、摔倒又爬起、笑容绽开)、镜头运动是否流畅、是否持续歪斜;
+- **声音**:有真实人声/笑声/欢呼的段落情绪价值显著加分(风噪不算)。
+
+按以下维度打分(0-10):
+- composition 构图:主体位置、画面平衡、背景干净度(5=中规中矩,7=舒服,9=讲究)
+- light 光影:曝光、层次、色彩氛围(5=正常记录,7=好看,9=氛围出彩)
+- subject_moment 主体与瞬间:主体是否清晰?整段有没有值得看的过程?(纯空镜过场=3-4,风景有看头=5-6,人物在做事=6-7,生动瞬间/互动/情绪外露=8+)
+- emotion 情绪价值:放进回忆里,几年后重看会有感觉吗?(真实人声/笑声是强信号)
+
+综合分层 tier:S=这部片子的高光时刻 / A=很好,优先用 / B=正常可用 / C=有明显硬伤。**普通但真实的画面是 B,不是 C。**
+配一句 25 字内点评:客观指出亮点或问题(过程和声音里看到的尤其值得说)。
+
+只输出一个 JSON 对象:
+{"composition": n, "light": n, "subject_moment": n, "emotion": n, "tier": "S|A|B|C", "critique": "<点评>"}"""
+
+
+def fine_review_source(content_hash: str, workers: int = 2, mode: str = "") -> dict:
+    """对一个素材的全部池时刻做细评。可续跑;返回 fine_review 数据。
+
+    mode: "video"(片段直喂 VLM,看得见过程、听得见人声)| "frames"(两帧,
+    更省)。默认取 config.FINE_REVIEW_MODE(缺省 video)。切换模式会对
+    已评段落**重评**(结论会覆盖,计费)——这是 GUI 上做 A/B 对比的入口。
+    """
     from src import config
     from src.analyzer import get_analysis_path
     try:
@@ -91,6 +143,10 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
         set_llm_stage("fine_review")
     except Exception:  # noqa: BLE001
         pass
+
+    mode = (mode or getattr(config, "FINE_REVIEW_MODE", "video")).strip().lower()
+    if mode not in ("video", "frames"):
+        mode = "video"
 
     cache_dir = get_analysis_path(content_hash)
     pool_path = os.path.join(cache_dir, "highlight_pool.json")
@@ -113,13 +169,18 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
-    todo = [m for m in moments if _mkey(m) not in data["moments"]]
+    # 同模式=断点续评;换模式=重评(verdict 带 mode 标记)
+    todo = [m for m in moments
+            if data["moments"].get(_mkey(m), {}).get("mode", "frames") != mode
+            or _mkey(m) not in data["moments"]]
     if not todo:
         return data
-    groups = [todo[i:i + 4] for i in range(0, len(todo), 4)]
+    # 真视频模式一段一调用(多段视频同发会互相干扰);静帧模式 4 段一调用
+    _gsz = 1 if mode == "video" else 4
+    groups = [todo[i:i + _gsz] for i in range(0, len(todo), _gsz)]
     total = len(moments)
     print(f"🔬 [FineReview] {os.path.basename(str(moments[0].get('video_path')))}: "
-          f"{len(todo)}/{total} 个时刻待评 → {len(groups)} 次 VLM 调用(计费)")
+          f"{len(todo)}/{total} 个时刻待评[{mode}] → {len(groups)} 次 VLM 调用(计费)")
     _lock = threading.Lock()
 
     def _progress(note=""):
@@ -141,22 +202,34 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
     def _judge(gi_grp):
         import litellm
         gi, grp = gi_grp
-        packs = []
-        for m in grp:
-            s, e = float(m["start"]), float(m["end"])
-            f1 = _frame_b64(m["video_path"], s + 0.2)
-            f2 = _frame_b64(m["video_path"], (s + e) / 2)
-            if f1 or f2:
-                packs.append((m, [b for b in (f1, f2) if b]))
-        if not packs:
-            return
-        content = [{"type": "text", "text": _PROMPT % (len(packs), len(packs))}]
-        for _pi, (_m, frames) in enumerate(packs):
-            content.append({"type": "text",
-                            "text": f"片段 {_pi + 1}({_m['duration']:.1f}s,画面描述:{str(_m.get('desc'))[:80]}):"})
-            for b64 in frames:
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        if mode == "video":
+            m = grp[0]
+            b64 = _clip_b64(m["video_path"], float(m["start"]), float(m["end"]))
+            if not b64:
+                return
+            packs = [(m, None)]
+            content = [
+                {"type": "text", "text": _PROMPT_VIDEO},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:video/mp4;base64,{b64}"}},
+            ]
+        else:
+            packs = []
+            for m in grp:
+                s, e = float(m["start"]), float(m["end"])
+                f1 = _frame_b64(m["video_path"], s + 0.2)
+                f2 = _frame_b64(m["video_path"], (s + e) / 2)
+                if f1 or f2:
+                    packs.append((m, [b for b in (f1, f2) if b]))
+            if not packs:
+                return
+            content = [{"type": "text", "text": _PROMPT % (len(packs), len(packs))}]
+            for _pi, (_m, frames) in enumerate(packs):
+                content.append({"type": "text",
+                                "text": f"片段 {_pi + 1}({_m['duration']:.1f}s,画面描述:{str(_m.get('desc'))[:80]}):"})
+                for b64 in frames:
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
         kwargs = dict(model=config.VIDEO_ANALYSIS_MODEL,
                       messages=[{"role": "user", "content": content}],
                       max_tokens=3000, temperature=0.0, timeout=150)
@@ -167,8 +240,12 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
         try:
             raw = litellm.completion(**kwargs)
             txt = (raw.choices[0].message.content or "").strip()
-            arr = re.search(r"\[.*\]", txt, re.S)
-            verdicts = json.loads(arr.group(0)) if arr else []
+            if mode == "video":
+                obj = re.search(r"\{.*\}", txt, re.S)
+                verdicts = [dict(json.loads(obj.group(0)), idx=1)] if obj else []
+            else:
+                arr = re.search(r"\[.*\]", txt, re.S)
+                verdicts = json.loads(arr.group(0)) if arr else []
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  [FineReview] 组 {gi + 1}/{len(groups)} 失败(跳过,不重试): {str(e)[:110]}")
             return
@@ -194,6 +271,7 @@ def fine_review_source(content_hash: str, workers: int = 2) -> dict:
                     "avg": round(sum(vals) / len(vals), 2) if vals else None,
                     "tier": tier if tier in ("S", "A", "B", "C") else "B",
                     "critique": str(v.get("critique") or "")[:80],
+                    "mode": mode,
                 }
             _flush()          # 每组落盘:付费结论一条都不能因中断丢失
             _progress(f"已评 {len(data['moments'])}/{total}")

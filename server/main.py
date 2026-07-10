@@ -2064,6 +2064,26 @@ def _analysis_details(content_hash: str, variant: str = "") -> dict:
                     result["fine_review_progress"] = json.load(f)
             except Exception:  # noqa: BLE001
                 pass
+        # DOVER 本地画质分随行 + 进度
+        _dv = os.path.join(get_analysis_path(content_hash), "dover_scores.json")
+        if os.path.exists(_dv):
+            try:
+                _dd = json.load(open(_dv, encoding="utf-8")).get("moments", {})
+                for _m in result.get("highlight_pool", []):
+                    _k = f"{float(_m.get('start') or 0):.1f}:{float(_m.get('end') or 0):.1f}"
+                    if _k in _dd:
+                        _m["dover"] = _dd[_k]
+            except Exception:  # noqa: BLE001
+                pass
+        _dvp = os.path.join(get_analysis_path(content_hash), "dover.progress.json")
+        if os.path.exists(_dvp):
+            try:
+                with open(_dvp, "r", encoding="utf-8") as f:
+                    result["dover_progress"] = json.load(f)
+            except Exception:  # noqa: BLE001
+                pass
+        result["dover_available"] = os.path.exists(
+            os.path.join(PROJECT_ROOT, "tools", "DOVER", "venv", "Scripts", "python.exe"))
     else:
         # live progress while the background scorer runs
         pp = os.path.join(get_analysis_path(content_hash), "highlight_pool.progress.json")
@@ -2083,6 +2103,7 @@ def asset_details(content_hash: str, variant: str = ""):
 
 class FineReviewRequest(BaseModel):
     content_hash: str
+    mode: str = ""     # "video"(片段直喂,看过程听声音)| "frames"(两帧,省);空=配置默认
 
 
 @app.post("/api/assets/fine_review")
@@ -2106,7 +2127,7 @@ def asset_fine_review(body: FineReviewRequest):
         "from src.analyzer import _ensure_ffmpeg_on_path\n"
         "_ensure_ffmpeg_on_path()\n"
         "from src.fine_review import fine_review_source\n"
-        f"fine_review_source({body.content_hash!r})\n"
+        f"fine_review_source({body.content_hash!r}, mode={body.mode!r})\n"
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -2122,6 +2143,7 @@ _FR_BATCH = {"running": False, "current": "", "done": 0, "total": 0, "errors": 0
 
 class FineReviewBatchRequest(BaseModel):
     content_hashes: list[str]
+    mode: str = ""
 
 
 @app.post("/api/assets/fine_review_batch")
@@ -2142,7 +2164,7 @@ def asset_fine_review_batch(body: FineReviewBatchRequest):
         for ch in hashes:
             _FR_BATCH["current"] = ch
             try:
-                fine_review_source(ch)
+                fine_review_source(ch, mode=body.mode)
             except Exception as e:  # noqa: BLE001
                 _FR_BATCH["errors"] += 1
                 print(f"⚠️ [FineReview] batch: {ch[:16]} failed: {str(e)[:100]}")
@@ -2156,6 +2178,42 @@ def asset_fine_review_batch(body: FineReviewBatchRequest):
 @app.get("/api/assets/fine_review_batch/status")
 def asset_fine_review_batch_status():
     return dict(_FR_BATCH)
+
+
+class DoverRequest(BaseModel):
+    content_hash: str
+
+
+@app.post("/api/assets/dover")
+def asset_dover(body: DoverRequest):
+    """本地 DOVER VQA:逐时刻 技术分+美学分(3090 上每段 1-3s,免费)。
+
+    在专属 venv 里跑(cutclaw 环境是 CPU torch);未安装时返回 400 指引。"""
+    from src.analyzer import get_analysis_path
+    _dover_py = os.path.join(PROJECT_ROOT, "tools", "DOVER", "venv", "Scripts", "python.exe")
+    _dover_script = os.path.join(PROJECT_ROOT, "tools", "DOVER", "score_segments.py")
+    _dover_w = os.path.join(PROJECT_ROOT, "tools", "DOVER", "pretrained_weights", "DOVER.pth")
+    if not (os.path.exists(_dover_py) and os.path.exists(_dover_w)):
+        raise HTTPException(400, "DOVER 未安装(tools/DOVER/venv + pretrained_weights/DOVER.pth)")
+    cache_dir = get_analysis_path(body.content_hash)
+    if not os.path.exists(os.path.join(cache_dir, "highlight_pool.json")):
+        raise HTTPException(400, "该素材还没有高光池 — 先在详情页构建高光评分")
+    prog_path = os.path.join(cache_dir, "dover.progress.json")
+    try:
+        if os.path.exists(prog_path) and time.time() - os.path.getmtime(prog_path) < 120:
+            return {"status": "scoring"}
+    except OSError:
+        pass
+    _ffmpeg = os.path.join(PROJECT_ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    subprocess.Popen(
+        [_dover_py, _dover_script, "--cache-dir", cache_dir,
+         "--ffmpeg", _ffmpeg if os.path.exists(_ffmpeg) else "ffmpeg"],
+        cwd=os.path.join(PROJECT_ROOT, "tools", "DOVER"), env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    return {"status": "started"}
 
 
 class SoundHighlightRequest(BaseModel):

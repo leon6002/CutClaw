@@ -297,6 +297,8 @@ function DetailView({
     highlight_pool?: any[]; highlight_pool_version?: number;
     highlight_pool_progress?: { done: number; total: number; note?: string };
     fine_review_progress?: { done: number; total: number; note?: string };
+    dover_progress?: { done: number; total: number; note?: string };
+    dover_available?: boolean;
   } | null>(null);
   const [poolBuilding, setPoolBuilding] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -350,15 +352,38 @@ function DetailView({
 
   // 🔬 AI 细评:VLM 逐片段分维度评判(标注时自动做;旧素材在这里补跑)
   const [fineBusy, setFineBusy] = useState(false);
+  const [fineMode, setFineMode] = useState<"video" | "frames">("video");
   const runFineReview = async () => {
     if (!asset) return;
     setFineBusy(true);
     try {
       await api("/api/assets/fine_review", {
-        method: "POST", body: JSON.stringify({ content_hash: asset.content_hash }),
+        method: "POST", body: JSON.stringify({ content_hash: asset.content_hash, mode: fineMode }),
       });
     } catch { setFineBusy(false); }
   };
+  // 🎞 DOVER 本地画质分(免费,专属 venv)
+  const [doverBusy, setDoverBusy] = useState(false);
+  const runDover = async () => {
+    if (!asset) return;
+    setDoverBusy(true);
+    try {
+      await api("/api/assets/dover", {
+        method: "POST", body: JSON.stringify({ content_hash: asset.content_hash }),
+      });
+    } catch (e: any) { window.alert(e.message); setDoverBusy(false); }
+  };
+  useEffect(() => {
+    if (!doverBusy || !asset) return;
+    const t = window.setInterval(async () => {
+      try {
+        const d = await api<any>(`/api/assets/${asset.content_hash}/details`);
+        setDetails((prev: any) => ({ ...(prev ?? d), highlight_pool: d.highlight_pool, dover_progress: d.dover_progress }));
+        if (!d.dover_progress) setDoverBusy(false);
+      } catch { /* keep polling */ }
+    }, 3000);
+    return () => window.clearInterval(t);
+  }, [doverBusy, asset?.content_hash]);
   useEffect(() => {
     if (!fineBusy || !asset) return;
     const t = window.setInterval(async () => {
@@ -759,22 +784,46 @@ function DetailView({
                       <Button
                         variant="outline"
                         className="h-7 gap-1.5 border-fuchsia-500/30 bg-fuchsia-500/[0.08] px-2.5 text-[11px] text-fuchsia-300"
-                        disabled={fineBusy} onClick={runFineReview}
+                        disabled={fineBusy} onClick={() => {
+                          const modeChanged = details.highlight_pool!.some((m: any) => m.fine && (m.fine.mode ?? "frames") !== fineMode);
+                          if (modeChanged && !window.confirm(`切换到「${fineMode === "video" ? "真视频" : "静帧"}」模式将重评已有结论(计费)。继续?`)) return;
+                          runFineReview();
+                        }}
                       >
                         {fineBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
-                        {fineBusy ? "细评中…" : details.highlight_pool.some((m: any) => m.fine) ? "🔬 补跑细评" : "🔬 AI 细评(分维度)"}
+                        {fineBusy ? "细评中…" : details.highlight_pool.some((m: any) => m.fine) ? "🔬 补跑/重评" : "🔬 AI 细评(分维度)"}
                       </Button>
+                      <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+                        {([["video", "🎞 真视频"], ["frames", "🖼 静帧"]] as const).map(([v, label]) => (
+                          <button key={v}
+                            className={cn("rounded-md px-2 py-0.5 text-[10.5px] transition-colors",
+                              fineMode === v ? "bg-fuchsia-500/20 font-semibold text-fuchsia-300" : "text-slate-400 hover:text-slate-200")}
+                            title={v === "video" ? "整段视频直喂 VLM:看得见过程、听得见人声(每段一次调用,略贵)" : "每段两帧:更省,但看不见过程"}
+                            onClick={() => setFineMode(v)}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
                       {details.fine_review_progress && (
                         <span className="text-[11px] text-fuchsia-300">
                           {details.fine_review_progress.done}/{details.fine_review_progress.total} 段
                           <span className="ml-1 text-slate-500">{details.fine_review_progress.note}</span>
                         </span>
                       )}
-                      {!details.highlight_pool.some((m: any) => m.fine) && !fineBusy && (
-                        <span className="text-[10.5px] text-slate-500">
-                          VLM 按严苛量表逐段评 构图/光影/主体瞬间/情绪 + 分层点评(新标注会自动做)
-                        </span>
-                      )}
+                      <Button
+                        variant="outline"
+                        className="h-7 gap-1.5 border-sky-500/30 bg-sky-500/[0.08] px-2.5 text-[11px] text-sky-300"
+                        disabled={doverBusy || !details.dover_available}
+                        title={details.dover_available
+                          ? "本地 DOVER 模型逐段打 技术分+美学分(3090,免费,每段约1-3秒)"
+                          : "DOVER 未安装(tools/DOVER/venv)"}
+                        onClick={runDover}
+                      >
+                        {doverBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        {doverBusy
+                          ? `DOVER ${details.dover_progress ? `${details.dover_progress.done}/${details.dover_progress.total}` : "…"}`
+                          : "🎞 DOVER 画质分(本地免费)"}
+                      </Button>
                     </div>
                     <div className="max-h-[560px] space-y-1.5 overflow-y-auto pr-1">
                       {[...details.highlight_pool].sort((a: any, b: any) => {
@@ -797,6 +846,19 @@ function DetailView({
                             </Badge>
                             {m.sound && <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300">🎙 人声 +15%</Badge>}
                             {m.people && <Badge variant="outline" className="border-white/15 bg-white/[0.05] text-[10px] text-slate-300">👤 有人 +5%</Badge>}
+                            {m.dover && (
+                              <span className="flex items-center gap-1.5 text-[10.5px] text-sky-300/90"
+                                title="DOVER 本地视频质量模型(整段时序分析):技术=清晰/噪点/抖动,美学=画面观感">
+                                DOVER 技{Math.round(m.dover.technical * 100)}
+                                <span className="inline-block h-1.5 w-9 overflow-hidden rounded-full bg-white/[0.08]">
+                                  <span className="block h-full bg-sky-400" style={{ width: `${m.dover.technical * 100}%` }} />
+                                </span>
+                                美{Math.round(m.dover.aesthetic * 100)}
+                                <span className="inline-block h-1.5 w-9 overflow-hidden rounded-full bg-white/[0.08]">
+                                  <span className="block h-full bg-teal-400" style={{ width: `${m.dover.aesthetic * 100}%` }} />
+                                </span>
+                              </span>
+                            )}
                             {(() => {
                               // 长镜链标注:同起点存在更短条目 = 本条是连续片段拼成的长版本。
                               // 两个版本服务不同槽位(快切用短/呼吸用长),成片里同源区间互斥,只会用其一。
@@ -839,6 +901,10 @@ function DetailView({
                                       : m.fine.tier === "B" ? "bg-sky-400/15 text-sky-300"
                                         : "bg-white/10 text-slate-400")}>
                                   {m.fine.tier} 级{m.fine.avg != null ? ` · ${Number(m.fine.avg).toFixed(1)}` : ""}
+                                </span>
+                                <span className="text-[10px] text-slate-500"
+                                  title={(m.fine.mode ?? "frames") === "video" ? "真视频评审(看过程+听声音)" : "静帧评审(两帧)"}>
+                                  {(m.fine.mode ?? "frames") === "video" ? "🎞" : "🖼"}
                                 </span>
                                 {([["composition", "构图"], ["light", "光影"], ["subject_moment", "主体瞬间"], ["emotion", "情绪"]] as const).map(([k, label]) => (
                                   m.fine.dims?.[k] != null && (
