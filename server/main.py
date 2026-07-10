@@ -2204,6 +2204,13 @@ def asset_dover(body: DoverRequest):
             return {"status": "scoring"}
     except OSError:
         pass
+    # 立刻写进度占位:打分器加载模型要 20-40s,期间没有进度文件的话,
+    # 前端 3s 首轮轮询会误判"已结束"把转圈停掉(用户实际撞到过)
+    try:
+        with open(prog_path, "w", encoding="utf-8") as f:
+            json.dump({"done": 0, "total": 0, "note": "加载 DOVER 模型…(首次约半分钟)"}, f)
+    except OSError:
+        pass
     _ffmpeg = os.path.join(PROJECT_ROOT, "tools", "ffmpeg", "ffmpeg.exe")
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"

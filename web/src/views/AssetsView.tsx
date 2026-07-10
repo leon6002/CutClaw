@@ -375,11 +375,16 @@ function DetailView({
   };
   useEffect(() => {
     if (!doverBusy || !asset) return;
+    let polls = 0;
     const t = window.setInterval(async () => {
       try {
+        polls += 1;
         const d = await api<any>(`/api/assets/${asset.content_hash}/details`);
         setDetails((prev: any) => ({ ...(prev ?? d), highlight_pool: d.highlight_pool, dover_progress: d.dover_progress }));
-        if (!d.dover_progress) setDoverBusy(false);
+        // 结束判定:进度文件消失且分数已经出现(或超时 10 分钟)——
+        // 只看"没有进度文件"会在模型加载间隙误判提前收工
+        const hasScores = (d.highlight_pool ?? []).some((m: any) => m.dover);
+        if ((!d.dover_progress && hasScores) || polls > 200) setDoverBusy(false);
       } catch { /* keep polling */ }
     }, 3000);
     return () => window.clearInterval(t);
@@ -821,7 +826,11 @@ function DetailView({
                       >
                         {doverBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
                         {doverBusy
-                          ? `DOVER ${details.dover_progress ? `${details.dover_progress.done}/${details.dover_progress.total}` : "…"}`
+                          ? (details.dover_progress
+                            ? (details.dover_progress.total > 0
+                              ? `DOVER ${details.dover_progress.done}/${details.dover_progress.total}`
+                              : details.dover_progress.note || "DOVER 加载模型…")
+                            : "DOVER 启动中…")
                           : "🎞 DOVER 画质分(本地免费)"}
                       </Button>
                     </div>
