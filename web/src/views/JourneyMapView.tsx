@@ -77,15 +77,21 @@ export default function JourneyMapView() {
       const [p1, p2] = [playSeq[a].ll, playSeq[b].ll];
       return Math.hypot(p1[0] - p2[0], (p1[1] - p2[1]) * midCos) * 111;
     };
-    type Seg = { kind: "stop" | "leg"; i0: number; i1: number; dur: number; t0: number; cum: number[] };
+    type Seg = { kind: "stop" | "leg"; i0: number; i1: number; dur: number; t0: number;
+                 cum: number[]; show: number[] };
     const segs: Seg[] = [];
     let i = 0;
     while (i < n - 1) {
       if (dKm(i, i + 1) < 0.3) {          // 停留簇:相邻 <300m
         let j = i + 1;
         while (j < n - 1 && dKm(j, j + 1) < 0.3) j++;
-        segs.push({ kind: "stop", i0: i, i1: j,
-                    dur: Math.min(3, 0.6 + 0.12 * (j - i)), t0: 0, cum: [] });
+        // 该地点采样 ≤8 张代表照,驻留期一张张"放映"(每张 ~1s)
+        const span = j - i;
+        const cnt = Math.min(8, span + 1);
+        const show = [...new Set(Array.from({ length: cnt },
+          (_, k) => i + Math.round(span * k / Math.max(1, cnt - 1))))];
+        segs.push({ kind: "stop", i0: i, i1: j, show,
+                    dur: Math.min(8, Math.max(1.4, 1.0 * show.length)), t0: 0, cum: [] });
         i = j;
       } else {                             // 移动腿:连续 >=300m 的跳
         let j = i;
@@ -95,7 +101,7 @@ export default function JourneyMapView() {
           j++;
         }
         const legKm = cum[cum.length - 1];
-        segs.push({ kind: "leg", i0: i, i1: j,
+        segs.push({ kind: "leg", i0: i, i1: j, show: [],
                     dur: Math.min(9, Math.max(2.2, legKm * 0.35)), t0: 0, cum });
         i = j;
       }
@@ -127,7 +133,7 @@ export default function JourneyMapView() {
       let idx: number;
       if (s.kind === "stop") {
         ll = playSeq[s.i1].ll;
-        idx = Math.min(s.i1, s.i0 + Math.floor(f * (s.i1 - s.i0 + 1)));   // 驻留期轮播
+        idx = s.show[Math.min(s.show.length - 1, Math.floor(f * s.show.length))];
         trail.setLatLngs(playSeq.slice(0, s.i1 + 1).map((x) => x.ll));
       } else {
         const d = f * s.cum[s.cum.length - 1];
@@ -294,18 +300,17 @@ export default function JourneyMapView() {
       <div className="relative min-h-0 flex-1">
         <div ref={boxRef} className={cn("absolute inset-0 overflow-hidden rounded-2xl ring-1 ring-white/10",
           darkMap && "jm-dark")} />
-        {/* 播放时:走到哪张照片,哪张浮出(点它看大图) */}
+        {/* 播放时:走到哪儿就"放映"哪儿的照片(大图 + 淡入,点击开灯箱) */}
         {playing && playPhoto && (
           <button
-            className="absolute bottom-4 left-4 z-[1100] flex items-center gap-2.5 rounded-xl bg-slate-950/88 p-2 pr-3.5 text-left shadow-[0_8px_28px_rgba(0,0,0,0.55)] ring-1 ring-white/15 backdrop-blur-sm"
+            className="absolute bottom-4 left-4 z-[1100] w-[min(38vw,400px)] overflow-hidden rounded-xl bg-slate-950/90 text-left shadow-[0_10px_36px_rgba(0,0,0,0.6)] ring-1 ring-white/15 backdrop-blur-sm"
             onClick={() => setDetail(playPhoto)}>
-            <img src={playPhoto.thumb} className="h-16 w-16 rounded-lg object-cover" />
-            <div className="text-[11.5px] leading-relaxed text-slate-300">
-              <div className="font-medium text-white">
-                {String(playPhoto.taken_at).replace("T", " ").slice(5, 16)}
-                {playPhoto.type === "VIDEO" && <span className="ml-1 text-[10px] text-slate-400">▶ 视频</span>}
-              </div>
-              {playPhoto.city && <div className="text-slate-400">📍 {playPhoto.city}</div>}
+            <img key={playPhoto.id} src={`/api/immich/thumb/${playPhoto.id}`}
+              className="jm-fade max-h-[42vh] w-full bg-black/40 object-contain" />
+            <div className="flex items-center gap-2.5 px-3 py-2 text-[11.5px] text-slate-300">
+              <span className="font-medium text-white">{String(playPhoto.taken_at).replace("T", " ").slice(5, 16)}</span>
+              {playPhoto.type === "VIDEO" && <span className="text-[10px] text-slate-400">▶ 视频</span>}
+              {playPhoto.city && <span className="text-slate-400">📍 {playPhoto.city}</span>}
             </div>
           </button>
         )}
@@ -351,6 +356,8 @@ export default function JourneyMapView() {
         .jm-head-wrap.is-leg .jm-head-dot { display:none; }
         .jm-head-wrap.is-leg .jm-head-car { display:block; }
         @keyframes jm-pulse { 50% { box-shadow:0 0 0 7px rgba(255,255,255,.15), 0 0 22px 8px rgba(56,189,248,.9); } }
+        .jm-fade { animation: jm-fadein .32s ease; }
+        @keyframes jm-fadein { from { opacity:0; transform:scale(.975); } }
       `}</style>
     </div>
   );
