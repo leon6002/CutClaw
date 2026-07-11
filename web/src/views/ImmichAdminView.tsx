@@ -20,8 +20,13 @@ type Item = {
 const fmtTime = (t?: any) => (t ? String(t).replace("T", " ").slice(0, 16) : "—");
 const fmtDur = (d?: any) => {
   if (d == null || d === "") return "";
+  // Immich 两种形态并存:字符串 "0:03:27.938" 或 毫秒整数 207938
+  if (typeof d === "number" || /^\d+$/.test(String(d))) {
+    const sec = Math.round(Number(d) / 1000);
+    return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+  }
   const s = String(d);
-  return s.includes(":") ? s.slice(s.startsWith("0:") ? 2 : 0, 8).replace(/\.\d+$/, "") : `${d}s`;
+  return s.includes(":") ? s.replace(/^0:/, "").replace(/\.\d+$/, "") : s;
 };
 
 /** 局部错误边界:单个脏数据资产不再炸掉整页(白屏)。 */
