@@ -25,6 +25,7 @@ import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
 import RenderView from "./views/RenderView";
 import ImmichAdminView from "./views/ImmichAdminView";
+import { useNavStore } from "./store";
 import SettingsModal from "./views/SettingsModal";
 
 export interface ProjectState {
@@ -161,7 +162,9 @@ function deriveWorkflow(
 }
 
 export default function App() {
-  const [tab, setTab] = useState("assets");
+  // tab ↔ URL hash 双向同步(store.ts):刷新/前进后退不再丢失所在页面
+  const tab = useNavStore((s) => s.tab);
+  const setTab = useNavStore((s) => s.setTab);
   const [showSettings, setShowSettings] = useState(false);
   const [showParams, setShowParams] = useState(false);
   const [projects, setProjects] = useState<any[]>([]);

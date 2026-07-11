@@ -798,22 +798,44 @@ def _mgmt_slim(a: dict) -> dict:
     }
 
 
+_MGMT_ALBUM_CACHE: dict = {}   # album_id -> (ts, payload) 60s 内存缓存
+
+
 @app.get("/api/immich/mgmt/album/{album_id}")
-def immich_mgmt_album(album_id: str):
-    """相簿全部资产(图片+视频),按拍摄时间排序 — 库管理页的相簿视图。"""
+def immich_mgmt_album(album_id: str, force: bool = False):
+    """相簿全部资产(图片+视频),按拍摄时间排序 — 库管理页的相簿视图。
+
+    性能:首页拿到 total 后其余分页**并行**拉(2317 项 5 串行请求 → 1+并行,
+    约 3-5 倍提速);60s 内存缓存打掉重复点开的等待。"""
     safe = "".join(c for c in album_id if c.isalnum() or c == "-")
+    _hit = _MGMT_ALBUM_CACHE.get(safe)
+    if _hit and not force and time.time() - _hit[0] < 60:
+        return _hit[1]
     al = _immich_req(f"/albums/{safe}")
-    assets: list = []
-    page = 1
-    while page and len(assets) < 3000:
+    _PAGE = 500
+
+    def _fetch(page: int) -> tuple[list, int | None, int]:
         r = _immich_req("/search/metadata", "POST",
-                        {"albumIds": [safe], "size": 500, "page": page, "withExif": True})
-        assets.extend((r.get("assets") or {}).get("items", []))
-        nxt = (r.get("assets") or {}).get("nextPage")
-        page = int(nxt) if nxt else None
+                        {"albumIds": [safe], "size": _PAGE, "page": page, "withExif": True})
+        a = r.get("assets") or {}
+        nxt = a.get("nextPage")
+        return a.get("items", []), (int(nxt) if nxt else None), int(a.get("total") or 0)
+
+    first, nxt, total = _fetch(1)
+    assets: list = list(first)
+    if nxt:
+        n_pages = min(6, (max(total, len(first)) + _PAGE - 1) // _PAGE) if total else 6
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for chunk, _, _ in ex.map(lambda p: _fetch(p), range(2, n_pages + 1)):
+                assets.extend(chunk)
     items = [_mgmt_slim(a) for a in assets]
     items.sort(key=lambda x: x.get("taken_at") or "")
-    return {"name": al.get("albumName", ""), "items": items}
+    payload = {"name": al.get("albumName", ""), "items": items}
+    _MGMT_ALBUM_CACHE[safe] = (time.time(), payload)
+    if len(_MGMT_ALBUM_CACHE) > 12:
+        _MGMT_ALBUM_CACHE.pop(next(iter(_MGMT_ALBUM_CACHE)))
+    return payload
 
 
 @app.get("/api/immich/mgmt/asset/{asset_id}")
@@ -902,6 +924,7 @@ def immich_mgmt_geo_refresh(body: MgmtIdsRequest):
                 ok += 1
             except Exception:  # noqa: BLE001
                 pass
+        _MGMT_ALBUM_CACHE.clear()   # 资产已变更,相簿缓存作废
         _WS_TASK.update({"running": False, "done": done,
                          "result": {"resolved": ok, "no_gps": no_gps,
                                     "failed": len(body.ids) - ok - no_gps}})
@@ -967,6 +990,7 @@ def immich_mgmt_score(body: MgmtIdsRequest):
                 json.dump(store, f, ensure_ascii=False, indent=1)
         except Exception:  # noqa: BLE001
             pass
+        _MGMT_ALBUM_CACHE.clear()   # 资产已变更,相簿缓存作废
         _WS_TASK.update({"running": False, "done": done,
                          "result": {"scored": scored, "skipped": skipped, "failed": failed}})
 
@@ -1062,6 +1086,7 @@ def immich_mgmt_geo_infer(body: MgmtIdsRequest):
                 ok += 1
             except Exception:  # noqa: BLE001
                 failed += 1
+        _MGMT_ALBUM_CACHE.clear()   # 资产已变更,相簿缓存作废
         _WS_TASK.update({"running": False, "done": done,
                          "result": {"inferred": ok, "had_gps": skipped,
                                     "no_neighbor_or_failed": failed}})

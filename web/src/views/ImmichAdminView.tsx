@@ -1,22 +1,15 @@
-/** Immich 库管理(§19)— 照片优先的设计语言(Google Photos / Lightroom 系):
- *  相簿墙 = 全出血封面 + 内嵌渐变标题;相簿内 = 按天分组时间线 + 方形密铺,
- *  控件悬浮才现身;选中 = 青色描边 + 底部悬浮操作条;详情 = 灯箱(← → 翻页,
- *  Esc 关闭),信息栏以「地点」为英雄区。 */
-import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
+/** Immich 库管理(§19)— 照片优先设计 + 架构升级(2026-07-11):
+ *  zustand 缓存(重进相簿秒开、刷新恢复现场)、Shift 范围选择、
+ *  类型/状态筛选片、相簿搜索;详情灯箱 ← → 翻页 / Esc。 */
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDownUp, ArrowLeft, Check, ChevronLeft, ChevronRight, Copy,
-  ExternalLink, Heart, Loader2, MapPin, Sparkles, X,
+  ExternalLink, Heart, Loader2, MapPin, Search, Sparkles, X,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { api } from "../api";
-
-type Album = { id: string; name: string; count: number; thumb?: string; start?: string; end?: string };
-type Item = {
-  id: string; name: string; type: string; taken_at: string; thumb: string;
-  duration?: any; rating?: number; favorite?: boolean; has_gps?: boolean;
-  city?: string; geo_done?: boolean; score_done?: boolean; size_mb?: number;
-};
+import { useImmichStore, type ImItem } from "../store";
 
 const fmtTime = (t?: any) => (t ? String(t).replace("T", " ").slice(0, 16) : "—");
 const fmtDur = (d?: any) => {
@@ -33,6 +26,22 @@ const dayLabel = (iso: string) => {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return "未知日期";
   return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 · ${WEEK[d.getDay()]}`;
+};
+
+const FILTERS = [
+  ["all", "全部"], ["image", "照片"], ["video", "视频"],
+  ["nogps", "无 GPS"], ["nogeo", "未写地名"], ["unscored", "未评分"],
+] as const;
+type FilterKey = typeof FILTERS[number][0];
+const applyFilter = (items: ImItem[], f: FilterKey) => {
+  switch (f) {
+    case "image": return items.filter((m) => m.type === "IMAGE");
+    case "video": return items.filter((m) => m.type === "VIDEO");
+    case "nogps": return items.filter((m) => !m.has_gps);
+    case "nogeo": return items.filter((m) => m.has_gps && !m.geo_done);
+    case "unscored": return items.filter((m) => !m.score_done);
+    default: return items;
+  }
 };
 
 class Boundary extends Component<{ children: ReactNode }, { err: string }> {
@@ -56,28 +65,31 @@ export default function ImmichAdminView() {
 }
 
 function Inner() {
-  const [albums, setAlbums] = useState<Album[]>([]);
-  const [album, setAlbum] = useState<Album | null>(null);
-  const [items, setItems] = useState<Item[]>([]);
-  const [loading, setLoading] = useState(false);
+  const { albums, itemsByAlbum, currentAlbumId, loadAlbums, openAlbum, loadItems } = useImmichStore();
+  const album = albums.find((a) => a.id === currentAlbumId) ?? null;
+  const cached = currentAlbumId ? itemsByAlbum[currentAlbumId] : undefined;
+  const items = cached?.items ?? [];
+  const loading = !!currentAlbumId && !cached;
+
+  const [wallQuery, setWallQuery] = useState("");
+  const [filter, setFilter] = useState<FilterKey>("all");
   const [desc, setDesc] = useState(false);
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
   const [task, setTask] = useState<any>(null);
   const [err, setErr] = useState("");
+  const lastClick = useRef<string | null>(null);
 
+  // 首载:相簿列表(缓存新鲜则零请求);恢复上次浏览的相簿
   useEffect(() => {
-    api<{ albums: Album[] }>("/api/immich/albums").then((r) => setAlbums(r.albums ?? [])).catch((e) => setErr(e.message));
+    loadAlbums();
+    if (currentAlbumId) loadItems(currentAlbumId);
   }, []);
 
-  const openAlbum = async (al: Album) => {
-    setAlbum(al); setItems([]); setSel(new Set()); setLoading(true);
-    try {
-      const r = await api<{ items: Item[] }>(`/api/immich/mgmt/album/${al.id}`);
-      setItems(r.items ?? []);
-    } catch (e: any) { setErr(e.message); }
-    setLoading(false);
+  const enterAlbum = (id: string) => {
+    openAlbum(id); setSel(new Set()); setFilter("all"); lastClick.current = null;
+    loadItems(id);              // 有缓存秒开,过期后台刷新
   };
 
   const openDetail = async (id: string) => {
@@ -86,10 +98,10 @@ function Inner() {
     catch (e: any) { setErr(e.message); }
   };
 
-  // 按天分组(排序方向作用于天序;天内始终时间正序)
+  const filteredItems = useMemo(() => applyFilter(items, filter), [items, filter]);
   const days = useMemo(() => {
-    const g = new Map<string, Item[]>();
-    for (const m of items) {
+    const g = new Map<string, ImItem[]>();
+    for (const m of filteredItems) {
       const k = String(m.taken_at || "").slice(0, 10) || "未知";
       if (!g.has(k)) g.set(k, []);
       g.get(k)!.push(m);
@@ -97,10 +109,31 @@ function Inner() {
     const keys = [...g.keys()].sort();
     if (desc) keys.reverse();
     return keys.map((k) => ({ key: k, items: g.get(k)! }));
-  }, [items, desc]);
+  }, [filteredItems, desc]);
   const flat = useMemo(() => days.flatMap((d) => d.items), [days]);
 
-  // 灯箱键盘:Esc 关闭,← → 翻页
+  // 勾选(支持 Shift 范围选择)
+  const clickCheck = (id: string, shift: boolean) => {
+    setSel((s) => {
+      const n = new Set(s);
+      if (shift && lastClick.current && lastClick.current !== id) {
+        const a = flat.findIndex((m) => m.id === lastClick.current);
+        const b = flat.findIndex((m) => m.id === id);
+        if (a >= 0 && b >= 0) {
+          const on = !n.has(id);
+          for (let i = Math.min(a, b); i <= Math.max(a, b); i++) {
+            on ? n.add(flat[i].id) : n.delete(flat[i].id);
+          }
+          return n;
+        }
+      }
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+    lastClick.current = id;
+  };
+
+  // 灯箱键盘
   useEffect(() => {
     if (!detailId) return;
     const onKey = (e: KeyboardEvent) => {
@@ -115,7 +148,7 @@ function Inner() {
     return () => window.removeEventListener("keydown", onKey);
   }, [detailId, flat]);
 
-  // 后台任务轮询
+  // 后台任务轮询;完成后强刷当前相簿(服务端缓存也已作废)
   useEffect(() => {
     if (!task?.running) return;
     const t = window.setInterval(async () => {
@@ -124,7 +157,7 @@ function Inner() {
         setTask(s);
         if (!s.running) {
           window.clearInterval(t);
-          if (album) openAlbum(album);
+          if (currentAlbumId) loadItems(currentAlbumId, true);
           if (detailId) openDetail(detailId);
         }
       } catch { /* keep */ }
@@ -145,11 +178,9 @@ function Inner() {
   const aiScore = (ids: string[]) => startTask("/api/immich/mgmt/score", ids,
     `对 ${ids.length} 个资产 AI 评分(星级 + 评语回填)?每资产 1 次视觉调用,已评过自动跳过。`);
   const geoInfer = (ids: string[]) => startTask("/api/immich/mgmt/geo_infer", ids,
-    `对 ${ids.length} 个无 GPS 资产按时间轴推测坐标?\n取前后 90 分钟内带 GPS 的邻居照片线性插值,写回 Immich(它会自动重新解析城市/上地图),描述追加 🧭 推测标记;已有 GPS 的自动跳过。`);
+    `对 ${ids.length} 个无 GPS 资产按时间轴推测坐标?\n取前后 90 分钟内带 GPS 的邻居照片插值,写回 Immich;已有 GPS 的自动跳过。`);
 
-  const toggle = (id: string) => setSel((s) => {
-    const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n;
-  });
+  const shownAlbums = albums.filter((a) => !wallQuery || a.name.toLowerCase().includes(wallQuery.toLowerCase()));
 
   return (
     <div className="select-none">
@@ -157,48 +188,83 @@ function Inner() {
 
       {/* ══ 相簿墙 ══ */}
       {!album && (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
-          {albums.map((al) => (
-            <button key={al.id}
-              className="group relative aspect-[4/3] overflow-hidden rounded-2xl bg-slate-900 text-left ring-1 ring-white/[0.06] transition-all duration-300 hover:ring-white/25"
-              onClick={() => openAlbum(al)}>
-              {al.thumb
-                ? <img src={al.thumb} className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.04]" loading="lazy" />
-                : <div className="h-full w-full bg-gradient-to-br from-slate-800 to-slate-900" />}
-              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10">
-                <div className="truncate text-[14px] font-medium text-white">{al.name}</div>
-                <div className="mt-0.5 text-[11px] tabular-nums text-white/55">
-                  {al.count} 项{al.start ? ` · ${al.start.split("-").join(".")}` : ""}
-                  {al.end && al.end !== al.start ? ` – ${al.end.slice(5).replace("-", ".")}` : ""}
-                </div>
-              </div>
-            </button>
-          ))}
-          {albums.length === 0 && !err && (
-            <div className="col-span-full py-20 text-center text-sm text-slate-500">
-              <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" /> 加载相簿…
+        <>
+          <div className="mb-4 flex items-center gap-2">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+              <input
+                className="h-9 w-64 rounded-full border border-white/10 bg-white/[0.04] pl-9 pr-3 text-[12.5px] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500/40 focus:outline-none"
+                placeholder="搜索相簿…" value={wallQuery} onChange={(e) => setWallQuery(e.target.value)} />
             </div>
-          )}
-        </div>
+            <span className="text-[11px] text-slate-600">{shownAlbums.length} 个相簿</span>
+          </div>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
+            {shownAlbums.map((al) => (
+              <button key={al.id}
+                className="group relative aspect-[4/3] overflow-hidden rounded-2xl bg-slate-900 text-left ring-1 ring-white/[0.06] transition-all duration-300 hover:ring-white/25"
+                onClick={() => enterAlbum(al.id)}>
+                {al.thumb
+                  ? <img src={al.thumb} className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-[1.04]" loading="lazy" />
+                  : <div className="h-full w-full bg-gradient-to-br from-slate-800 to-slate-900" />}
+                <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10">
+                  <div className="truncate text-[14px] font-medium text-white">{al.name}</div>
+                  <div className="mt-0.5 text-[11px] tabular-nums text-white/55">
+                    {al.count} 项{al.start ? ` · ${al.start.split("-").join(".")}` : ""}
+                    {al.end && al.end !== al.start ? ` – ${al.end.slice(5).replace("-", ".")}` : ""}
+                  </div>
+                </div>
+              </button>
+            ))}
+            {albums.length === 0 && !err && (
+              <div className="col-span-full py-20 text-center text-sm text-slate-500">
+                <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" /> 加载相簿…
+              </div>
+            )}
+          </div>
+        </>
       )}
 
-      {/* ══ 相簿内:按天时间线 ══ */}
+      {/* ══ 相簿内 ══ */}
       {album && (
         <div>
-          <div className="mb-4 flex items-center gap-3">
+          <div className="mb-3 flex items-center gap-3">
             <button className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-white"
-              onClick={() => { setAlbum(null); setSel(new Set()); }}>
+              onClick={() => { openAlbum(null); setSel(new Set()); }}>
               <ArrowLeft className="h-4 w-4" />
             </button>
             <div>
               <h2 className="text-[17px] font-semibold tracking-tight text-white">{album.name}</h2>
-              <div className="text-[11px] text-slate-500">{items.length} 项 · {days.length} 天</div>
+              <div className="text-[11px] text-slate-500">
+                {filteredItems.length}{filter !== "all" ? ` / ${items.length}` : ""} 项 · {days.length} 天
+                {cached && Date.now() - cached.at > 60_000 && (
+                  <button className="ml-2 text-cyan-500 hover:underline" onClick={() => loadItems(album.id, true)}>刷新</button>
+                )}
+              </div>
             </div>
             <button
               className="ml-auto flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-white"
               onClick={() => setDesc((v) => !v)}>
               <ArrowDownUp className="h-3.5 w-3.5" /> {desc ? "最新在前" : "最早在前"}
             </button>
+          </div>
+
+          {/* 筛选片 */}
+          <div className="mb-3 flex flex-wrap gap-1.5">
+            {FILTERS.map(([k, label]) => (
+              <button key={k}
+                className={cn("h-7 rounded-full px-3 text-[11.5px] transition-colors",
+                  filter === k ? "bg-cyan-500/20 font-medium text-cyan-200" : "bg-white/[0.04] text-slate-400 hover:bg-white/[0.08] hover:text-slate-200")}
+                onClick={() => setFilter(k)}>
+                {label}
+              </button>
+            ))}
+            {filteredItems.length > 0 && (
+              <button className="h-7 rounded-full bg-white/[0.04] px-3 text-[11.5px] text-slate-400 transition-colors hover:bg-white/[0.08] hover:text-slate-200"
+                onClick={() => setSel(new Set(filteredItems.map((m) => m.id)))}>
+                全选筛选结果
+              </button>
+            )}
+            <span className="self-center text-[10.5px] text-slate-600">提示:按住 Shift 点勾选圆可范围选择</span>
           </div>
 
           {loading ? (
@@ -235,22 +301,19 @@ function Inner() {
                         onClick={() => openDetail(m.id)}>
                         <img src={m.thumb} loading="lazy"
                           className={cn("h-full w-full object-cover transition-transform duration-200", on && "scale-[0.88]")} />
-                        {/* 悬浮/选中才出现的勾选圆 */}
                         <button
                           className={cn("absolute left-1.5 top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full transition-all",
                             on ? "bg-cyan-400 text-slate-950"
                               : "bg-black/45 text-white/80 opacity-0 backdrop-blur-sm hover:bg-black/70 group-hover:opacity-100")}
-                          onClick={(e) => { e.stopPropagation(); toggle(m.id); }}>
+                          onClick={(e) => { e.stopPropagation(); clickCheck(m.id, e.shiftKey); }}>
                           <Check className="h-3 w-3" strokeWidth={3} />
                         </button>
-                        {/* 常驻的最小信息:时长 / 收藏 */}
                         {m.type === "VIDEO" && (
                           <span className="absolute bottom-1 right-1.5 rounded bg-black/55 px-1 py-px text-[9.5px] font-medium tabular-nums text-white/90 backdrop-blur-sm">
                             {fmtDur(m.duration)}
                           </span>
                         )}
                         {m.favorite && <Heart className="absolute bottom-1 left-1.5 h-3 w-3 fill-rose-400 text-rose-400" />}
-                        {/* 悬浮渐变:时间 + 状态点 */}
                         <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-end gap-1 bg-gradient-to-b from-black/55 to-transparent px-1.5 pb-4 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
                           <span className="mr-auto pl-6 text-[9.5px] tabular-nums text-white/75">{fmtTime(m.taken_at).slice(11)}</span>
                           {(m.rating ?? 0) > 0 && <span className="text-[9px] text-amber-300">★{m.rating}</span>}
@@ -308,7 +371,6 @@ function Inner() {
       {detailId && (
         <div className="fixed inset-0 z-50 flex bg-black/90 backdrop-blur-sm"
           onClick={() => { setDetailId(null); setDetail(null); }}>
-          {/* 左右翻页 */}
           {(() => {
             const i = flat.findIndex((m) => m.id === detailId);
             return (
@@ -328,13 +390,11 @@ function Inner() {
               </>
             );
           })()}
-          {/* 主图区 */}
           <div className="flex min-w-0 flex-1 items-center justify-center p-8" onClick={(e) => e.stopPropagation()}>
             {detail
               ? <img src={detail.thumb} className="max-h-full max-w-full rounded-lg object-contain shadow-2xl" />
               : <Loader2 className="h-6 w-6 animate-spin text-slate-500" />}
           </div>
-          {/* 信息栏 */}
           <div className="flex w-[352px] shrink-0 flex-col border-l border-white/[0.07] bg-[#0a0f1c]" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-1 px-4 pb-2 pt-3">
               <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-white" title={detail?.name}>{detail?.name ?? "…"}</span>
@@ -346,11 +406,11 @@ function Inner() {
             {detail && (
               <>
                 <div className="flex gap-1.5 px-4 pb-3">
-                  <button className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-500/12 text-[12px] text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-40"
+                  <button className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-500/[0.12] text-[12px] text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-40"
                     disabled={!detail.has_gps || !!task?.running} onClick={() => geoRefresh([detail.id])}>
                     <MapPin className="h-3.5 w-3.5" /> 刷新地名
                   </button>
-                  <button className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg bg-fuchsia-500/12 text-[12px] text-fuchsia-300 transition-colors hover:bg-fuchsia-500/20 disabled:opacity-40"
+                  <button className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg bg-fuchsia-500/[0.12] text-[12px] text-fuchsia-300 transition-colors hover:bg-fuchsia-500/20 disabled:opacity-40"
                     disabled={!!task?.running} onClick={() => aiScore([detail.id])}>
                     <Sparkles className="h-3.5 w-3.5" /> AI 评分
                   </button>
@@ -361,7 +421,6 @@ function Inner() {
                 </div>
                 <ScrollArea className="min-h-0 flex-1">
                   <div className="space-y-5 px-4 pb-6">
-                    {/* 英雄区:地点 */}
                     {detail.geo ? (() => {
                       const levels = [detail.geo.province, detail.geo.city, detail.geo.district, detail.geo.township]
                         .filter((x: string, i: number, a: string[]) => x && a.indexOf(x) === i);
@@ -397,17 +456,15 @@ function Inner() {
                       </div>
                     )}
 
-                    {/* 状态 */}
                     {(detail.rating > 0 || detail.rating === -1 || detail.favorite || detail.score_done) && (
                       <div className="flex flex-wrap gap-1.5">
-                        {detail.rating > 0 && <span className="rounded-md bg-amber-400/12 px-2 py-1 text-[11.5px] text-amber-300">{"★".repeat(Math.min(5, detail.rating))}</span>}
-                        {detail.rating === -1 && <span className="rounded-md bg-red-500/12 px-2 py-1 text-[11.5px] text-red-300">已拒绝</span>}
-                        {detail.favorite && <span className="rounded-md bg-rose-500/12 px-2 py-1 text-[11.5px] text-rose-300">❤️ 收藏</span>}
-                        {detail.score_done && <span className="rounded-md bg-fuchsia-500/12 px-2 py-1 text-[11.5px] text-fuchsia-300">✨ 已评分</span>}
+                        {detail.rating > 0 && <span className="rounded-md bg-amber-400/[0.12] px-2 py-1 text-[11.5px] text-amber-300">{"★".repeat(Math.min(5, detail.rating))}</span>}
+                        {detail.rating === -1 && <span className="rounded-md bg-red-500/[0.12] px-2 py-1 text-[11.5px] text-red-300">已拒绝</span>}
+                        {detail.favorite && <span className="rounded-md bg-rose-500/[0.12] px-2 py-1 text-[11.5px] text-rose-300">❤️ 收藏</span>}
+                        {detail.score_done && <span className="rounded-md bg-fuchsia-500/[0.12] px-2 py-1 text-[11.5px] text-fuchsia-300">✨ 已评分</span>}
                       </div>
                     )}
 
-                    {/* 拍摄 */}
                     <div>
                       <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-600">拍摄</div>
                       <div className="space-y-1.5 text-[12.5px]">
@@ -426,7 +483,6 @@ function Inner() {
                       </div>
                     </div>
 
-                    {/* 相簿 */}
                     <div>
                       <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-600">相簿</div>
                       <div className="flex flex-wrap gap-1.5">
@@ -437,7 +493,6 @@ function Inner() {
                       </div>
                     </div>
 
-                    {/* 描述 */}
                     {detail.description && (
                       <div>
                         <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-600">描述</div>
