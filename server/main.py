@@ -974,6 +974,102 @@ def immich_mgmt_score(body: MgmtIdsRequest):
     return {"status": "started", "total": len(body.ids)}
 
 
+@app.post("/api/immich/mgmt/geo_infer")
+def immich_mgmt_geo_infer(body: MgmtIdsRequest):
+    """无 GPS 资产的坐标推测(时间轴地理插值,Lightroom 同款原理):
+
+    找拍摄时间前后最近的两张带 GPS 的照片(±90 分钟窗口),按时间线性
+    插值经纬度,PUT 回 Immich(它会自动重新解析城市/上地图)。描述追加
+    🧭 推测标记行保证可审计;只有单侧邻居时直接用该侧坐标。"""
+    if not body.ids:
+        raise HTTPException(400, "ids required")
+    if not _ws_start("geo_infer"):
+        raise HTTPException(409, "已有后台任务在跑")
+
+    from datetime import datetime, timedelta, timezone
+
+    def _wall(t: str):
+        """墙上时钟(去时区的本地钟表时间)。Pocket 导出无时区被 Immich 当成
+        UTC 存,在 UTC 轴上会漂 8 小时;但 localDateTime 两边记的都是当地
+        钟表时间,天然可比。"""
+        try:
+            return datetime.fromisoformat(
+                str(t).replace("Z", "").split("+")[0].split(".")[0])
+        except Exception:  # noqa: BLE001
+            return None
+
+    _WINDOW_MIN = 90
+
+    def _run():
+        done = ok = skipped = failed = 0
+        _WS_TASK["total"] = len(body.ids)
+        for aid in body.ids:
+            _WS_TASK.update({"done": done, "note": f"推测 GPS {done + 1}/{len(body.ids)}"})
+            done += 1
+            try:
+                a = _immich_req(f"/assets/{aid}")
+                ex = a.get("exifInfo") or {}
+                if ex.get("latitude") is not None:
+                    skipped += 1          # 已有 GPS,不动
+                    continue
+                t0 = _wall(a.get("localDateTime") or ex.get("dateTimeOriginal")
+                           or a.get("fileCreatedAt"))
+                if t0 is None:
+                    failed += 1
+                    continue
+                # UTC 轴宽查询(±14h 覆盖任意时区错记),墙钟轴精过滤
+                _t0u = t0.replace(tzinfo=timezone.utc)
+                r = _immich_req("/search/metadata", "POST", {
+                    "takenAfter": (_t0u - timedelta(hours=14)).isoformat().replace("+00:00", "Z"),
+                    "takenBefore": (_t0u + timedelta(hours=14)).isoformat().replace("+00:00", "Z"),
+                    "withExif": True, "size": 1000, "page": 1})
+                cands = []
+                for n in (r.get("assets") or {}).get("items", []):
+                    nex = n.get("exifInfo") or {}
+                    if nex.get("latitude") is None or n.get("id") == aid:
+                        continue
+                    tn = _wall(n.get("localDateTime") or nex.get("dateTimeOriginal")
+                               or n.get("fileCreatedAt"))
+                    if tn is None or abs((tn - t0).total_seconds()) > _WINDOW_MIN * 60:
+                        continue
+                    cands.append((tn, float(nex["latitude"]), float(nex["longitude"]),
+                                  n.get("originalFileName", "")))
+                before = max((c for c in cands if c[0] <= t0), default=None, key=lambda c: c[0])
+                after = min((c for c in cands if c[0] >= t0), default=None, key=lambda c: c[0])
+                if before and after and after[0] != before[0]:
+                    w = (t0 - before[0]).total_seconds() / (after[0] - before[0]).total_seconds()
+                    lat = before[1] + (after[1] - before[1]) * w
+                    lon = before[2] + (after[2] - before[2]) * w
+                    src = f"{before[3]} ←{abs((t0-before[0]).total_seconds())/60:.0f}min·{abs((after[0]-t0).total_seconds())/60:.0f}min→ {after[3]}"
+                elif before or after:
+                    c = before or after
+                    lat, lon = c[1], c[2]
+                    src = f"{c[3]}(相隔 {abs((t0-c[0]).total_seconds())/60:.0f} 分钟)"
+                else:
+                    failed += 1           # 窗口内没有带 GPS 的邻居
+                    continue
+                cur = str(ex.get("description") or "")
+                lines = [l for l in cur.splitlines() if not l.startswith("🧭")]
+                lines.append(f"🧭 GPS 由相邻照片推测({src})")
+                _immich_req(f"/assets/{aid}", "PUT", {
+                    "latitude": round(lat, 6), "longitude": round(lon, 6),
+                    "description": "\n".join(lines).strip()[:4000]})
+                try:
+                    from src.utils.amap_geo import reverse_geocode
+                    reverse_geocode(lat, lon, context=a.get("originalFileName") or aid)
+                except Exception:  # noqa: BLE001
+                    pass
+                ok += 1
+            except Exception:  # noqa: BLE001
+                failed += 1
+        _WS_TASK.update({"running": False, "done": done,
+                         "result": {"inferred": ok, "had_gps": skipped,
+                                    "no_neighbor_or_failed": failed}})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "total": len(body.ids)}
+
+
 class ImmichImport(BaseModel):
     ids: list[str] = []
 

@@ -144,6 +144,8 @@ function Inner() {
     `对 ${ids.length} 个资产刷新高德地名并写入描述?无 GPS 自动跳过,网格缓存下配额消耗很小。`);
   const aiScore = (ids: string[]) => startTask("/api/immich/mgmt/score", ids,
     `对 ${ids.length} 个资产 AI 评分(星级 + 评语回填)?每资产 1 次视觉调用,已评过自动跳过。`);
+  const geoInfer = (ids: string[]) => startTask("/api/immich/mgmt/geo_infer", ids,
+    `对 ${ids.length} 个无 GPS 资产按时间轴推测坐标?\n取前后 90 分钟内带 GPS 的邻居照片线性插值,写回 Immich(它会自动重新解析城市/上地图),描述追加 🧭 推测标记;已有 GPS 的自动跳过。`);
 
   const toggle = (id: string) => setSel((s) => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n;
@@ -277,6 +279,11 @@ function Inner() {
             disabled={!!task?.running} onClick={() => aiScore([...sel])}>
             <Sparkles className="h-3.5 w-3.5" /> AI 评分
           </button>
+          <button className="flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] text-sky-300 transition-colors hover:bg-sky-500/15"
+            title="对选中里没有 GPS 的资产,用前后 90 分钟内带 GPS 的照片按时间插值坐标并写回 Immich"
+            disabled={!!task?.running} onClick={() => geoInfer([...sel])}>
+            🧭 推测 GPS
+          </button>
           <button className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
             onClick={() => setSel(new Set())}>
             <X className="h-4 w-4" />
@@ -374,7 +381,19 @@ function Inner() {
                       );
                     })() : (
                       <div className="text-[13px] text-slate-500">
-                        {detail.exif?.latitude != null ? "有 GPS,尚未解析地名 — 点上方「刷新地名」" : "没有位置信息"}
+                        {detail.exif?.latitude != null
+                          ? "有 GPS,尚未解析地名 — 点上方「刷新地名」"
+                          : (
+                            <span className="flex flex-wrap items-center gap-2">
+                              没有位置信息
+                              <button className="rounded-lg bg-sky-500/[0.12] px-2.5 py-1 text-[11.5px] text-sky-300 transition-colors hover:bg-sky-500/20 disabled:opacity-40"
+                                disabled={!!task?.running}
+                                title="用拍摄时间前后 90 分钟内带 GPS 的照片插值坐标,写回 Immich"
+                                onClick={() => geoInfer([detail.id])}>
+                                🧭 从相邻照片推测 GPS
+                              </button>
+                            </span>
+                          )}
                       </div>
                     )}
 
