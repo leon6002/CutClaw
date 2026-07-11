@@ -262,7 +262,9 @@ function Inner() {
 
   // ── 相似整理:分析发起 / 堆叠应用 ──
   const idMap = useMemo(() => new Map(items.map((m) => [m.id, m])), [items]);
-  const simPending = ((sim?.clusters ?? []) as any[]).filter((c) => !c.applied);
+  const simPending = ((sim?.clusters ?? []) as any[])
+    .filter((c) => !c.applied)
+    .sort((a, b) => String(a.time || "").localeCompare(String(b.time || "")));
   const simApplied = ((sim?.clusters ?? []) as any[]).length - simPending.length;
   const simActive = simPending.filter((c) => !simSkip.has(c.key));
 
@@ -271,6 +273,15 @@ function Inner() {
     setErr("");
     try {
       await api("/api/immich/mgmt/similar/analyze", { method: "POST", body: JSON.stringify({ album_id: album.id }) });
+      setTask({ running: true, done: 0, total: 0 });
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  const runDeep = async () => {
+    if (!album) return;
+    setErr("");
+    try {
+      await api("/api/immich/mgmt/similar/deep", { method: "POST", body: JSON.stringify({ album_id: album.id }) });
       setTask({ running: true, done: 0, total: 0 });
     } catch (e: any) { setErr(e.message); }
   };
@@ -388,6 +399,13 @@ function Inner() {
                     <span className="text-slate-300">{simPending.length} 簇待整理</span>
                     {simApplied > 0 && <span className="text-emerald-400/80">{simApplied} 簇已堆叠</span>}
                     <button className="text-cyan-500 hover:underline disabled:opacity-40" disabled={!!task?.running} onClick={runAnalyze}>重新分析</button>
+                    {((sim.scene_groups?.length ?? 0) > 0) && (
+                      <button className="text-fuchsia-400 hover:underline disabled:opacity-40" disabled={!!task?.running}
+                        title="连拍算法对'同场景换姿势/换构图'看不出来,交给视觉模型逐组判断。每组 1 次调用(约 12 张小图),评过的组走缓存不重复计费"
+                        onClick={runDeep}>
+                        🧠 AI 场景去重(≤{sim.scene_groups.length} 次调用)
+                      </button>
+                    )}
                     <span className="text-slate-600">点缩略图换封面 · 双击看大图</span>
                   </div>
                   {simPending.length === 0 && (
@@ -404,6 +422,10 @@ function Inner() {
                         <div className="mb-2 flex items-center gap-2.5 text-[11.5px] text-slate-500">
                           <span className="tabular-nums">{c.time}</span>
                           <span>{c.ids.length} 张</span>
+                          {c.tier === "scene"
+                            ? <span className="rounded bg-fuchsia-500/15 px-1.5 py-px text-[10px] text-fuchsia-300">🧠 AI 场景</span>
+                            : <span className="rounded bg-cyan-500/[0.12] px-1.5 py-px text-[10px] text-cyan-300/80">连拍</span>}
+                          {c.reason && <span className="truncate text-slate-400">{c.reason}</span>}
                           <button className="ml-auto transition-colors hover:text-cyan-300"
                             onClick={() => setSimSkip((s) => { const n = new Set(s); n.has(c.key) ? n.delete(c.key) : n.add(c.key); return n; })}>
                             {skipped ? "恢复此簇" : "跳过此簇"}

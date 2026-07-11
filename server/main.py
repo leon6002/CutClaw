@@ -1220,10 +1220,40 @@ def immich_mgmt_similar_analyze(body: SimilarAnalyzeRequest):
                         "winner": win["id"],
                         "metrics": met,
                         "applied": False,
+                        "tier": "burst",
                     })
+            # 场景候选组(二期):模拟本地簇应用后的时间线,≤30s 链分组交给
+            # VLM 判断语义级重复 —— dHash 对"同场景换构图/换姿势"全盲
+            # (实测同场景 h17-41 与真场景切换完全重叠,算法已到天花板)
+            losers = {i for c in clusters for i in c["ids"] if i != c["winner"]}
+            remain = [(m, t) for m, t in tagged if m["id"] not in losers]
+            raw_groups: list[list] = []
+            cur2: list = []
+            for m, t in remain:
+                if cur2 and (t - cur2[-1][1]).total_seconds() > 30:
+                    if len(cur2) >= 2:
+                        raw_groups.append(cur2)
+                    cur2 = []
+                cur2.append((m, t))
+            if len(cur2) >= 2:
+                raw_groups.append(cur2)
+            scene_groups: list[list[str]] = []
+            for g in raw_groups:
+                gids = [x[0]["id"] for x in g]
+                scene_groups.extend(gids[i:i + 12] for i in range(0, len(gids), 12))
+            scene_groups = [g for g in scene_groups if len(g) >= 2]
+            # VLM 组结果按内容签名缓存,重分析后同组零成本复用(计费纪律)
+            old_done: dict = {}
+            try:
+                with open(os.path.join(_SIMILAR_DIR, f"{album_id}.json"),
+                          encoding="utf-8") as f:
+                    old_done = json.load(f).get("scene_done") or {}
+            except Exception:  # noqa: BLE001
+                pass
             os.makedirs(_SIMILAR_DIR, exist_ok=True)
             payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "album": album_id,
-                       "photos": len(photos), "clusters": clusters}
+                       "photos": len(photos), "clusters": clusters,
+                       "scene_groups": scene_groups, "scene_done": old_done}
             with open(os.path.join(_SIMILAR_DIR, f"{album_id}.json"), "w",
                       encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=1)
@@ -1245,6 +1275,147 @@ def immich_mgmt_similar(album_id: str):
         return {"ts": None, "clusters": []}
     with open(p, encoding="utf-8") as f:
         return json.load(f)
+
+
+_SCENE_GROUP_PROMPT = """这是一组在同一时间段内连续拍摄的照片,按拍摄顺序编号(第一张为 0)。
+任务:找出"重复可收纳"的照片组 —— 同一场景、同一主体的反复拍摄(换姿势/微调构图/连按快门)。
+判断标准:一组照片如果只需保留其中最好的一张、其余收进相册堆叠也不可惜,就算重复。
+明显不同的场景、不同主体、或构图差异大到各有保留价值的,不要并组;单张不成组。
+每组从成员里选最佳一张:表情自然、主体清晰、构图最好。
+只输出 JSON:
+{"groups":[{"members":[编号],"best":编号,"reason":"选它的理由,≤20字"}]}
+没有可收纳的组则输出 {"groups":[]}
+"""
+
+
+def _scene_group_vlm(b64s: list[str]) -> dict | None:
+    import litellm
+    content: list = [{"type": "text", "text": _SCENE_GROUP_PROMPT}]
+    for b in b64s:
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/webp;base64,{b}"}})
+    kwargs = dict(
+        model=str(cfg("VIDEO_ANALYSIS_MODEL", "")),
+        messages=[{"role": "user", "content": content}],
+        temperature=0.2, max_tokens=8192, timeout=180,
+    )
+    base = str(cfg("VIDEO_ANALYSIS_ENDPOINT", ""))
+    key = str(cfg("VIDEO_ANALYSIS_API_KEY", ""))
+    if base:
+        kwargs["api_base"] = base
+    if key:
+        kwargs["api_key"] = key
+    resp = litellm.completion(**kwargs)
+    msg = resp.choices[0].message
+    text = (msg.content or "").strip() \
+        or str(getattr(msg, "reasoning_content", "") or "").strip()
+    d = _extract_json_generic(text)
+    return d if isinstance(d, dict) and isinstance(d.get("groups"), list) else None
+
+
+@app.post("/api/immich/mgmt/similar/deep")
+def immich_mgmt_similar_deep(body: SimilarAnalyzeRequest):
+    """场景级 AI 去重(§20 二期):对本地分析产出的候选组逐组问 VLM
+    "哪些是同场景反复拍、留哪张"。计费:每组 1 次视觉调用(~12 张缩略图);
+    组结果按内容签名缓存,重跑/重分析后同组零成本。失败的组不重试
+    (纪律),下次深评自动补。后台跑,workspace/task 轮询。"""
+    album_id = "".join(c for c in body.album_id if c.isalnum() or c == "-")
+    p = os.path.join(_SIMILAR_DIR, f"{album_id}.json")
+    if not os.path.exists(p):
+        raise HTTPException(400, "先跑本地相似分析")
+    if not _ws_start("similar_deep"):
+        raise HTTPException(409, "已有后台任务在跑")
+
+    def _run():
+        import base64
+        import hashlib
+        from src.utils.burst_cluster import quality
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            groups = data.get("scene_groups") or []
+            done: dict = data.get("scene_done") or {}
+            # 重建 scene 簇:非 applied 的丢掉重来(缓存兜底,零成本),
+            # applied 的保留且不重复展示
+            old_applied = {c["key"] for c in data.get("clusters", []) if c.get("applied")}
+            clusters = [c for c in data.get("clusters", [])
+                        if c.get("tier") != "scene" or c.get("applied")]
+            try:
+                amap = {m["id"]: m for m in immich_mgmt_album(album_id)["items"]}
+            except Exception:  # noqa: BLE001
+                amap = {}
+            _WS_TASK["total"] = len(groups)
+            calls = cached = failed = consec = 0
+            last_err = ""
+            for gi, gids in enumerate(groups):
+                _WS_TASK.update({"done": gi, "note": f"AI 场景去重 {gi + 1}/{len(groups)}"})
+                gkey = hashlib.sha1(",".join(gids).encode()).hexdigest()[:12]
+                if gkey in done:
+                    res = done[gkey]
+                    cached += 1
+                else:
+                    # 单组失败跳过不重试(纪律;503 未处理不计费,下次深评
+                    # 自动补);连续 3 组失败视为模型过载,熔断停跑
+                    try:
+                        b64s = []
+                        for aid in gids:
+                            with open(_thumb_path(aid, small=True), "rb") as f:
+                                b64s.append(base64.b64encode(f.read()).decode())
+                        res = _scene_group_vlm(b64s)
+                    except Exception as e:  # noqa: BLE001
+                        failed += 1
+                        consec += 1
+                        last_err = str(e)[:200]
+                        if consec >= 3:
+                            _WS_TASK.update({"running": False, "error": (
+                                f"模型连续 {consec} 次不可用,已熔断(完成 {calls} 组已缓存,"
+                                f"稍后再点一次即可续跑)。最后错误: {last_err}")})
+                            return
+                        continue
+                    consec = 0
+                    if res is None:
+                        failed += 1
+                        continue        # 拿到响应但解析失败;下次深评自动补
+                    done[gkey] = res
+                    calls += 1
+                for n, grp in enumerate(res.get("groups") or []):
+                    idx = [i for i in (grp.get("members") or [])
+                           if isinstance(i, int) and 0 <= i < len(gids)]
+                    if len(idx) < 2:
+                        continue
+                    mem = [gids[i] for i in idx]
+                    best = grp.get("best")
+                    win = gids[best] if isinstance(best, int) and best in idx else mem[0]
+                    key = f"scene_{gkey}_{n}"
+                    if key in old_applied:
+                        continue        # 之前已应用,成员已入栈
+                    met = {}
+                    for aid in mem:
+                        try:
+                            with open(_thumb_path(aid, small=True), "rb") as f:
+                                met[aid] = quality(f.read())
+                        except Exception:  # noqa: BLE001
+                            met[aid] = {"sharp": 0, "clip": 0, "score": 0}
+                    clusters.append({
+                        "key": key,
+                        "time": str(amap.get(win, {}).get("taken_at", ""))[:16].replace("T", " "),
+                        "ids": mem, "winner": win, "metrics": met,
+                        "applied": False, "tier": "scene",
+                        "reason": str(grp.get("reason") or "")[:60],
+                    })
+                # 每组落盘(断点缓存:中断/崩溃零重付)
+                data.update({"clusters": clusters, "scene_done": done})
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1)
+            _WS_TASK.update({"running": False, "done": len(groups), "result": {
+                "vlm_calls": calls, "cached_groups": cached, "failed_groups": failed,
+                "scene_clusters": sum(1 for c in clusters if c.get("tier") == "scene"
+                                      and not c.get("applied"))}})
+        except Exception as e:  # noqa: BLE001
+            _WS_TASK.update({"running": False, "error": str(e)})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "groups": 0}
 
 
 class StackRequest(BaseModel):
