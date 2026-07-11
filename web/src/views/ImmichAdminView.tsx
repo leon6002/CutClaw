@@ -1,7 +1,7 @@
 /** Immich 库管理(§19)— 照片优先设计 + 架构升级(2026-07-11):
  *  zustand 缓存(重进相簿秒开、刷新恢复现场)、Shift 范围选择、
  *  类型/状态筛选片、相簿搜索;详情灯箱 ← → 翻页 / Esc。 */
-import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Component, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDownUp, ArrowLeft, Check, ChevronLeft, ChevronRight, Copy,
   ExternalLink, Heart, Loader2, MapPin, Search, Sparkles, X,
@@ -43,6 +43,44 @@ const applyFilter = (items: ImItem[], f: FilterKey) => {
     default: return items;
   }
 };
+
+/** 单个缩略格 — memo 化:500 格的相簿里,点筛选/勾选/任务轮询只重渲染
+ *  真正变化的格子,而不是全量 500×8 层 DOM。注意不要在这里用
+ *  backdrop-blur(500 份合成层是页面掉帧主因)。 */
+const Tile = memo(function Tile({ m, on, onOpen, onCheck }: {
+  m: ImItem; on: boolean;
+  onOpen: (id: string) => void;
+  onCheck: (id: string, shift: boolean) => void;
+}) {
+  return (
+    <div
+      className={cn("group relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-slate-900",
+        on && "rounded-lg ring-2 ring-cyan-400 ring-offset-2 ring-offset-[#0a0f1c]")}
+      onClick={() => onOpen(m.id)}>
+      <img src={m.thumb} loading="lazy" decoding="async"
+        className={cn("h-full w-full object-cover transition-transform duration-200", on && "scale-[0.88]")} />
+      <button
+        className={cn("absolute left-1.5 top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full transition-opacity",
+          on ? "bg-cyan-400 text-slate-950"
+            : "bg-black/60 text-white/80 opacity-0 hover:bg-black/80 group-hover:opacity-100")}
+        onClick={(e) => { e.stopPropagation(); onCheck(m.id, e.shiftKey); }}>
+        <Check className="h-3 w-3" strokeWidth={3} />
+      </button>
+      {m.type === "VIDEO" && (
+        <span className="absolute bottom-1 right-1.5 rounded bg-black/65 px-1 py-px text-[9.5px] font-medium tabular-nums text-white/90">
+          {fmtDur(m.duration)}
+        </span>
+      )}
+      {m.favorite && <Heart className="absolute bottom-1 left-1.5 h-3 w-3 fill-rose-400 text-rose-400" />}
+      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-end gap-1 bg-gradient-to-b from-black/55 to-transparent px-1.5 pb-4 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
+        <span className="mr-auto pl-6 text-[9.5px] tabular-nums text-white/75">{fmtTime(m.taken_at).slice(11)}</span>
+        {(m.rating ?? 0) > 0 && <span className="text-[9px] text-amber-300">★{m.rating}</span>}
+        {m.geo_done && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" title="已写地名" />}
+        {m.score_done && <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-400" title="已评分" />}
+      </div>
+    </div>
+  );
+});
 
 class Boundary extends Component<{ children: ReactNode }, { err: string }> {
   state = { err: "" };
@@ -92,11 +130,11 @@ function Inner() {
     loadItems(id);              // 有缓存秒开,过期后台刷新
   };
 
-  const openDetail = async (id: string) => {
+  const openDetail = useCallback(async (id: string) => {
     setDetailId(id); setDetail(null);
     try { setDetail(await api<any>(`/api/immich/mgmt/asset/${id}`)); }
     catch (e: any) { setErr(e.message); }
-  };
+  }, []);
 
   const filteredItems = useMemo(() => applyFilter(items, filter), [items, filter]);
   const days = useMemo(() => {
@@ -108,21 +146,32 @@ function Inner() {
     }
     const keys = [...g.keys()].sort();
     if (desc) keys.reverse();
-    return keys.map((k) => ({ key: k, items: g.get(k)! }));
+    return keys.map((k) => {
+      const its = g.get(k)!;
+      // 当天主城市:O(n) 众数(以前是 O(n²) 且写在 render 里,每帧白算)
+      const cnt = new Map<string, number>();
+      for (const m of its) if (m.city) cnt.set(m.city, (cnt.get(m.city) ?? 0) + 1);
+      let city: string | undefined; let best = 0;
+      for (const [c, n] of cnt) if (n > best) { best = n; city = c; }
+      return { key: k, items: its, city };
+    });
   }, [filteredItems, desc]);
   const flat = useMemo(() => days.flatMap((d) => d.items), [days]);
+  const flatRef = useRef(flat);
+  flatRef.current = flat;
 
-  // 勾选(支持 Shift 范围选择)
-  const clickCheck = (id: string, shift: boolean) => {
+  // 勾选(支持 Shift 范围选择)— useCallback 保持引用稳定,memo Tile 才不失效
+  const clickCheck = useCallback((id: string, shift: boolean) => {
     setSel((s) => {
       const n = new Set(s);
+      const all = flatRef.current;
       if (shift && lastClick.current && lastClick.current !== id) {
-        const a = flat.findIndex((m) => m.id === lastClick.current);
-        const b = flat.findIndex((m) => m.id === id);
+        const a = all.findIndex((m) => m.id === lastClick.current);
+        const b = all.findIndex((m) => m.id === id);
         if (a >= 0 && b >= 0) {
           const on = !n.has(id);
           for (let i = Math.min(a, b); i <= Math.max(a, b); i++) {
-            on ? n.add(flat[i].id) : n.delete(flat[i].id);
+            on ? n.add(all[i].id) : n.delete(all[i].id);
           }
           return n;
         }
@@ -131,7 +180,7 @@ function Inner() {
       return n;
     });
     lastClick.current = id;
-  };
+  }, []);
 
   // 灯箱键盘
   useEffect(() => {
@@ -270,17 +319,15 @@ function Inner() {
           {loading ? (
             <div className="py-24 text-center"><Loader2 className="mx-auto h-5 w-5 animate-spin text-slate-500" /></div>
           ) : days.map((day) => {
-            const city = (() => {
-              const c = day.items.map((m) => m.city).filter(Boolean);
-              return c.sort((a, b) => c.filter(x => x === b).length - c.filter(x => x === a).length)[0];
-            })();
             const dayIds = day.items.map((m) => m.id);
             const allSel = dayIds.every((id) => sel.has(id));
             return (
-              <section key={day.key} className="mb-6">
-                <div className="sticky top-0 z-10 -mx-2 mb-2 flex items-baseline gap-2.5 bg-[#0a0f1c]/85 px-2 py-2 backdrop-blur-md">
+              // content-visibility: 屏幕外的天整段跳过排版与绘制,长相簿滚动/交互不再全页结算
+              <section key={day.key} className="mb-6"
+                style={{ contentVisibility: "auto", containIntrinsicSize: "auto 500px" } as any}>
+                <div className="sticky top-0 z-10 -mx-2 mb-2 flex items-baseline gap-2.5 bg-[#0a0f1c]/95 px-2 py-2">
                   <h3 className="text-[13.5px] font-medium text-slate-200">{dayLabel(day.key)}</h3>
-                  {city && <span className="flex items-center gap-0.5 text-[11px] text-slate-500"><MapPin className="h-3 w-3" />{city}</span>}
+                  {day.city && <span className="flex items-center gap-0.5 text-[11px] text-slate-500"><MapPin className="h-3 w-3" />{day.city}</span>}
                   <span className="text-[11px] text-slate-600">{day.items.length}</span>
                   <button className="ml-auto text-[11px] text-slate-500 transition-colors hover:text-cyan-300"
                     onClick={() => setSel((s) => {
@@ -292,37 +339,9 @@ function Inner() {
                   </button>
                 </div>
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-1">
-                  {day.items.map((m) => {
-                    const on = sel.has(m.id);
-                    return (
-                      <div key={m.id}
-                        className={cn("group relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-slate-900 transition-all duration-150",
-                          on && "rounded-lg ring-2 ring-cyan-400 ring-offset-2 ring-offset-[#0a0f1c]")}
-                        onClick={() => openDetail(m.id)}>
-                        <img src={m.thumb} loading="lazy"
-                          className={cn("h-full w-full object-cover transition-transform duration-200", on && "scale-[0.88]")} />
-                        <button
-                          className={cn("absolute left-1.5 top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full transition-all",
-                            on ? "bg-cyan-400 text-slate-950"
-                              : "bg-black/45 text-white/80 opacity-0 backdrop-blur-sm hover:bg-black/70 group-hover:opacity-100")}
-                          onClick={(e) => { e.stopPropagation(); clickCheck(m.id, e.shiftKey); }}>
-                          <Check className="h-3 w-3" strokeWidth={3} />
-                        </button>
-                        {m.type === "VIDEO" && (
-                          <span className="absolute bottom-1 right-1.5 rounded bg-black/55 px-1 py-px text-[9.5px] font-medium tabular-nums text-white/90 backdrop-blur-sm">
-                            {fmtDur(m.duration)}
-                          </span>
-                        )}
-                        {m.favorite && <Heart className="absolute bottom-1 left-1.5 h-3 w-3 fill-rose-400 text-rose-400" />}
-                        <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-end gap-1 bg-gradient-to-b from-black/55 to-transparent px-1.5 pb-4 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
-                          <span className="mr-auto pl-6 text-[9.5px] tabular-nums text-white/75">{fmtTime(m.taken_at).slice(11)}</span>
-                          {(m.rating ?? 0) > 0 && <span className="text-[9px] text-amber-300">★{m.rating}</span>}
-                          {m.geo_done && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" title="已写地名" />}
-                          {m.score_done && <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-400" title="已评分" />}
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {day.items.map((m) => (
+                    <Tile key={m.id} m={m} on={sel.has(m.id)} onOpen={openDetail} onCheck={clickCheck} />
+                  ))}
                 </div>
               </section>
             );

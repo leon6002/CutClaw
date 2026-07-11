@@ -761,16 +761,20 @@ def immich_album_assets(album_id: str):
 
 
 @app.get("/api/immich/thumb/{asset_id}")
-def immich_thumb(asset_id: str):
+def immich_thumb(asset_id: str, size: str = "preview"):
+    """size=thumbnail(~250px webp,网格用)| preview(~1440px,灯箱用)。
+    网格 500 格若加载 preview 大图,解码+显存开销是页面卡顿主因之一。"""
     tdir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_thumbs")
     os.makedirs(tdir, exist_ok=True)
     safe = "".join(c for c in asset_id if c.isalnum() or c == "-")
-    tp = os.path.join(tdir, f"{safe}.jpg")
+    small = size == "thumbnail"
+    tp = os.path.join(tdir, f"{safe}_t.webp" if small else f"{safe}.jpg")
     if not os.path.exists(tp):
-        data = _immich_req(f"/assets/{safe}/thumbnail?size=preview", raw=True)
+        data = _immich_req(
+            f"/assets/{safe}/thumbnail?size={'thumbnail' if small else 'preview'}", raw=True)
         with open(tp, "wb") as f:
             f.write(data)
-    return FileResponse(tp, media_type="image/jpeg")
+    return FileResponse(tp, media_type="image/webp" if small else "image/jpeg")
 
 
 # ── Immich 库管理页(§19):地名/评分回填,逐个细看 + 批量操作 ─────────────
@@ -786,7 +790,7 @@ def _mgmt_slim(a: dict) -> dict:
         "name": a.get("originalFileName", ""),
         "type": a.get("type", ""),
         "taken_at": ex.get("dateTimeOriginal") or a.get("fileCreatedAt", ""),
-        "thumb": f"/api/immich/thumb/{a.get('id')}",
+        "thumb": f"/api/immich/thumb/{a.get('id')}?size=thumbnail",
         "duration": a.get("duration", ""),
         "rating": ex.get("rating"),
         "favorite": bool(a.get("isFavorite")),
@@ -860,6 +864,7 @@ def immich_mgmt_asset(asset_id: str):
         pass
     return {
         **_mgmt_slim(a),
+        "thumb": f"/api/immich/thumb/{safe}",   # 灯箱要大图,覆盖 slim 的 thumbnail 尺寸
         "exif": {k: v for k, v in ex.items() if v not in (None, "", [])},
         "description": ex.get("description") or "",
         "geo": geo,
