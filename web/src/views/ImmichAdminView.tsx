@@ -422,6 +422,12 @@ function Inner() {
                                 {m && <img src={m.thumb} className="h-full w-full object-cover" loading="lazy" decoding="async" />}
                                 {win && <span className="absolute left-1 top-1 rounded bg-cyan-400 px-1 py-px text-[9px] font-semibold text-slate-950">封面</span>}
                                 {m?.favorite && <Heart className="absolute right-1 top-1 h-3 w-3 fill-rose-400 text-rose-400" />}
+                                {(m?.stack_count ?? 0) > 1 && (
+                                  <span className="absolute bottom-4 right-1 flex items-center gap-0.5 rounded bg-black/65 px-1 py-px text-[9px] tabular-nums text-white/90"
+                                    title={`已是 ${m!.stack_count} 张堆叠的封面,应用时旧堆叠会并入新簇`}>
+                                    <Layers className="h-2.5 w-2.5" />{m!.stack_count}
+                                  </span>
+                                )}
                                 <span className="absolute inset-x-0 bottom-0 bg-black/55 px-1 py-px text-left text-[9px] tabular-nums text-white/80">
                                   清晰 {c.metrics?.[id]?.sharp ?? "—"}
                                 </span>

@@ -634,7 +634,7 @@ def _immich_req(path: str, method: str = "GET", body: dict | None = None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
-            return data if raw else json.loads(data)
+            return data if raw else (json.loads(data) if data else {})
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Immich 请求失败: {e}")
 
@@ -813,6 +813,19 @@ def _mgmt_slim(a: dict) -> dict:
     }
 
 
+def _stacks_map() -> dict:
+    """全库堆叠一览:asset_id -> {stack_id, primary, count}。一次 GET,列表
+    接口的 assets 就是全量(与详情一致,实测)。"""
+    out: dict = {}
+    for st in _immich_req("/stacks") or []:
+        sid = st.get("id")
+        prim = st.get("primaryAssetId")
+        ids = [a.get("id") for a in (st.get("assets") or []) if a.get("id")]
+        for aid in ids:
+            out[aid] = {"stack_id": sid, "primary": aid == prim, "count": len(ids)}
+    return out
+
+
 _MGMT_ALBUM_CACHE: dict = {}   # album_id -> (ts, payload) 60s 内存缓存
 
 
@@ -845,6 +858,18 @@ def immich_mgmt_album(album_id: str, force: bool = False):
             for chunk, _, _ in ex.map(lambda p: _fetch(p), range(2, n_pages + 1)):
                 assets.extend(chunk)
     items = [_mgmt_slim(a) for a in assets]
+    # Immich v3 的 search/metadata 不返回 stack 字段(withStacked 传啥都不带,
+    # 实测),堆叠信息必须从 /stacks 列表补 —— 否则子项永远藏不住。
+    try:
+        smap = _stacks_map()
+        for it in items:
+            s = smap.get(it["id"])
+            if s:
+                it["stack_child"] = not s["primary"]
+                it["stack_count"] = s["count"] if s["primary"] else 0
+                it["stack_id"] = s["stack_id"]
+    except Exception:  # noqa: BLE001
+        pass
     items.sort(key=lambda x: x.get("taken_at") or "")
     payload = {"name": al.get("albumName", ""), "items": items}
     _MGMT_ALBUM_CACHE[safe] = (time.time(), payload)
@@ -1145,9 +1170,10 @@ def immich_mgmt_similar_analyze(body: SimilarAnalyzeRequest):
 
         try:
             items = immich_mgmt_album(album_id)["items"]
-            # 只看还没堆叠过的照片(已是封面/子项的跳过,避免重复整理)
+            # 子项已收纳不再参与;但**封面要参与**——否则上次没聚齐的漏网
+            # 照片永远没机会并进已有堆叠(应用时会自动合并旧堆叠)
             photos = [m for m in items if m.get("type") == "IMAGE"
-                      and not m.get("stack_child") and not m.get("stack_count")]
+                      and not m.get("stack_child")]
             tagged = sorted(((m, _wall(m.get("taken_at"))) for m in photos
                              if _wall(m.get("taken_at"))), key=lambda x: x[1])
             groups: list[list] = []
@@ -1235,6 +1261,15 @@ def immich_mgmt_stack(body: StackRequest):
     ok = failed = 0
     errs: list[str] = []
     applied_keys: set[str] = set()
+    # 成员若已是某个堆叠的封面:先解散旧堆叠、把它的子项并进新簇(合并),
+    # 否则 Immich 会拒绝把已堆叠资产再次入栈
+    try:
+        smap = _stacks_map()
+    except Exception:  # noqa: BLE001
+        smap = {}
+    stack_assets: dict[str, list[str]] = {}
+    for aid, s in smap.items():
+        stack_assets.setdefault(s["stack_id"], []).append(aid)
     for grp in body.groups[:500]:
         prim = str(grp.get("primary") or "")
         ids = [str(i) for i in (grp.get("ids") or []) if i]
@@ -1242,6 +1277,10 @@ def immich_mgmt_stack(body: StackRequest):
             failed += 1
             continue
         try:
+            old_sids = {smap[i]["stack_id"] for i in ids if i in smap}
+            for sid in old_sids:
+                ids.extend(a for a in stack_assets.get(sid, []) if a not in ids)
+                _immich_req(f"/stacks/{sid}", "DELETE")
             st = _immich_req("/stacks", "POST",
                              {"assetIds": [prim] + [i for i in ids if i != prim]})
             # 保险:个别版本不以首元素为封面,显式修正

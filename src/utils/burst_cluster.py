@@ -12,7 +12,10 @@ import cv2
 import numpy as np
 
 GAP_SEC = 15          # 相邻两张间隔超过这个秒数,不再算同一波连拍
-HAMMING_MAX = 11      # 64 位 dHash 距离上限(<=11 视觉上基本相同)
+# 64 位 dHash 距离上限。实测(长白山 2026-07-11):15s 窗内换姿势/微变焦
+# 常落在 12-16,≤11 会把一波连拍切碎成多簇(每簇各留一张→"还是很像");
+# 时间窗内本来就是同场景,视觉闸只需挡"15 秒内转头拍别处"(实测 h≥17)。
+HAMMING_MAX = 16
 
 
 def _decode_gray(img_bytes: bytes):
@@ -50,15 +53,16 @@ def quality(img_bytes: bytes) -> dict:
 
 def split_by_visual(hashes: list[int | None]) -> list[list[int]]:
     """把一个时间组按视觉相似切成若干簇(返回下标簇)。
-    贪心链式:与簇内最后一张距离 <= HAMMING_MAX 即加入(连拍会缓慢漂移,
-    比全簇比对更符合实际)。哈希缺失的照片自成一簇(不参与堆叠)。"""
+    与当前簇**任意成员**距离 <= HAMMING_MAX 即加入 —— 只比最后一张会在
+    中间混入一张偏差照时断链,把同一波连拍切碎(实测教训)。
+    哈希缺失的照片自成一簇(不参与堆叠)。"""
     clusters: list[list[int]] = []
     for i, h in enumerate(hashes):
         if h is not None and clusters:
-            last = clusters[-1]
-            lh = hashes[last[-1]]
-            if lh is not None and hamming(h, lh) <= HAMMING_MAX:
-                last.append(i)
+            members = clusters[-1]
+            if any(hashes[j] is not None and hamming(h, hashes[j]) <= HAMMING_MAX
+                   for j in members):
+                members.append(i)
                 continue
         clusters.append([i])
     return clusters
