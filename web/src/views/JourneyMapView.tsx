@@ -21,6 +21,7 @@ export default function JourneyMapView() {
   const [albumId, setAlbumId] = useState<string>("");
   const [selDays, setSelDays] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<ImItem | null>(null);
+  const [darkMap, setDarkMap] = useState(false);   // 默认原色(压暗被用户否决)
   const mapRef = useRef<L.Map | null>(null);
   const layerRef = useRef<L.LayerGroup | null>(null);
   const boundsRef = useRef<L.LatLngBounds | null>(null);
@@ -159,10 +160,18 @@ export default function JourneyMapView() {
             {noGps > 0 && <span className="text-[10.5px] text-slate-600">{noGps} 项无 GPS 未显示</span>}
           </>
         )}
+        <button
+          className={cn("ml-auto h-7 rounded-full px-2.5 text-[11px] transition-colors",
+            darkMap ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
+          title="暗色氛围模式(默认原色地图)"
+          onClick={() => setDarkMap((v) => !v)}>
+          {darkMap ? "🌙 暗色" : "☀️ 原色"}
+        </button>
       </div>
 
       {/* 地图 */}
-      <div ref={boxRef} className="min-h-0 flex-1 overflow-hidden rounded-2xl ring-1 ring-white/10" />
+      <div ref={boxRef} className={cn("min-h-0 flex-1 overflow-hidden rounded-2xl ring-1 ring-white/10",
+        darkMap && "jm-dark")} />
 
       {/* 灯箱 */}
       {detail && (
@@ -186,7 +195,7 @@ export default function JourneyMapView() {
 
       {/* 瓦片暗色化 + 照片钉样式 */}
       <style>{`
-        .amap-dark { filter: grayscale(35%) brightness(0.62) contrast(1.05) saturate(0.7); }
+        .jm-dark .amap-dark { filter: grayscale(35%) brightness(0.62) contrast(1.05) saturate(0.7); }
         .jm-pin { width: 44px; height: 44px; border-radius: 10px; overflow: hidden;
                   border: 2px solid; box-shadow: 0 2px 10px rgba(0,0,0,.55); background:#0f172a;
                   transition: transform .12s; position: relative; }
