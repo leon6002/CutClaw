@@ -1170,8 +1170,15 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
             except Exception:  # noqa: BLE001
                 _MEDIA_META = {}
         cached = _MEDIA_META.get(file_name)
-        # entries cached before the camera field existed refresh once
-        if cached is not None and "camera" in cached:
+        # entries cached before the camera field existed refresh once;
+        # 裸坐标地名("43.742, 84.420" — Immich 查无此地时代的产物)在配置了
+        # 高德 key 后也刷新一次,换成真地名
+        _stale_coords = (cached is not None
+                         and os.environ.get("AMAP_API_KEY")
+                         and (re.fullmatch(r"-?\d+\.\d+, ?-?\d+\.\d+",
+                                           str(cached.get("location") or "x"))
+                              or str(cached.get("location")) in ("China", "中国")))
+        if cached is not None and "camera" in cached and not _stale_coords:
             return cached
 
     meta: dict = {"capture_time": None, "location": None, "camera": None}
@@ -1189,11 +1196,22 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
         if entry and entry.get("id"):
             info = _immich_req(f"/assets/{entry['id']}", timeout=15)
             ex = info.get("exifInfo") or {}
-            parts = [p for p in (ex.get("city"), ex.get("state") or ex.get("country")) if p]
+            parts = [p for p in (ex.get("city"), ex.get("state")) if p]
             if parts:
                 meta["location"] = " · ".join(dict.fromkeys(parts))
             elif ex.get("latitude") is not None and ex.get("longitude") is not None:
-                meta["location"] = f"{float(ex['latitude']):.3f}, {float(ex['longitude']):.3f}"
+                # Immich 本地地名库查无此地(偏远地区 25km 内无入库聚居点,只剩
+                # country)——高德逆地理兜底(网格缓存,同一片区域只调一次),
+                # 独库公路这类旅拍点位从"中国"变成"乌苏市·赛力克提牧场"
+                try:
+                    from src.utils.amap_geo import reverse_geocode
+                    _geo = reverse_geocode(ex["latitude"], ex["longitude"])
+                except Exception:  # noqa: BLE001
+                    _geo = None
+                meta["location"] = (_geo or {}).get("label") or ex.get("country") or \
+                    f"{float(ex['latitude']):.3f}, {float(ex['longitude']):.3f}"
+            elif ex.get("country"):
+                meta["location"] = ex.get("country")
             make = str(ex.get("make") or "").strip()
             model = str(ex.get("model") or "").strip()
             if model:
@@ -1219,7 +1237,13 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
             if not meta["location"]:
                 m = re.search(r"([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)", out)
                 if m:
-                    meta["location"] = f"{float(m.group(1)):.3f}, {float(m.group(2)):.3f}"
+                    try:
+                        from src.utils.amap_geo import reverse_geocode
+                        _geo = reverse_geocode(float(m.group(1)), float(m.group(2)))
+                    except Exception:  # noqa: BLE001
+                        _geo = None
+                    meta["location"] = (_geo or {}).get("label") or \
+                        f"{float(m.group(1)):.3f}, {float(m.group(2)):.3f}"
             if not meta["camera"]:
                 tags = dict(re.findall(r"TAG:([\w.]+)=(.+)", out))
                 make = (tags.get("com.apple.quicktime.make") or tags.get("make") or "").strip()
