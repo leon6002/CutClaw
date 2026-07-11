@@ -9,6 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { api, mediaUrl, useJob } from "../api";
 import JobLog from "../components/JobLog";
+import RouteIntroPreview from "../components/RouteIntroPreview";
 import { ShotTimeline, type BeatMark } from "../components/Charts";
 import { ActiveClipCard, ClipCaption, ClipInspector, activeClipAt, useClipMap } from "../components/ClipInspector";
 import type { PipelineStatus, ProjectState } from "../App";
@@ -54,6 +55,7 @@ export default function RenderView({
   const [fades, setFades] = useState(true);
   const [routeIntro, setRouteIntro] = useState(true);
   const [routeInfo, setRouteInfo] = useState<any>(null);
+  const [routePanel, setRoutePanel] = useState(false);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
@@ -413,17 +415,29 @@ export default function RenderView({
                   淡入淡出收尾
                 </label>
                 <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400"
-                  title="用素材的真实 GPS 轨迹生成一段极简路线动画,自动前置为第一个镜头;项目素材没有 GPS 时静默跳过">
+                  title="用素材的真实 GPS 轨迹生成一段路线动画(高德底图),自动前置为第一个镜头;项目素材没有 GPS 时静默跳过">
                   <Checkbox checked={routeIntro} onCheckedChange={(v) => setRouteIntro(v === true)} />
                   🗺 旅程轨迹开场
                   <span className="text-[10px] text-slate-600">
                     {routeInfo === null ? "(检测中…)"
                       : routeInfo.available
-                        ? `(${routeInfo.start_label || "?"} → ${routeInfo.end_label || "?"} · ${routeInfo.total_km} km · ${routeInfo.points} 点)`
+                        ? `(${routeInfo.start_label || "?"} → ${routeInfo.end_label || "?"} · ${routeInfo.total_km} km)`
                         : "(无 GPS 数据,将跳过)"}
                   </span>
+                  {routeInfo?.available && (
+                    <button className="rounded-md bg-cyan-500/[0.12] px-2 py-0.5 text-[10.5px] text-cyan-300 transition-colors hover:bg-cyan-500/20"
+                      onClick={(e) => { e.preventDefault(); setRoutePanel((v) => !v); }}>
+                      {routePanel ? "收起预览" : "调整预览"}
+                    </button>
+                  )}
                 </label>
               </div>
+
+              {routePanel && routeInfo?.available && (
+                <div className="mb-4 rounded-xl border border-cyan-500/15 bg-cyan-500/[0.03] p-3">
+                  <RouteIntroPreview shotPoint={shotPoint} />
+                </div>
+              )}
 
               <div className="mb-4 flex flex-wrap items-center gap-2.5 text-[13px] text-slate-300">
                 <span>片头字幕</span>

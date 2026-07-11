@@ -22,7 +22,8 @@ _SIZES = {"9:16": (720, 1280), "16:9": (1280, 720), "1:1": (960, 960)}
 _BG = (11, 15, 26)
 _PATH = (125, 211, 252)
 _FPS = 30
-_DUR = 7.0                  # 用户反馈 4.2s "一下就没了" → 放慢
+_DUR = 10.0                 # 默认时长(7s 仍被反馈太快);预览面板可调
+_BRIGHT = 0.62              # 底图亮度(0.42 被反馈太暗);预览面板可调
 _CANVAS = 2048              # 底图/抽象画布统一尺寸(1024*1024@scale2)
 
 
@@ -42,9 +43,9 @@ def _smoothstep(x: float) -> float:
     return x * x * (3 - 2 * x)
 
 
-def _fullpx(route: dict) -> list[tuple]:
-    """轨迹点 → 2048 画布像素坐标。有底图走 GCJ-02+mercator 对位;
-    没有则抽象投影(等距圆柱 + 居中适配)。"""
+def _projector(route: dict):
+    """返回 geo→2048 画布坐标的投影函数(轨迹点和冒泡照片共用)。
+    有底图走 GCJ-02+mercator 对位;没有则抽象投影(等距圆柱居中适配)。"""
     pts = route.get("points") or []
     m = route.get("map") or {}
     if m.get("center") and m.get("zoom"):
@@ -64,20 +65,38 @@ def _fullpx(route: dict) -> list[tuple]:
             return ((ln + 180) / 360 * n,
                     (1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2 * n)
         c_x, c_y = merc(m["center"][1], m["center"][0])
-        out = []
-        for p in pts:
-            gla, gln = _gcj(p["lat"], p["lon"])
-            x, y = merc(gla, gln)
-            out.append((x - c_x + _CANVAS / 2, y - c_y + _CANVAS / 2))
-        return out
+
+        def proj(lat: float, lon: float):
+            x, y = merc(*_gcj(lat, lon))
+            return (x - c_x + _CANVAS / 2, y - c_y + _CANVAS / 2)
+        return proj
     # 抽象模式
     mid = math.radians(sum(p["lat"] for p in pts) / len(pts))
     xs = [p["lon"] * math.cos(mid) for p in pts]
     ys = [p["lat"] for p in pts]
     x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
     s = _CANVAS * 0.52 / max(x1 - x0, y1 - y0, 1e-9)
-    return [((x - (x0 + x1) / 2) * s + _CANVAS / 2,
-             _CANVAS / 2 - (y - (y0 + y1) / 2) * s) for x, y in zip(xs, ys)]
+
+    def proj(lat: float, lon: float):
+        return ((lon * math.cos(mid) - (x0 + x1) / 2) * s + _CANVAS / 2,
+                _CANVAS / 2 - (lat - (y0 + y1) / 2) * s)
+    return proj
+
+
+def _make_polaroid(thumb_path: str, size: int, rot: float) -> Image.Image | None:
+    """冒泡照片:方形裁剪 + 白框拍立得 + 轻微旋转,预生成 RGBA 贴纸。"""
+    try:
+        im = Image.open(thumb_path).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+    s = min(im.size)
+    im = im.crop(((im.width - s) // 2, (im.height - s) // 2,
+                  (im.width + s) // 2, (im.height + s) // 2)) \
+        .resize((size, size), Image.LANCZOS)
+    b = max(3, size // 22)
+    card = Image.new("RGBA", (size + 2 * b, size + 2 * b), (248, 248, 246, 255))
+    card.paste(im, (b, b))
+    return card.rotate(rot, expand=True, resample=Image.BICUBIC)
 
 
 def _resample(pts: list[tuple], n: int = 260) -> list[tuple]:
@@ -99,18 +118,18 @@ def _resample(pts: list[tuple], n: int = 260) -> list[tuple]:
     return out
 
 
-def _prep_canvas(route: dict) -> Image.Image:
+def _prep_canvas(route: dict, brightness: float = _BRIGHT) -> Image.Image:
     """2048 底板:真实底图做电影化处理;否则暗色画布 + 淡网格。"""
     m = route.get("map") or {}
     if m.get("image") and os.path.exists(m["image"]):
         img = Image.open(m["image"]).convert("RGB")
         if img.size != (_CANVAS, _CANVAS):
             img = img.resize((_CANVAS, _CANVAS), Image.BILINEAR)
-        img = ImageEnhance.Color(img).enhance(0.22)        # 退饱和
-        img = ImageEnhance.Brightness(img).enhance(0.42)   # 压暗
+        img = ImageEnhance.Color(img).enhance(0.28)        # 退饱和
+        img = ImageEnhance.Brightness(img).enhance(brightness)
         arr = np.asarray(img).astype(np.float32)
-        arr[..., 2] = np.clip(arr[..., 2] * 1.22 + 10, 0, 255)   # 蓝移
-        arr[..., 0] *= 0.88
+        arr[..., 2] = np.clip(arr[..., 2] * 1.18 + 8, 0, 255)   # 蓝移
+        arr[..., 0] *= 0.90
         return Image.fromarray(arr.astype(np.uint8))
     img = Image.new("RGB", (_CANVAS, _CANVAS), _BG)
     d = ImageDraw.Draw(img)
@@ -133,6 +152,12 @@ def render_route_intro(route_json: str, out_mp4: str, ratio: str = "16:9",
         route = json.load(f)
     if len(route.get("points") or []) < 2:
         raise ValueError("route needs >= 2 GPS points")
+    style = route.get("style") or {}
+    if duration is None:
+        try:
+            duration = float(style.get("duration") or 0) or None
+        except Exception:  # noqa: BLE001
+            duration = None
     if duration is None:
         try:
             _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -142,9 +167,16 @@ def render_route_intro(route_json: str, out_mp4: str, ratio: str = "16:9",
             duration = float(getattr(_cfg, "ROUTE_INTRO_DURATION_SEC", _DUR))
         except Exception:  # noqa: BLE001
             duration = _DUR
+    duration = max(4.0, min(20.0, float(duration)))
+    try:
+        brightness = max(0.2, min(1.2, float(style.get("map_brightness") or _BRIGHT)))
+    except Exception:  # noqa: BLE001
+        brightness = _BRIGHT
+    bubbles_on = bool(style.get("bubbles", True))
     w, h = _SIZES.get(ratio, _SIZES["16:9"])
 
-    raw = _fullpx(route)
+    proj = _projector(route)
+    raw = [proj(p["lat"], p["lon"]) for p in route["points"]]
     if len(raw) >= 5:                    # 轻度平滑去 GPS 抖动
         raw = [(sum(p[0] for p in raw[max(0, i - 2):i + 3]) / len(raw[max(0, i - 2):i + 3]),
                 sum(p[1] for p in raw[max(0, i - 2):i + 3]) / len(raw[max(0, i - 2):i + 3]))
@@ -163,8 +195,24 @@ def render_route_intro(route_json: str, out_mp4: str, ratio: str = "16:9",
     f_ = min(_CANVAS / cw0, _CANVAS / ch0, 1.0)
     cw0, ch0 = cw0 * f_, ch0 * f_
 
-    canvas = _prep_canvas(route)
+    canvas = _prep_canvas(route, brightness)
     vig = _vignette(w, h)
+
+    # 冒泡照片:预生成拍立得贴纸,head 走到对应弧长位置时弹出
+    bubbles: list[dict] = []
+    _excl = set(style.get("bubble_exclude") or [])
+    if bubbles_on:
+        for k, b in enumerate(x for x in (route.get("bubbles") or [])
+                               if x.get("id") not in _excl):
+            spr = _make_polaroid(str(b.get("thumb") or ""), int(h * 0.13),
+                                 -6 if k % 2 else 6)
+            if spr is None:
+                continue
+            bpx = proj(b["lat"], b["lon"])
+            near = min(range(len(path)),
+                       key=lambda j: (path[j][0] - bpx[0]) ** 2 + (path[j][1] - bpx[1]) ** 2)
+            bubbles.append({"px": bpx, "frac": min(near / max(1, len(path) - 1), 0.985),
+                            "spr": spr, "side": k % 2, "born": None})
 
     f_small = _font(max(14, int(h * 0.026)))
     start_label = str(route.get("start_label") or "").strip()
@@ -246,6 +294,25 @@ def render_route_intro(route_json: str, out_mp4: str, ratio: str = "16:9",
                            fill=(255, 255, 255, 255))
                 dr.ellipse([e0[0] - 11, e0[1] - 11, e0[0] + 11, e0[1] + 11],
                            outline=(255, 255, 255, 90), width=2)
+
+            # 冒泡照片:head 经过即弹出(0.5s 过冲缩放),之后常驻
+            for bb in bubbles:
+                if bb["born"] is None and p >= bb["frac"]:
+                    bb["born"] = t
+                if bb["born"] is None:
+                    continue
+                x_ = min(1.0, (t - bb["born"]) / 0.5)
+                s_ = _smoothstep(x_) * (1 + 0.16 * (1 - x_))
+                spr = bb["spr"]
+                sw2 = max(2, int(spr.width * s_))
+                sh2 = max(2, int(spr.height * s_))
+                bx, by = T(bb["px"])
+                dr.ellipse([bx - 3, by - 3, bx + 3, by + 3], fill=(255, 255, 255, 230))
+                ox = 16 if bb["side"] else -16 - sw2
+                pos = (int(min(max(bx + ox, 4), w - sw2 - 4)),
+                       int(min(max(by - sh2 - 10, 4), h - sh2 - 4)))
+                spr2 = spr if x_ >= 1.0 else spr.resize((sw2, sh2), Image.BILINEAR)
+                ov.alpha_composite(spr2, pos)
 
             ta = _smoothstep((t - text_t0) / 0.7)
             if ta > 0 and title:

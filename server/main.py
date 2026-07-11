@@ -4591,7 +4591,7 @@ def _fetch_route_basemap(points: list, out_png: str) -> dict | None:
         return None
     import math as _m
     from src.utils.amap_geo import _wgs84_to_gcj02
-    g = [_wgs84_to_gcj02(la, ln) for _t, la, ln in points]
+    g = [_wgs84_to_gcj02(p[1], p[2]) for p in points]   # 兼容 3/5 元组
 
     def _merc(lat: float, lng: float, z: int):
         n = 256 * (2 ** z) * 2          # scale=2 像素坐标
@@ -4607,6 +4607,9 @@ def _fetch_route_basemap(points: list, out_png: str) -> dict | None:
         if max(xs) - min(xs) <= 2048 * 0.45 and max(ys) - min(ys) <= 2048 * 0.45:
             break
         zoom -= 1
+    meta = {"center": [round(clng, 6), round(clat, 6)], "zoom": zoom, "px": 2048}
+    if os.path.exists(out_png) and os.path.getsize(out_png) > 10000:
+        return meta                     # 已有图零调用(center/zoom 由点集确定)
     url = (f"https://restapi.amap.com/v3/staticmap?key={key}"
            f"&location={clng:.6f},{clat:.6f}&zoom={zoom}&size=1024*1024&scale=2")
     import urllib.request
@@ -4617,7 +4620,7 @@ def _fetch_route_basemap(points: list, out_png: str) -> dict | None:
         return None                     # 高德返回错误 JSON(配额/参数)
     with open(out_png, "wb") as f:
         f.write(data)
-    return {"center": [round(clng, 6), round(clat, 6)], "zoom": zoom, "px": 2048}
+    return meta
 
 
 def _build_route_data(shot_point_path: str) -> str | None:
@@ -4630,19 +4633,8 @@ def _build_route_data(shot_point_path: str) -> str | None:
         if os.path.exists(out_path) and time.time() - os.path.getmtime(out_path) < 86400:
             with open(out_path, encoding="utf-8") as f:
                 d = json.load(f)
-            if len(d.get("points") or []) >= 2:
-                # 老缓存补底图(此前没 key / 版本没这功能)
-                if not (d.get("map") or {}).get("image") \
-                        or not os.path.exists((d.get("map") or {}).get("image", "")):
-                    try:
-                        _pts = [(None, p["lat"], p["lon"]) for p in d["points"]]
-                        mm = _fetch_route_basemap(_pts, map_png)
-                        if mm:
-                            d["map"] = {"image": map_png, **mm}
-                            with open(out_path, "w", encoding="utf-8") as f:
-                                json.dump(d, f, ensure_ascii=False, indent=1)
-                    except Exception:  # noqa: BLE001
-                        pass
+            # "bubbles" 是新版字段:老缓存缺它就走完整重建(底图文件在则零调用)
+            if len(d.get("points") or []) >= 2 and "bubbles" in d:
                 return out_path
     except Exception:  # noqa: BLE001
         pass
@@ -4704,7 +4696,9 @@ def _build_route_data(shot_point_path: str) -> str | None:
                             or it.get("fileCreatedAt"))
             if t is None or t.date() not in days:
                 continue
-            pts.append((t, float(ex["latitude"]), float(ex["longitude"])))
+            pts.append((t, float(ex["latitude"]), float(ex["longitude"]),
+                        it.get("id"), it.get("type"),
+                        bool(it.get("isFavorite")) or (ex.get("rating") or 0) >= 4))
         nxt = a.get("nextPage")
         if not nxt:
             break
@@ -4713,8 +4707,9 @@ def _build_route_data(shot_point_path: str) -> str | None:
         return None
     pts.sort(key=lambda x: x[0])
     thin = [pts[0]]
-    for t, la, ln in pts[1:]:
-        pt, pla, plo = thin[-1]
+    for p in pts[1:]:
+        t, la, ln = p[0], p[1], p[2]
+        pt, pla, plo = thin[-1][0], thin[-1][1], thin[-1][2]
         dt = (t - pt).total_seconds()
         dk = _haversine_km(pla, plo, la, ln)
         # GPS 瞬移离群点(隐含时速 >160km/h):手机缓存位/信号漂移,
@@ -4722,7 +4717,7 @@ def _build_route_data(shot_point_path: str) -> str | None:
         if dt > 0 and dk / (dt / 3600.0) > 160:
             continue
         if dt >= 60 or dk >= 0.2:
-            thin.append((t, la, ln))
+            thin.append(p)
     if len(thin) > 400:
         step = len(thin) / 400.0
         thin = [thin[int(i * step)] for i in range(400)]
@@ -4739,8 +4734,8 @@ def _build_route_data(shot_point_path: str) -> str | None:
             return ""
     d0, d1 = thin[0][0], thin[-1][0]
     data = {
-        "points": [{"t": t.isoformat(), "lat": round(la, 6), "lon": round(ln, 6)}
-                   for t, la, ln in thin],
+        "points": [{"t": p[0].isoformat(), "lat": round(p[1], 6), "lon": round(p[2], 6)}
+                   for p in thin],
         "start_label": _label(thin[0][1], thin[0][2]),
         "end_label": _label(thin[-1][1], thin[-1][2]),
         "date_range": d0.strftime("%Y.%m.%d")
@@ -4748,6 +4743,71 @@ def _build_route_data(shot_point_path: str) -> str | None:
         "total_km": round(km, 1),
         "days": len(days),
     }
+    # 冒泡照片:按累计里程等距挑 ≤6 张照片(视频封面也行但照片优先),
+    # 动画头走到该处时弹出;缩略图此刻就落到本地缓存(渲染子进程直读文件)
+    bubbles: list = []
+    try:
+        cum = [0.0]
+        for a, b in zip(thin, thin[1:]):
+            cum.append(cum[-1] + _haversine_km(a[1], a[2], b[1], b[2]))
+        total = cum[-1] or 1.0
+        used: set = set()
+        try:
+            _bscores = _photo_scores_load()
+        except Exception:  # noqa: BLE001
+            _bscores = {}
+
+        def _btier(i: int) -> int:
+            """同路段内的优先级:红心/S-A-B 评分 > 未评 > C-D(废片自动靠后)。"""
+            if len(thin[i]) > 5 and thin[i][5]:
+                return 0
+            g = str((_bscores.get(thin[i][3]) or {}).get("grade") or "")
+            return 0 if g in ("S", "A", "B") else (3 if g in ("C", "D") else 1)
+        for k in range(6):
+            wfrac = k / 5.0
+            # 同一路段(5% 里程桶)内按 _btier 优先 —— 就近取第一张会捞到
+            # 文件翻拍这类"废片"(实测);算法认不出内容,还配了预览面板手动剔除
+            cand = [(round(abs(cum[i] / total - wfrac) * 20), _btier(i),
+                     abs(cum[i] / total - wfrac), i)
+                    for i in range(len(thin))
+                    if thin[i][3] and i not in used
+                    and (thin[i][4] == "IMAGE" or k in (0, 5))]
+            picked = None
+            for _key in sorted(cand)[:8]:
+                i = _key[3]
+                used.add(i)
+                try:
+                    tp = _thumb_path(thin[i][3], small=True)
+                    # 白纸观感(亮度极高+饱和度极低)= 文档/收据/截图翻拍,
+                    # 不配上地图(实测起点段捞到一张酒店单据)
+                    import numpy as _np
+                    from PIL import Image as _Im
+                    _a = _np.asarray(_Im.open(tp).convert("RGB").resize((64, 64)),
+                                     dtype=_np.float32)
+                    if _a.mean() > 185 and (_a.max(-1) - _a.min(-1)).mean() < 30:
+                        continue
+                    picked = (i, tp)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not picked:
+                continue
+            i, tp = picked
+            bubbles.append({"id": thin[i][3], "lat": round(thin[i][1], 6),
+                            "lon": round(thin[i][2], 6), "thumb": tp})
+        seen: set = set()
+        bubbles = [b for b in bubbles if not (b["id"] in seen or seen.add(b["id"]))]
+    except Exception:  # noqa: BLE001
+        bubbles = []
+    data["bubbles"] = bubbles
+    # 保留用户在预览面板里调好的样式参数
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            _old_style = (json.load(f)).get("style") or {}
+        if _old_style:
+            data["style"] = _old_style
+    except Exception:  # noqa: BLE001
+        pass
     try:
         mm = _fetch_route_basemap(thin, map_png)
         if mm:
@@ -4770,6 +4830,64 @@ def render_route_data(shot_point: str):
     return {"available": True, "points": len(d.get("points") or []),
             "total_km": d.get("total_km"), "start_label": d.get("start_label"),
             "end_label": d.get("end_label"), "date_range": d.get("date_range")}
+
+
+@app.get("/api/render/route_full")
+def render_route_full(shot_point: str):
+    """完整路线数据(网页预览面板用):点集 + 底图 URL + 冒泡缩略图 URL + 样式。"""
+    p = _build_route_data(_resolve(shot_point))
+    if not p:
+        raise HTTPException(404, "该项目没有可用的 GPS 轨迹数据")
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    import urllib.parse
+    m = d.get("map") or {}
+    q = urllib.parse.quote(shot_point)
+    return {
+        "points": d.get("points") or [],
+        "start_label": d.get("start_label"), "end_label": d.get("end_label"),
+        "date_range": d.get("date_range"), "total_km": d.get("total_km"),
+        "map": ({"url": f"/api/render/route_map?shot_point={q}",
+                 "center": m.get("center"), "zoom": m.get("zoom"), "px": m.get("px")}
+                if m.get("image") and os.path.exists(m["image"]) else None),
+        "bubbles": [{"id": b["id"], "lat": b["lat"], "lon": b["lon"],
+                     "thumb_url": f"/api/immich/thumb/{b['id']}?size=thumbnail"}
+                    for b in (d.get("bubbles") or [])],
+        "style": d.get("style") or {},
+    }
+
+
+@app.get("/api/render/route_map")
+def render_route_map(shot_point: str):
+    sp = _resolve(shot_point)
+    mp = os.path.join(os.path.dirname(sp), "route_map.png")
+    if not os.path.exists(mp):
+        raise HTTPException(404, "no basemap")
+    return FileResponse(mp, media_type="image/png")
+
+
+class RouteStyleRequest(BaseModel):
+    shot_point: str
+    style: dict = {}       # {duration, map_brightness, bubbles}
+
+
+@app.post("/api/render/route_style")
+def render_route_style(body: RouteStyleRequest):
+    """预览面板保存样式参数 → 写进 route_intro.json,正式渲染读同一份(所见即所得)。"""
+    sp = _resolve(body.shot_point)
+    p = os.path.join(os.path.dirname(sp), "route_intro.json")
+    if not os.path.exists(p):
+        raise HTTPException(404, "route_intro.json 不存在,先打开一次预览")
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    st = d.get("style") or {}
+    for k in ("duration", "map_brightness", "bubbles", "bubble_exclude"):
+        if k in body.style:
+            st[k] = body.style[k]
+    d["style"] = st
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    return {"ok": True, "style": st}
 
 
 class RenderRequest(BaseModel):
