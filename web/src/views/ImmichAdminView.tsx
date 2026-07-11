@@ -4,7 +4,7 @@
 import { Component, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDownUp, ArrowLeft, Check, ChevronLeft, ChevronRight, Copy,
-  ExternalLink, Heart, Loader2, MapPin, Search, Sparkles, X,
+  ExternalLink, Heart, Layers, Loader2, MapPin, Search, Sparkles, X,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -30,17 +30,20 @@ const dayLabel = (iso: string) => {
 
 const FILTERS = [
   ["all", "全部"], ["image", "照片"], ["video", "视频"],
-  ["nogps", "无 GPS"], ["nogeo", "未写地名"], ["unscored", "未评分"],
+  ["nogps", "无 GPS"], ["nogeo", "未写地名"], ["unscored", "未评分"], ["stacked", "堆叠子项"],
 ] as const;
 type FilterKey = typeof FILTERS[number][0];
 const applyFilter = (items: ImItem[], f: FilterKey) => {
+  // 堆叠子项默认从时间线隐藏(与 Immich 行为一致),专用筛选片可查看
+  if (f === "stacked") return items.filter((m) => m.stack_child);
+  const base = items.filter((m) => !m.stack_child);
   switch (f) {
-    case "image": return items.filter((m) => m.type === "IMAGE");
-    case "video": return items.filter((m) => m.type === "VIDEO");
-    case "nogps": return items.filter((m) => !m.has_gps);
-    case "nogeo": return items.filter((m) => m.has_gps && !m.geo_done);
-    case "unscored": return items.filter((m) => !m.score_done);
-    default: return items;
+    case "image": return base.filter((m) => m.type === "IMAGE");
+    case "video": return base.filter((m) => m.type === "VIDEO");
+    case "nogps": return base.filter((m) => !m.has_gps);
+    case "nogeo": return base.filter((m) => m.has_gps && !m.geo_done);
+    case "unscored": return base.filter((m) => !m.score_done);
+    default: return base;
   }
 };
 
@@ -72,6 +75,12 @@ const Tile = memo(function Tile({ m, on, onOpen, onCheck }: {
         </span>
       )}
       {m.favorite && <Heart className="absolute bottom-1 left-1.5 h-3 w-3 fill-rose-400 text-rose-400" />}
+      {(m.stack_count ?? 0) > 1 && (
+        <span className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded bg-black/65 px-1 py-px text-[9px] font-medium tabular-nums text-white/90"
+          title={`堆叠封面(共 ${m.stack_count} 张)`}>
+          <Layers className="h-2.5 w-2.5" />{m.stack_count}
+        </span>
+      )}
       <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-end gap-1 bg-gradient-to-b from-black/55 to-transparent px-1.5 pb-4 pt-1 opacity-0 transition-opacity group-hover:opacity-100">
         <span className="mr-auto pl-6 text-[9.5px] tabular-nums text-white/75">{fmtTime(m.taken_at).slice(11)}</span>
         {(m.rating ?? 0) > 0 && <span className="text-[9px] text-amber-300">★{m.rating}</span>}
@@ -119,6 +128,24 @@ function Inner() {
   const [err, setErr] = useState("");
   const lastClick = useRef<string | null>(null);
 
+  // 相似整理(§20):连拍聚类结果 + 每簇封面改选 + 跳过标记
+  const [simMode, setSimMode] = useState(false);
+  const [sim, setSim] = useState<any>(null);
+  const [simWinners, setSimWinners] = useState<Record<string, string>>({});
+  const [simSkip, setSimSkip] = useState<Set<string>>(new Set());
+  const simModeRef = useRef(false);
+  simModeRef.current = simMode;
+  const fetchSim = useCallback(async (id: string) => {
+    try {
+      const r = await api<any>(`/api/immich/mgmt/similar/${id}`);
+      setSim(r);
+      const w: Record<string, string> = {};
+      for (const c of r.clusters ?? []) w[c.key] = c.winner;
+      setSimWinners(w);
+      setSimSkip(new Set());
+    } catch (e: any) { setErr(e.message); }
+  }, []);
+
   // 首载:相簿列表(缓存新鲜则零请求);恢复上次浏览的相簿
   useEffect(() => {
     loadAlbums();
@@ -127,6 +154,7 @@ function Inner() {
 
   const enterAlbum = (id: string) => {
     openAlbum(id); setSel(new Set()); setFilter("all"); lastClick.current = null;
+    setSimMode(false); setSim(null);
     loadItems(id);              // 有缓存秒开,过期后台刷新
   };
 
@@ -208,6 +236,7 @@ function Inner() {
           window.clearInterval(t);
           if (currentAlbumId) loadItems(currentAlbumId, true);
           if (detailId) openDetail(detailId);
+          if (simModeRef.current && currentAlbumId) fetchSim(currentAlbumId);
         }
       } catch { /* keep */ }
     }, 2500);
@@ -230,6 +259,35 @@ function Inner() {
     `对 ${ids.length} 个无 GPS 资产按时间轴推测坐标?\n取前后 90 分钟内带 GPS 的邻居照片插值,写回 Immich;已有 GPS 的自动跳过。`);
 
   const shownAlbums = albums.filter((a) => !wallQuery || a.name.toLowerCase().includes(wallQuery.toLowerCase()));
+
+  // ── 相似整理:分析发起 / 堆叠应用 ──
+  const idMap = useMemo(() => new Map(items.map((m) => [m.id, m])), [items]);
+  const simPending = ((sim?.clusters ?? []) as any[]).filter((c) => !c.applied);
+  const simApplied = ((sim?.clusters ?? []) as any[]).length - simPending.length;
+  const simActive = simPending.filter((c) => !simSkip.has(c.key));
+
+  const runAnalyze = async () => {
+    if (!album) return;
+    setErr("");
+    try {
+      await api("/api/immich/mgmt/similar/analyze", { method: "POST", body: JSON.stringify({ album_id: album.id }) });
+      setTask({ running: true, done: 0, total: 0 });
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  const applyStacks = async () => {
+    if (!album || !simActive.length) return;
+    const groups = simActive.map((c) => ({ key: c.key, primary: simWinners[c.key] ?? c.winner, ids: c.ids }));
+    const hide = groups.reduce((a, g) => a + g.ids.length - 1, 0);
+    if (!window.confirm(`把 ${groups.length} 簇相似照片堆叠?\n时间线将只显示每簇封面,其余 ${hide} 张收进堆叠。\n不删除任何照片,可随时在 Immich 中解除堆叠。`)) return;
+    setErr("");
+    try {
+      const r = await api<any>("/api/immich/mgmt/stack", { method: "POST", body: JSON.stringify({ album_id: album.id, groups }) });
+      setTask({ running: false, result: { 已堆叠: r.stacked, 失败: r.failed } });
+      fetchSim(album.id);
+      loadItems(album.id, true);
+    } catch (e: any) { setErr(e.message); }
+  };
 
   return (
     <div className="select-none">
@@ -291,13 +349,108 @@ function Inner() {
               </div>
             </div>
             <button
-              className="ml-auto flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-white"
+              className={cn("ml-auto flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] transition-colors",
+                simMode ? "bg-cyan-500/20 font-medium text-cyan-200" : "text-slate-400 hover:bg-white/[0.06] hover:text-white")}
+              title="连拍相似照片聚类,选出最佳一张做堆叠封面(本地算法,免费)"
+              onClick={() => { const next = !simMode; setSimMode(next); setSel(new Set()); if (next) fetchSim(album.id); }}>
+              <Layers className="h-3.5 w-3.5" /> 相似整理
+            </button>
+            <button
+              className="flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] text-slate-400 transition-colors hover:bg-white/[0.06] hover:text-white"
               onClick={() => setDesc((v) => !v)}>
               <ArrowDownUp className="h-3.5 w-3.5" /> {desc ? "最新在前" : "最早在前"}
             </button>
           </div>
 
+          {/* ══ 相似整理模式 ══ */}
+          {simMode && (
+            <div className="pb-24">
+              {!sim ? (
+                <div className="py-16 text-center"><Loader2 className="mx-auto h-5 w-5 animate-spin text-slate-500" /></div>
+              ) : !sim.ts ? (
+                <div className="rounded-2xl border border-white/[0.06] bg-white/[0.02] px-6 py-12 text-center">
+                  <Layers className="mx-auto mb-3 h-8 w-8 text-slate-600" />
+                  <div className="text-[14px] font-medium text-slate-200">分析连拍相似照片</div>
+                  <div className="mx-auto mt-1.5 max-w-md text-[12px] leading-relaxed text-slate-500">
+                    拍摄间隔 ≤15 秒且画面相似的照片聚成一簇,按清晰度选出最佳一张做堆叠封面。
+                    纯本地算法,不调用任何付费 API。堆叠不删除照片,可随时在 Immich 中解除。
+                  </div>
+                  <button
+                    className="mt-5 h-9 rounded-full bg-cyan-500/20 px-5 text-[12.5px] font-medium text-cyan-200 transition-colors hover:bg-cyan-500/30 disabled:opacity-40"
+                    disabled={!!task?.running} onClick={runAnalyze}>
+                    开始分析(免费)
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-slate-500">
+                    <span>分析于 {String(sim.ts).replace("T", " ").slice(0, 16)}</span>
+                    <span className="text-slate-300">{simPending.length} 簇待整理</span>
+                    {simApplied > 0 && <span className="text-emerald-400/80">{simApplied} 簇已堆叠</span>}
+                    <button className="text-cyan-500 hover:underline disabled:opacity-40" disabled={!!task?.running} onClick={runAnalyze}>重新分析</button>
+                    <span className="text-slate-600">点缩略图换封面 · 双击看大图</span>
+                  </div>
+                  {simPending.length === 0 && (
+                    <div className="py-12 text-center text-[13px] text-slate-500">没有待整理的相似簇 🎉</div>
+                  )}
+                  {simPending.map((c: any) => {
+                    const skipped = simSkip.has(c.key);
+                    const winId = simWinners[c.key] ?? c.winner;
+                    return (
+                      <section key={c.key}
+                        className={cn("mb-4 rounded-xl border p-3 transition-opacity",
+                          skipped ? "border-white/[0.04] opacity-40" : "border-white/[0.07] bg-white/[0.02]")}
+                        style={{ contentVisibility: "auto", containIntrinsicSize: "auto 160px" } as any}>
+                        <div className="mb-2 flex items-center gap-2.5 text-[11.5px] text-slate-500">
+                          <span className="tabular-nums">{c.time}</span>
+                          <span>{c.ids.length} 张</span>
+                          <button className="ml-auto transition-colors hover:text-cyan-300"
+                            onClick={() => setSimSkip((s) => { const n = new Set(s); n.has(c.key) ? n.delete(c.key) : n.add(c.key); return n; })}>
+                            {skipped ? "恢复此簇" : "跳过此簇"}
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {c.ids.map((id: string) => {
+                            const m = idMap.get(id);
+                            const win = winId === id;
+                            return (
+                              <button key={id}
+                                className={cn("relative h-28 w-28 shrink-0 overflow-hidden rounded-lg bg-slate-900",
+                                  win ? "ring-2 ring-cyan-400" : "opacity-75 hover:opacity-100")}
+                                onClick={() => setSimWinners((w) => ({ ...w, [c.key]: id }))}
+                                onDoubleClick={() => openDetail(id)}>
+                                {m && <img src={m.thumb} className="h-full w-full object-cover" loading="lazy" decoding="async" />}
+                                {win && <span className="absolute left-1 top-1 rounded bg-cyan-400 px-1 py-px text-[9px] font-semibold text-slate-950">封面</span>}
+                                {m?.favorite && <Heart className="absolute right-1 top-1 h-3 w-3 fill-rose-400 text-rose-400" />}
+                                <span className="absolute inset-x-0 bottom-0 bg-black/55 px-1 py-px text-left text-[9px] tabular-nums text-white/80">
+                                  清晰 {c.metrics?.[id]?.sharp ?? "—"}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          )}
+          {simMode && simActive.length > 0 && (
+            <div className="fixed bottom-6 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full border border-white/10 bg-slate-950/90 py-1.5 pl-5 pr-2 shadow-[0_8px_32px_rgba(0,0,0,0.6)] backdrop-blur-xl">
+              <span className="text-[12.5px] text-slate-300">
+                {simActive.length} 簇 · 收纳 {simActive.reduce((a: number, c: any) => a + c.ids.length - 1, 0)} 张
+              </span>
+              <button
+                className="flex h-8 items-center gap-1.5 rounded-full bg-cyan-500/20 px-4 text-[12.5px] font-medium text-cyan-200 transition-colors hover:bg-cyan-500/30 disabled:opacity-40"
+                disabled={!!task?.running} onClick={applyStacks}>
+                <Layers className="h-3.5 w-3.5" /> 应用堆叠
+              </button>
+            </div>
+          )}
+
           {/* 筛选片 */}
+          {!simMode && (<>
           <div className="mb-3 flex flex-wrap gap-1.5">
             {FILTERS.map(([k, label]) => (
               <button key={k}
@@ -346,6 +499,7 @@ function Inner() {
               </section>
             );
           })}
+          </>)}
         </div>
       )}
 

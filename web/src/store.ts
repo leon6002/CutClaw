@@ -33,6 +33,7 @@ export type ImItem = {
   id: string; name: string; type: string; taken_at: string; thumb: string;
   duration?: any; rating?: number; favorite?: boolean; has_gps?: boolean;
   city?: string; geo_done?: boolean; score_done?: boolean; size_mb?: number;
+  stack_child?: boolean; stack_count?: number;
 };
 
 type ImmichState = {

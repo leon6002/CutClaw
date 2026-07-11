@@ -760,21 +760,27 @@ def immich_album_assets(album_id: str):
             "total": int(al.get("assetCount") or 0), "videos": len(items)}
 
 
-@app.get("/api/immich/thumb/{asset_id}")
-def immich_thumb(asset_id: str, size: str = "preview"):
-    """size=thumbnail(~250px webp,网格用)| preview(~1440px,灯箱用)。
-    网格 500 格若加载 preview 大图,解码+显存开销是页面卡顿主因之一。"""
+def _thumb_path(asset_id: str, small: bool = False) -> str:
+    """磁盘缓存的 Immich 缩略图路径(缺失时现拉现存)。small=~250px webp。"""
     tdir = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_thumbs")
     os.makedirs(tdir, exist_ok=True)
     safe = "".join(c for c in asset_id if c.isalnum() or c == "-")
-    small = size == "thumbnail"
     tp = os.path.join(tdir, f"{safe}_t.webp" if small else f"{safe}.jpg")
     if not os.path.exists(tp):
         data = _immich_req(
             f"/assets/{safe}/thumbnail?size={'thumbnail' if small else 'preview'}", raw=True)
         with open(tp, "wb") as f:
             f.write(data)
-    return FileResponse(tp, media_type="image/webp" if small else "image/jpeg")
+    return tp
+
+
+@app.get("/api/immich/thumb/{asset_id}")
+def immich_thumb(asset_id: str, size: str = "preview"):
+    """size=thumbnail(~250px webp,网格用)| preview(~1440px,灯箱用)。
+    网格 500 格若加载 preview 大图,解码+显存开销是页面卡顿主因之一。"""
+    small = size == "thumbnail"
+    return FileResponse(_thumb_path(asset_id, small),
+                        media_type="image/webp" if small else "image/jpeg")
 
 
 # ── Immich 库管理页(§19):地名/评分回填,逐个细看 + 批量操作 ─────────────
@@ -785,7 +791,12 @@ _GEO_MARK = "📍 高德定位"
 def _mgmt_slim(a: dict) -> dict:
     ex = a.get("exifInfo") or {}
     desc = str(ex.get("description") or "")
+    st = a.get("stack") or {}
+    is_primary = bool(st) and st.get("primaryAssetId") == a.get("id")
     return {
+        # 堆叠:子项默认从时间线隐藏(与 Immich 行为一致),封面带张数角标
+        "stack_child": bool(st) and not is_primary,
+        "stack_count": int(st.get("assetCount") or 0) if is_primary else 0,
         "id": a.get("id"),
         "name": a.get("originalFileName", ""),
         "type": a.get("type", ""),
@@ -1098,6 +1109,172 @@ def immich_mgmt_geo_infer(body: MgmtIdsRequest):
 
     threading.Thread(target=_run, daemon=True).start()
     return {"status": "started", "total": len(body.ids)}
+
+
+# ── 相似整理(§20):连拍聚类 → 簇内选优 → Immich 原生堆叠 ─────────────────
+# 纯本地算法(时间窗 + dHash 双闸门,拉普拉斯清晰度选优),零 API 成本。
+# 处置用 Immich Stack:非破坏,时间线只显示封面,随时可解除,一张不删。
+
+_SIMILAR_DIR = os.path.join(PROJECT_ROOT, "Output", "asset_index", "similar_clusters")
+
+
+class SimilarAnalyzeRequest(BaseModel):
+    album_id: str
+
+
+@app.post("/api/immich/mgmt/similar/analyze")
+def immich_mgmt_similar_analyze(body: SimilarAnalyzeRequest):
+    """分析相簿里的连拍相似照片(本地算法,免费)。结果按相簿落盘,
+    GET /api/immich/mgmt/similar/{album_id} 取;后台跑,workspace/task 轮询。"""
+    album_id = "".join(c for c in body.album_id if c.isalnum() or c == "-")
+    if not album_id:
+        raise HTTPException(400, "album_id required")
+    if not _ws_start("similar_analyze"):
+        raise HTTPException(409, "已有后台任务在跑")
+
+    def _run():
+        from datetime import datetime
+        from src.utils.burst_cluster import GAP_SEC, dhash, quality, split_by_visual
+
+        def _wall(t):
+            try:
+                return datetime.fromisoformat(
+                    str(t).replace("Z", "").split("+")[0].split(".")[0])
+            except Exception:  # noqa: BLE001
+                return None
+
+        try:
+            items = immich_mgmt_album(album_id)["items"]
+            # 只看还没堆叠过的照片(已是封面/子项的跳过,避免重复整理)
+            photos = [m for m in items if m.get("type") == "IMAGE"
+                      and not m.get("stack_child") and not m.get("stack_count")]
+            tagged = sorted(((m, _wall(m.get("taken_at"))) for m in photos
+                             if _wall(m.get("taken_at"))), key=lambda x: x[1])
+            groups: list[list] = []
+            cur: list = []
+            for m, t in tagged:
+                if cur and (t - cur[-1][1]).total_seconds() > GAP_SEC:
+                    if len(cur) >= 2:
+                        groups.append(cur)
+                    cur = []
+                cur.append((m, t))
+            if len(cur) >= 2:
+                groups.append(cur)
+
+            total = sum(len(g) for g in groups)
+            _WS_TASK["total"] = total
+            done = 0
+            clusters = []
+            for g in groups:
+                hs, qs = [], []
+                for m, _t in g:
+                    _WS_TASK.update({"done": done, "note": f"相似分析 {done + 1}/{total}"})
+                    done += 1
+                    try:
+                        with open(_thumb_path(m["id"], small=True), "rb") as f:
+                            b = f.read()
+                        hs.append(dhash(b))
+                        qs.append(quality(b))
+                    except Exception:  # noqa: BLE001
+                        hs.append(None)
+                        qs.append({"sharp": 0.0, "clip": 1.0, "score": 0.0})
+                for idxs in split_by_visual(hs):
+                    if len(idxs) < 2:
+                        continue
+                    mem = [g[i][0] for i in idxs]
+                    met = {g[i][0]["id"]: qs[i] for i in idxs}
+                    # 选优:质量分为主,收藏/星级破平
+                    win = max(mem, key=lambda m: (met[m["id"]]["score"],
+                                                  bool(m.get("favorite")),
+                                                  m.get("rating") or 0))
+                    clusters.append({
+                        "key": f"{g[idxs[0]][1].isoformat()}_{mem[0]['id'][:8]}",
+                        "time": g[idxs[0]][1].isoformat(sep=" ")[:16],
+                        "ids": [m["id"] for m in mem],
+                        "winner": win["id"],
+                        "metrics": met,
+                        "applied": False,
+                    })
+            os.makedirs(_SIMILAR_DIR, exist_ok=True)
+            payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "album": album_id,
+                       "photos": len(photos), "clusters": clusters}
+            with open(os.path.join(_SIMILAR_DIR, f"{album_id}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=1)
+            _WS_TASK.update({"running": False, "done": done, "result": {
+                "clusters": len(clusters),
+                "photos_in_clusters": sum(len(c["ids"]) for c in clusters)}})
+        except Exception as e:  # noqa: BLE001
+            _WS_TASK.update({"running": False, "error": str(e)})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/immich/mgmt/similar/{album_id}")
+def immich_mgmt_similar(album_id: str):
+    safe = "".join(c for c in album_id if c.isalnum() or c == "-")
+    p = os.path.join(_SIMILAR_DIR, f"{safe}.json")
+    if not os.path.exists(p):
+        return {"ts": None, "clusters": []}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class StackRequest(BaseModel):
+    album_id: str = ""
+    groups: list[dict] = []      # [{key, primary, ids}]
+
+
+@app.post("/api/immich/mgmt/stack")
+def immich_mgmt_stack(body: StackRequest):
+    """把相似簇写成 Immich 原生堆叠:primary 做封面,其余收进堆叠。
+    非破坏 — 不删任何照片,Immich 里点开堆叠可随时解除/换封面。"""
+    if not body.groups:
+        raise HTTPException(400, "groups required")
+    ok = failed = 0
+    errs: list[str] = []
+    applied_keys: set[str] = set()
+    for grp in body.groups[:500]:
+        prim = str(grp.get("primary") or "")
+        ids = [str(i) for i in (grp.get("ids") or []) if i]
+        if not prim or len(ids) < 2 or prim not in ids:
+            failed += 1
+            continue
+        try:
+            st = _immich_req("/stacks", "POST",
+                             {"assetIds": [prim] + [i for i in ids if i != prim]})
+            # 保险:个别版本不以首元素为封面,显式修正
+            if st.get("id") and st.get("primaryAssetId") not in (None, prim):
+                try:
+                    _immich_req(f"/stacks/{st['id']}", "PUT", {"primaryAssetId": prim})
+                except Exception:  # noqa: BLE001
+                    pass
+            ok += 1
+            if grp.get("key"):
+                applied_keys.add(str(grp["key"]))
+        except HTTPException as e:
+            failed += 1
+            errs.append(str(e.detail)[:120])
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            errs.append(str(e)[:120])
+    # 已应用的簇标记回落盘文件(断点:重开页面不会重复提示)
+    if body.album_id and applied_keys:
+        safe = "".join(c for c in body.album_id if c.isalnum() or c == "-")
+        p = os.path.join(_SIMILAR_DIR, f"{safe}.json")
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            for c in data.get("clusters", []):
+                if c.get("key") in applied_keys:
+                    c["applied"] = True
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except Exception:  # noqa: BLE001
+            pass
+    _MGMT_ALBUM_CACHE.clear()   # 资产已变更,相簿缓存作废
+    return {"stacked": ok, "failed": failed, "errors": errs[:5]}
 
 
 class ImmichImport(BaseModel):

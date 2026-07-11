@@ -644,6 +644,27 @@ shot_point.json（多源 clip 各带 video_path）
 
 ---
 
+## 19. Immich 库管理页
+
+> 动机(2026-07-11,用户):在 CutClaw 里直接管理 Immich 库——批量地名/评分回填、逐资产全景查看,不用切去 Immich。
+
+- **数据链**:`/api/immich/mgmt/album/{id}`(并行分页 + 60s 内存缓存 `_MGMT_ALBUM_CACHE`,写操作 worker 结束时清)→ `_mgmt_slim` 轻量字段;`/api/immich/mgmt/asset/{id}` 全景(EXIF+高德+相簿)。前端 zustand 缓存(sessionStorage 恢复现场)+ hash 路由。
+- **批量 worker**(全部走 `_ws_start` 单任务队列,前端浮标轮询):`geo_refresh`(高德逆地理→📍 分级地址行)、`score`(VLM 评分→星级+带依据描述块,`photo_scores.json` 幂等)、`geo_infer`(无 GPS 按**墙钟**时间轴向邻居插值——DJI/Pocket 导出无时区被 Immich 当 UTC 存,UTC 轴会漂 8h)。
+- **性能铁律**(2026-07-11 卡顿返工教训):网格缩略图必须用 `?size=thumbnail`(~55KB webp),preview(~850KB)只给灯箱;tile 必须 memo 化+回调 useCallback 稳定;**禁止 per-tile backdrop-blur/transition-all**;日期区块加 `content-visibility:auto`;O(n²) 统计不许写在 render 里。
+
+## 20. 相似整理(连拍聚类 → 选优 → Immich 堆叠)
+
+> 动机(2026-07-11,用户):拍摄时习惯连按多张回家不整理,想程序化"每簇只留最好的一张"。
+
+- **聚类**(`src/utils/burst_cluster.py`,纯本地零 API 成本):时间窗(相邻 ≤15s)+ dHash 汉明距离(≤11)双闸门;视觉切分用**贪心链式**(和簇内最后一张比,连拍构图会缓慢漂移,全簇比对会误切)。
+- **选优**:~250px 缩略图上拉普拉斯方差(清晰度)×曝光裁剪惩罚,收藏/星级破平。同簇画面相同,相对比较可靠,不需要大图。
+- **处置**:Immich 原生 Stack(v3 `/stacks` API,POST assetIds 首元素为封面,已验证)——**非破坏**,时间线只显封面,子项收进堆叠,Immich 里随时解除;程序永不删除照片。
+- **断点**:分析结果按相簿落盘 `Output/asset_index/similar_clusters/{album_id}.json`;应用过的簇标记 `applied` 不再重复提示。已堆叠(封面或子项)的照片不参与再次分析。
+- **UI**:相簿页「相似整理」模式——簇行展示、点缩略图换封面、双击看大图、跳过簇、底部条一键应用;时间线默认隐藏堆叠子项(与 Immich 一致),筛选片「堆叠子项」可查看,封面 tile 带 ⧉n 角标。
+- 二期预留:VLM 簇内 listwise 比较(一簇一调用选"表情/构图最佳",比逐张评分便宜一个量级),用户觉得算法选不准时再加。
+
+---
+
 ## 附：历史决策否决清单（别再提议）
 
 - ❌ 均匀降帧省 token —— 损失画面信息，被明确否决（"不能在输出质量上妥协"）。
