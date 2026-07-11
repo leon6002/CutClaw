@@ -63,54 +63,94 @@ export default function JourneyMapView() {
       .map((m) => ({ m, ll: wgs2gcj(m.lat!, m.lon!) as [number, number] }));
   }, [days, selDays]);
 
-  // 轨迹播放引擎:白色进度线 + 发光行进头,地图跟随,经过的照片浮出左下角。
-  // 进度按**弧长**匀速(按序号平分会在连拍密集点原地卡几十秒,"没在播放");
-  // interval 驱动而非 rAF(rAF 在标签页失焦时被冻结,回来动画就死了)。
+  // 轨迹播放引擎(§22):行程切成「停留点」和「移动腿」——
+  //   停留点:驻留 0.6~3s,期间照片卡轮播该处拍的照片;
+  //   移动腿:🚗 小车以人眼能跟的速度开过去(每腿 2.2~9s,随里程),纯弧长
+  //   匀速会让 40km 转场几秒划过("瞬移",用户反馈)。
+  // interval 驱动(rAF 失焦冻结);地图逐帧无动画跟车,不跳。
   useEffect(() => {
     const map = mapRef.current;
     if (!playing || !map || playSeq.length < 2) return;
-    // 累计弧长(等距圆柱近似,做相对参数化足够)
+    const n = playSeq.length;
     const midCos = Math.cos((playSeq[0].ll[0] * Math.PI) / 180);
-    const cum = [0];
-    for (let i = 1; i < playSeq.length; i++) {
-      const [a, b] = [playSeq[i - 1].ll, playSeq[i].ll];
-      cum.push(cum[i - 1] + Math.hypot(a[0] - b[0], (a[1] - b[1]) * midCos));
+    const dKm = (a: number, b: number) => {
+      const [p1, p2] = [playSeq[a].ll, playSeq[b].ll];
+      return Math.hypot(p1[0] - p2[0], (p1[1] - p2[1]) * midCos) * 111;
+    };
+    type Seg = { kind: "stop" | "leg"; i0: number; i1: number; dur: number; t0: number; cum: number[] };
+    const segs: Seg[] = [];
+    let i = 0;
+    while (i < n - 1) {
+      if (dKm(i, i + 1) < 0.3) {          // 停留簇:相邻 <300m
+        let j = i + 1;
+        while (j < n - 1 && dKm(j, j + 1) < 0.3) j++;
+        segs.push({ kind: "stop", i0: i, i1: j,
+                    dur: Math.min(3, 0.6 + 0.12 * (j - i)), t0: 0, cum: [] });
+        i = j;
+      } else {                             // 移动腿:连续 >=300m 的跳
+        let j = i;
+        const cum = [0];
+        while (j < n - 1 && dKm(j, j + 1) >= 0.3) {
+          cum.push(cum[cum.length - 1] + dKm(j, j + 1));
+          j++;
+        }
+        const legKm = cum[cum.length - 1];
+        segs.push({ kind: "leg", i0: i, i1: j,
+                    dur: Math.min(9, Math.max(2.2, legKm * 0.35)), t0: 0, cum });
+        i = j;
+      }
     }
-    const totalLen = cum[cum.length - 1];
-    const kmApprox = totalLen * 111;
-    const total = Math.min(60, Math.max(12, kmApprox * 0.35));   // 整段秒数,随里程自适应
-    let p = 0, last = performance.now(), lastPan = 0, lastIdx = -1, doneAt = 0, j = 0;
+    if (!segs.length) return;
+    let total = 0;
+    for (const s of segs) { s.t0 = total; total += s.dur; }
+
+    const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
+    const head = L.marker(playSeq[0].ll, {
+      icon: L.divIcon({
+        className: "",
+        html: '<div class="jm-head-wrap"><div class="jm-head-dot"></div><div class="jm-head-car">🚗</div></div>',
+        iconSize: [34, 34], iconAnchor: [17, 17],
+      }),
+      zIndexOffset: 2000, interactive: false,
+    }).addTo(map);
+
+    let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
     const step = () => {
       const now = performance.now();
       p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
       last = now;
+      const tt = p * total;
+      while (si < segs.length - 1 && tt >= segs[si].t0 + segs[si].dur) si++;
+      const s = segs[si];
+      const f = Math.min(1, (tt - s.t0) / s.dur);
       let ll: [number, number];
       let idx: number;
-      if (totalLen > 1e-9) {
-        const d = p * totalLen;
-        while (j < cum.length - 2 && cum[j + 1] < d) j++;
-        const f = Math.min(1, (d - cum[j]) / Math.max(cum[j + 1] - cum[j], 1e-12));
-        const [a, b] = [playSeq[j].ll, playSeq[j + 1].ll];
-        ll = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
-        idx = f > 0.5 ? j + 1 : j;
-        trail.setLatLngs([...playSeq.slice(0, j + 1).map((x) => x.ll), ll]);
-      } else {   // 全在同一地点:退回按序号
-        idx = Math.min(playSeq.length - 1, Math.floor(p * (playSeq.length - 1)));
-        ll = playSeq[idx].ll;
+      if (s.kind === "stop") {
+        ll = playSeq[s.i1].ll;
+        idx = Math.min(s.i1, s.i0 + Math.floor(f * (s.i1 - s.i0 + 1)));   // 驻留期轮播
+        trail.setLatLngs(playSeq.slice(0, s.i1 + 1).map((x) => x.ll));
+      } else {
+        const d = f * s.cum[s.cum.length - 1];
+        let j = 0;
+        while (j < s.cum.length - 2 && s.cum[j + 1] < d) j++;
+        const g = Math.min(1, (d - s.cum[j]) / Math.max(s.cum[j + 1] - s.cum[j], 1e-12));
+        const [a, b] = [playSeq[s.i0 + j].ll, playSeq[s.i0 + j + 1].ll];
+        ll = [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
+        idx = g > 0.5 ? s.i0 + j + 1 : s.i0 + j;
+        trail.setLatLngs([...playSeq.slice(0, s.i0 + j + 1).map((x) => x.ll), ll]);
+        // 小车朝向:向西开就水平翻转
+        const el = head.getElement()?.querySelector(".jm-head-car") as HTMLElement | null;
+        if (el) el.style.transform = b[1] < a[1] ? "scaleX(-1)" : "";
       }
+      head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      if (now - lastPan > 400) { map.panTo(ll); lastPan = now; }
+      map.panTo(ll, { animate: false });   // 逐帧跟随,不跳
       if (p >= 1) {
         if (!doneAt) doneAt = now;
-        if (now - doneAt > 1800) setPlaying(false);   // 终点停 1.8s 收尾
+        if (now - doneAt > 1800) setPlaying(false);
       }
     };
-    const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
-    const head = L.marker(playSeq[0].ll, {
-      icon: L.divIcon({ className: "", html: '<div class="jm-head"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
-      zIndexOffset: 2000, interactive: false,
-    }).addTo(map);
     const timer = window.setInterval(step, 33);
     return () => { window.clearInterval(timer); trail.remove(); head.remove(); setPlayPhoto(null); };
   }, [playing, playSeq]);
@@ -302,9 +342,14 @@ export default function JourneyMapView() {
         .jm-play { position:absolute; right:2px; bottom:1px; font-size:9px; color:#fff;
                    text-shadow:0 1px 3px rgba(0,0,0,.9); }
         .leaflet-container { background:#0b0f1a; }
-        .jm-head { width:18px; height:18px; border-radius:50%; background:#fff;
-                   box-shadow:0 0 0 4px rgba(255,255,255,.25), 0 0 18px 6px rgba(56,189,248,.8);
-                   animation: jm-pulse 1.2s ease-in-out infinite; }
+        .jm-head-wrap { width:34px; height:34px; display:flex; align-items:center; justify-content:center; }
+        .jm-head-dot { width:16px; height:16px; border-radius:50%; background:#fff;
+                       box-shadow:0 0 0 4px rgba(255,255,255,.25), 0 0 18px 6px rgba(56,189,248,.8);
+                       animation: jm-pulse 1.2s ease-in-out infinite; }
+        .jm-head-car { display:none; font-size:26px; line-height:1;
+                       filter: drop-shadow(0 2px 5px rgba(0,0,0,.6)); }
+        .jm-head-wrap.is-leg .jm-head-dot { display:none; }
+        .jm-head-wrap.is-leg .jm-head-car { display:block; }
         @keyframes jm-pulse { 50% { box-shadow:0 0 0 7px rgba(255,255,255,.15), 0 0 22px 8px rgba(56,189,248,.9); } }
       `}</style>
     </div>
