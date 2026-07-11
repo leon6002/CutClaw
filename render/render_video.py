@@ -1150,6 +1150,11 @@ def render_video_ffmpeg(
         _last_main_idx = max(
             (idx for idx, c in enumerate(clips)
              if not c.get('is_ending') and not c.get('is_intro')), default=-1)
+        # 片头字幕画在第一个"主"镜头上 —— 有路线开场/hook 时 i==0 是 intro,
+        # 按 i==0 判断会让 title 永远不出现
+        _first_main_idx = next(
+            (idx for idx, c in enumerate(clips)
+             if not c.get('is_ending') and not c.get('is_intro')), 0)
         for i, clip in enumerate(clips):
             clip_file = os.path.join(temp_dir, f"clip_{i:04d}.mp4")
             clip_files.append(clip_file)
@@ -1170,7 +1175,10 @@ def render_video_ffmpeg(
             # no -ss (always extracts from 0s). That silently replaced every clip
             # with the first `duration` seconds of its source: "只取开头几秒" +
             # identical duplicate clips whenever two picks shared a source.
-            ending_video_path = clip.get('video_path') if clip.get('is_ending') else None
+            # 路线开场(is_route)与结尾片同款处理:独立成片的外部文件,
+            # 转码归一到目标格式后直接进 concat
+            ending_video_path = clip.get('video_path') \
+                if (clip.get('is_ending') or clip.get('is_route')) else None
             if ending_video_path:
                 # Transcode ending video to match main video format exactly.
                 # If crop_ratio is set, scale+pad to the cropped output size.
@@ -1510,7 +1518,7 @@ def render_video_ffmpeg(
             # 片头/片尾字幕:直接叠在首/尾镜头上(切片本来就要重编码,零额外
             # 遍数,也不移动时间轴——不破坏卡点)。中文走 textfile 免转义。
             _card_h = target_h if (crop_w_ratio and crop_h_ratio) else (video_height or src_h)
-            if title_text and i == 0 and not _is_extra:
+            if title_text and i == _first_main_idx and not _is_extra:
                 _tf = os.path.join(temp_dir, "title_card.txt")
                 with open(_tf, "w", encoding="utf-8") as _tfh:
                     _tfh.write(title_text)
@@ -2225,6 +2233,12 @@ def main():
         help='AI 旁白 sidecar(narration_*.json):句子按绝对时刻混入,BGM 自动闪避'
     )
     parser.add_argument(
+        '--route-intro',
+        type=str,
+        default='',
+        help='旅程轨迹开场:route_intro.json 路径(GPS 轨迹动画,自动前置为第一个镜头)'
+    )
+    parser.add_argument(
         '--title-text',
         type=str,
         default='',
@@ -2366,6 +2380,29 @@ def main():
                 }
                 clips = [hook_clip] + clips
 
+    # 旅程轨迹开场(§21):GPS 轨迹动画独立成片,前置为第一个镜头。
+    # 失败只警告不阻塞渲染(开场是锦上添花,不许拖垮成片)。
+    if args.route_intro and os.path.exists(args.route_intro):
+        try:
+            from route_intro import render_route_intro
+            _ri_mp4 = os.path.join(
+                os.path.dirname(os.path.abspath(args.output)) or ".",
+                "route_intro_clip.mp4")
+            _ri_dur = render_route_intro(args.route_intro, _ri_mp4,
+                                         ratio=(args.crop_ratio or "16:9"))
+            clips = [{
+                'section_idx': -2, 'shot_idx': -1,
+                'start_sec': 0.0, 'end_sec': _ri_dur, 'duration': _ri_dur,
+                'start_str': "", 'end_str': "",
+                'original_start': 0.0, 'original_end': _ri_dur, 'adjusted': False,
+                'crop_center': None, 'scaled_detections': None,
+                'video_path': _ri_mp4, 'show_labels': False,
+                'is_intro': True, 'is_route': True,
+            }] + clips
+            print(f"🗺️  Route intro: {_ri_dur:.2f}s ({os.path.basename(args.route_intro)})")
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: route intro failed, skipping: {e}")
+
     if args.ending_video:
         try:
             probe = subprocess.run(
@@ -2498,6 +2535,15 @@ def main():
                 print("🎙️  Narration file present but disabled/empty — skipped")
         except Exception as _e:  # noqa: BLE001
             print(f"⚠️  Narration file unreadable, skipped: {_e}")
+
+    # 旁白句子的 at_sec 相对"正片"计时;前面垫了 intro(路线开场/hook)时
+    # 整体后移,否则每句都提前 intro 时长
+    if narration:
+        _intro_off = sum(float(c.get('duration', 0)) for c in clips if c.get('is_intro'))
+        if _intro_off > 0:
+            for _l in narration.get('lines', []):
+                _l['at_sec'] = float(_l.get('at_sec', 0)) + _intro_off
+            print(f"🎙️  Narration shifted +{_intro_off:.2f}s for intro clips")
 
     success = render_video_ffmpeg(
         video_path=args.video,

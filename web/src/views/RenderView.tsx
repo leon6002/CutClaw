@@ -52,6 +52,8 @@ export default function RenderView({
   const [colorGrade, setColorGrade] = useState<"" | "teal_orange" | "film" | "warm">("");
   const [letterbox, setLetterbox] = useState(false);
   const [fades, setFades] = useState(true);
+  const [routeIntro, setRouteIntro] = useState(true);
+  const [routeInfo, setRouteInfo] = useState<any>(null);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [renderRatio, setRenderRatio] = useState("");
@@ -141,6 +143,9 @@ export default function RenderView({
       setSpExists(!!r.shot_point_exists);
       onOutputsCount?.(r.outputs.length);
     }).catch(() => {});
+    // 轨迹开场可用性(首次会查 Immich + 高德,可能要几秒,异步不阻塞)
+    api<any>(`/api/render/route_data?shot_point=${encodeURIComponent(sp)}`)
+      .then(setRouteInfo).catch(() => setRouteInfo({ available: false }));
   };
 
   // Self-heal: legacy projects may reference a shot_point path derived with an
@@ -253,6 +258,7 @@ export default function RenderView({
           color_grade: colorGrade,
           letterbox: letterbox && ratio === "16:9",
           fades,
+          route_intro: routeIntro,
           title_text: titleText,
           end_text: endText,
         }),
@@ -405,6 +411,17 @@ export default function RenderView({
                 <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400">
                   <Checkbox checked={fades} onCheckedChange={(v) => setFades(v === true)} />
                   淡入淡出收尾
+                </label>
+                <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400"
+                  title="用素材的真实 GPS 轨迹生成一段极简路线动画,自动前置为第一个镜头;项目素材没有 GPS 时静默跳过">
+                  <Checkbox checked={routeIntro} onCheckedChange={(v) => setRouteIntro(v === true)} />
+                  🗺 旅程轨迹开场
+                  <span className="text-[10px] text-slate-600">
+                    {routeInfo === null ? "(检测中…)"
+                      : routeInfo.available
+                        ? `(${routeInfo.start_label || "?"} → ${routeInfo.end_label || "?"} · ${routeInfo.total_km} km · ${routeInfo.points} 点)`
+                        : "(无 GPS 数据,将跳过)"}
+                  </span>
                 </label>
               </div>
 

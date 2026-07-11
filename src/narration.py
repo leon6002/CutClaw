@@ -135,7 +135,31 @@ def _extract_json(content: str):
     return None
 
 
-def write_script(slots: list[dict], ctx: dict, instruction: str = "") -> list[dict]:
+def _journey_line(journey: dict | None) -> str:
+    """旅程事实块(§21):起终点/里程/天数来自 GPS 轨迹,给旁白"移动的故事"。"""
+    if not journey:
+        return ""
+    start = str(journey.get("start") or "").strip()
+    end = str(journey.get("end") or "").strip()
+    km = journey.get("km")
+    days = journey.get("days")
+    if not (start or end):
+        return ""
+    seg = []
+    if days and int(days) > 1:
+        seg.append(f"这趟一共 {int(days)} 天")
+    if start and end and start != end:
+        seg.append(f"从「{start}」一路到「{end}」")
+    elif start or end:
+        seg.append(f"都在「{start or end}」一带")
+    if km and float(km) >= 3:
+        seg.append(f"轨迹全程约 {float(km):.0f} 公里")
+    return ("旅程事实(真实 GPS 轨迹算出来的,可自然带进某一句——比如路上颠簸、"
+            "越走越远、终于到了——但别报数字腔):" + ",".join(seg) + "。")
+
+
+def write_script(slots: list[dict], ctx: dict, instruction: str = "",
+                 journey: dict | None = None) -> list[dict]:
     """LLM 写 4-6 句第一人称旁白并挑槽位。单次调用,失败抛错(重试纪律)。"""
     import litellm
     from src import config as _cfg
@@ -152,6 +176,7 @@ def write_script(slots: list[dict], ctx: dict, instruction: str = "") -> list[di
 
 主题:{ctx['theme']}
 叙事:{ctx['logic']}
+{_journey_line(journey)}
 {f'创作倾向(低权重参考):{instruction}' if instruction else ''}
 
 可用的旁白位置(只能从下面挑,slot 编号 + 画面内容):
@@ -251,12 +276,12 @@ def synthesize(lines: list[dict], out_dir: str, voice_key: str = DEFAULT_VOICE) 
 
 
 def generate(shot_point_path: str, voice: str = DEFAULT_VOICE,
-             instruction: str = "") -> dict:
+             instruction: str = "", journey: dict | None = None) -> dict:
     """全流程:槽位 → LLM 写稿 → TTS。写 narration.json 并返回。"""
     slots, ctx = build_slots(shot_point_path)
     if len(slots) < 3:
         raise RuntimeError(f"可用旁白槽位只有 {len(slots)} 个(镜头太密/人声太多)")
-    lines = write_script(slots, ctx, instruction)
+    lines = write_script(slots, ctx, instruction, journey)
     jpath, adir = narration_paths(shot_point_path)
     lines = synthesize(lines, adir, voice)
     data = {"enabled": True, "voice": voice, "created": time.strftime("%Y-%m-%d %H:%M:%S"),

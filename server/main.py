@@ -4564,6 +4564,155 @@ def project_recent(limit: int = 10):
 
 # ── Render ──────────────────────────────────────────────────────────────────
 
+# ── 旅程轨迹开场(§21):shot_point 源视频 → Immich GPS → 路线数据 ──────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    a = (sin(radians(lat2 - lat1) / 2) ** 2
+         + cos(radians(lat1)) * cos(radians(lat2)) * sin(radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371.0 * asin(min(1.0, sqrt(a)))
+
+
+def _route_wall(t):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(t).replace("Z", "").split("+")[0].split(".")[0])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_route_data(shot_point_path: str) -> str | None:
+    """项目源视频反查 Immich → 同行程日期的**全部**带 GPS 资产(照片密度远
+    高于视频,轨迹靠它们)→ 稀化 + 里程 + 高德起终点地名,落盘
+    route_intro.json。1 天内新鲜直接复用;凑不出 2 个点返回 None。"""
+    out_path = os.path.join(os.path.dirname(shot_point_path), "route_intro.json")
+    try:
+        if os.path.exists(out_path) and time.time() - os.path.getmtime(out_path) < 86400:
+            with open(out_path, encoding="utf-8") as f:
+                if len((json.load(f)).get("points") or []) >= 2:
+                    return out_path
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open(shot_point_path, encoding="utf-8") as f:
+            sp = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    basenames: set = set()
+    for r in (sp if isinstance(sp, list) else []):
+        for c in ([r] + (r.get("clips") or [])):
+            vp = c.get("video_path") or ""
+            if vp:
+                basenames.add(os.path.basename(vp))
+    map_path = os.path.join(PROJECT_ROOT, "Output", "asset_index", "immich_map.json")
+    try:
+        with open(map_path, encoding="utf-8") as f:
+            imap = json.load(f)
+    except Exception:  # noqa: BLE001
+        imap = {}
+    ids = [v.get("id") for k, v in imap.items() if k in basenames and v.get("id")]
+    if not ids:
+        return None
+    from datetime import timedelta, timezone
+    days: set = set()
+    times: list = []
+    for aid in ids[:20]:
+        try:
+            a = _immich_req(f"/assets/{aid}")
+            t = _route_wall(a.get("localDateTime")
+                            or (a.get("exifInfo") or {}).get("dateTimeOriginal")
+                            or a.get("fileCreatedAt"))
+            if t:
+                days.add(t.date())
+                times.append(t)
+        except Exception:  # noqa: BLE001
+            continue
+    if not times:
+        return None
+    # UTC 宽查询(±14h 时区错记 + 1 天缓冲),墙钟精过滤到行程日
+    lo_u = min(times).replace(tzinfo=timezone.utc) - timedelta(hours=38)
+    hi_u = max(times).replace(tzinfo=timezone.utc) + timedelta(hours=38)
+    pts: list = []
+    page = 1
+    while page <= 4:
+        try:
+            r = _immich_req("/search/metadata", "POST", {
+                "takenAfter": lo_u.isoformat().replace("+00:00", "Z"),
+                "takenBefore": hi_u.isoformat().replace("+00:00", "Z"),
+                "withExif": True, "size": 1000, "page": page})
+        except Exception:  # noqa: BLE001
+            break
+        a = r.get("assets") or {}
+        for it in a.get("items", []):
+            ex = it.get("exifInfo") or {}
+            if ex.get("latitude") is None:
+                continue
+            t = _route_wall(it.get("localDateTime") or ex.get("dateTimeOriginal")
+                            or it.get("fileCreatedAt"))
+            if t is None or t.date() not in days:
+                continue
+            pts.append((t, float(ex["latitude"]), float(ex["longitude"])))
+        nxt = a.get("nextPage")
+        if not nxt:
+            break
+        page = int(nxt)
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda x: x[0])
+    thin = [pts[0]]
+    for t, la, ln in pts[1:]:
+        pt, pla, plo = thin[-1]
+        dt = (t - pt).total_seconds()
+        dk = _haversine_km(pla, plo, la, ln)
+        # GPS 瞬移离群点(隐含时速 >160km/h):手机缓存位/信号漂移,
+        # 会把里程灌水好几倍(实测 638km→真实两位数),直接丢弃
+        if dt > 0 and dk / (dt / 3600.0) > 160:
+            continue
+        if dt >= 60 or dk >= 0.2:
+            thin.append((t, la, ln))
+    if len(thin) > 400:
+        step = len(thin) / 400.0
+        thin = [thin[int(i * step)] for i in range(400)]
+    km = sum(_haversine_km(a[1], a[2], b[1], b[2]) for a, b in zip(thin, thin[1:]))
+
+    def _label(lat: float, lon: float) -> str:
+        try:
+            from src.utils.amap_geo import reverse_geocode
+            g = reverse_geocode(lat, lon, context="route_intro") or {}
+            if g.get("label"):
+                return str(g["label"])
+            return "·".join(str(g[x]) for x in ("city", "district") if g.get(x))
+        except Exception:  # noqa: BLE001
+            return ""
+    d0, d1 = thin[0][0], thin[-1][0]
+    data = {
+        "points": [{"t": t.isoformat(), "lat": round(la, 6), "lon": round(ln, 6)}
+                   for t, la, ln in thin],
+        "start_label": _label(thin[0][1], thin[0][2]),
+        "end_label": _label(thin[-1][1], thin[-1][2]),
+        "date_range": d0.strftime("%Y.%m.%d")
+                      + ("" if d0.date() == d1.date() else "–" + d1.strftime("%m.%d")),
+        "total_km": round(km, 1),
+        "days": len(days),
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    return out_path
+
+
+@app.get("/api/render/route_data")
+def render_route_data(shot_point: str):
+    """轨迹开场可用性(渲染页开关旁的提示):点数/里程/起终点。"""
+    p = _build_route_data(_resolve(shot_point))
+    if not p:
+        return {"available": False}
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    return {"available": True, "points": len(d.get("points") or []),
+            "total_km": d.get("total_km"), "start_label": d.get("start_label"),
+            "end_label": d.get("end_label"), "date_range": d.get("date_range")}
+
+
 class RenderRequest(BaseModel):
     shot_point: str
     video_path: str
@@ -4580,6 +4729,7 @@ class RenderRequest(BaseModel):
     narration: bool = True     # 混入 AI 旁白(需先生成 narration sidecar 且其 enabled=true)
     title_text: str = ""       # 片头字幕(叠在第一个镜头上)
     end_text: str = ""         # 片尾字幕(随最后一个镜头淡出浮现)
+    route_intro: bool = False  # 旅程轨迹开场(GPS 轨迹动画,无 GPS 数据时静默跳过)
 
 
 # ── AI 旁白 ─────────────────────────────────────────────────────────────────
@@ -4618,8 +4768,20 @@ def narration_generate(body: NarrationGenRequest):
     abs_point = _resolve(body.shot_point)
     if not os.path.exists(abs_point):
         raise HTTPException(404, "shot_point 不存在")
+    # 旅程事实(GPS 轨迹):有就给旁白"移动的故事",没有静默跳过
+    journey = None
     try:
-        data = generate(abs_point, voice=body.voice, instruction=body.instruction)
+        _rp = _build_route_data(abs_point)
+        if _rp:
+            with open(_rp, encoding="utf-8") as f:
+                _rd = json.load(f)
+            journey = {"start": _rd.get("start_label"), "end": _rd.get("end_label"),
+                       "km": _rd.get("total_km"), "days": _rd.get("days")}
+    except Exception:  # noqa: BLE001
+        journey = None
+    try:
+        data = generate(abs_point, voice=body.voice, instruction=body.instruction,
+                        journey=journey)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"旁白生成失败: {e}")
     return data
@@ -4718,6 +4880,16 @@ def render(body: RenderRequest):
         cmd += ["--title-text", body.title_text.strip()]
     if body.end_text.strip():
         cmd += ["--end-text", body.end_text.strip()]
+    _route_note = ""
+    if body.route_intro:
+        try:
+            _rp = _build_route_data(abs_point)
+        except Exception:  # noqa: BLE001
+            _rp = None
+        if _rp:
+            cmd += ["--route-intro", _rp]
+        else:
+            _route_note = "[轨迹] 项目素材找不到 GPS 数据,已跳过旅程开场"
     if body.add_ending and os.path.exists(ending):
         cmd += ["--ending-video", ending]
     if os.path.exists(font):
@@ -4738,6 +4910,8 @@ def render(body: RenderRequest):
                      "source_quality": body.source_quality})
     for _n in _orig_notes:
         job.add(f"[原片] {_n}")
+    if _route_note:
+        job.add(_route_note)
     try:
         _spawn(job, cmd)
     except Exception as e:
