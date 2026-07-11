@@ -24,6 +24,19 @@ import urllib.request
 _LOCK = threading.Lock()
 _CACHE: dict | None = None
 _CACHE_PATH = os.path.join("Output", "asset_index", "amap_geo_cache.json")
+_LOG_PATH = os.path.join("Output", "logs", "amap_geo.jsonl")
+
+
+def _log(entry: dict) -> None:
+    """逐条追加解析日志(哪张照片/什么坐标/走没走缓存/解析出什么)。"""
+    try:
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+        import time as _t
+        entry = {"ts": _t.strftime("%Y-%m-%d %H:%M:%S"), **entry}
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _wgs84_to_gcj02(lat: float, lon: float) -> tuple[float, float]:
@@ -68,11 +81,12 @@ def _load() -> dict:
     return _CACHE
 
 
-def reverse_geocode(lat: float, lon: float) -> dict | None:
+def reverse_geocode(lat: float, lon: float, context: str = "") -> dict | None:
     """{'province','city','district','township','label','formatted'} 或 None。
 
     label 是给 UI/片头用的短地名:district(县市)优先,township 补细节,
-    如 "乌苏市·赛力克提牧场"。
+    如 "乌苏市·赛力克提牧场"。context(通常是文件名)进解析日志,
+    Output/logs/amap_geo.jsonl 可审计"逆编码了哪些照片、地址是什么"。
     """
     key = os.environ.get("AMAP_API_KEY", "").strip()
     if not key:
@@ -85,7 +99,12 @@ def reverse_geocode(lat: float, lon: float) -> dict | None:
     with _LOCK:
         cache = _load()
         if gk in cache:
-            return cache[gk] or None
+            hit = cache[gk] or None
+            _log({"file": context, "lat": round(lat, 5), "lon": round(lon, 5),
+                  "grid": gk, "cached": True,
+                  "label": (hit or {}).get("label"),
+                  "formatted": (hit or {}).get("formatted")})
+            return hit
     glat, glon = _wgs84_to_gcj02(lat, lon)
     url = ("https://restapi.amap.com/v3/geocode/regeo?"
            + urllib.parse.urlencode({"key": key, "location": f"{glon:.6f},{glat:.6f}",
@@ -94,6 +113,8 @@ def reverse_geocode(lat: float, lon: float) -> dict | None:
         with urllib.request.urlopen(url, timeout=10) as r:
             d = json.load(r)
         if d.get("status") != "1":
+            _log({"file": context, "lat": round(lat, 5), "lon": round(lon, 5),
+                  "grid": gk, "cached": False, "error": str(d.get("info"))[:60]})
             return None          # key 配额/失效——不缓存失败,下次再试
         ac = (d.get("regeocode") or {}).get("addressComponent") or {}
 
@@ -117,6 +138,12 @@ def reverse_geocode(lat: float, lon: float) -> dict | None:
                     json.dump(cache, f, ensure_ascii=False, indent=0)
             except Exception:  # noqa: BLE001
                 pass
+        _log({"file": context, "lat": round(lat, 5), "lon": round(lon, 5),
+              "grid": gk, "cached": False,
+              "label": (out or {}).get("label"),
+              "formatted": (out or {}).get("formatted")})
         return out
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log({"file": context, "lat": round(lat, 5), "lon": round(lon, 5),
+              "grid": gk, "cached": False, "error": str(e)[:60]})
         return None

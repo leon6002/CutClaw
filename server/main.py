@@ -1201,7 +1201,7 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
             if ex.get("latitude") is not None and ex.get("longitude") is not None:
                 try:
                     from src.utils.amap_geo import reverse_geocode
-                    _geo = reverse_geocode(ex["latitude"], ex["longitude"])
+                    _geo = reverse_geocode(ex["latitude"], ex["longitude"], context=file_name)
                 except Exception:  # noqa: BLE001
                     _geo = None
             parts = [p for p in (ex.get("city"), ex.get("state")) if p]
@@ -1240,7 +1240,7 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
                 if m:
                     try:
                         from src.utils.amap_geo import reverse_geocode
-                        _geo = reverse_geocode(float(m.group(1)), float(m.group(2)))
+                        _geo = reverse_geocode(float(m.group(1)), float(m.group(2)), context=file_name)
                     except Exception:  # noqa: BLE001
                         _geo = None
                     meta["location"] = (_geo or {}).get("label") or \
@@ -3768,6 +3768,53 @@ def pipeline_selection_trace(shot_point: str):
         "repairs": trace.get("repairs", []),
         "shots": shots,
     }
+
+
+@app.get("/api/geo/log")
+def geo_log(limit: int = 300, format: str = "json"):
+    """高德逆地理解析日志:哪些照片、什么坐标、走没走缓存、解析出什么地址。
+
+    format=html 直接出可读表格页(素材库「📍 地名日志」按钮打开)。"""
+    path = _resolve(os.path.join("Output", "logs", "amap_geo.jsonl"))
+    entries: list = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for line in lines[-max(1, min(limit, 2000)):]:
+            try:
+                entries.append(json.loads(line))
+            except Exception:  # noqa: BLE001
+                continue
+        entries.reverse()   # 最新在前
+    except OSError:
+        pass
+    api_calls = sum(1 for e in entries if not e.get("cached"))
+    if format != "html":
+        return {"entries": entries, "total_shown": len(entries), "api_calls_shown": api_calls}
+    rows = "".join(
+        f"<tr><td>{e.get('ts','')}</td>"
+        f"<td class=f>{(e.get('file') or '—')}</td>"
+        f"<td class=m>{e.get('lat')}, {e.get('lon')}</td>"
+        f"<td>{'缓存' if e.get('cached') else '<b class=api>API</b>'}</td>"
+        f"<td>{e.get('label') or ('<span class=err>' + str(e.get('error', '')) + '</span>' if e.get('error') else '—')}</td>"
+        f"<td class=m>{e.get('formatted') or ''}</td></tr>"
+        for e in entries)
+    html = f"""<!doctype html><html lang=zh><head><meta charset=utf-8>
+<title>高德地名解析日志</title><style>
+body{{background:#0b1220;color:#cbd5e1;font:13px/1.5 system-ui;margin:20px}}
+h2{{color:#67e8f9}} .hint{{color:#64748b;font-size:12px}}
+table{{border-collapse:collapse;width:100%;margin-top:10px}}
+td,th{{padding:4px 10px;border-bottom:1px solid #1e293b;text-align:left;font-size:12px}}
+th{{color:#94a3b8;position:sticky;top:0;background:#0b1220}}
+.f{{color:#7dd3fc}} .m{{color:#64748b;font-family:monospace;font-size:11px}}
+.api{{color:#fbbf24}} .err{{color:#f87171}}
+</style></head><body>
+<h2>📍 高德地名解析日志</h2>
+<div class=hint>最近 {len(entries)} 条(最新在前)· 其中真实 API 调用 {api_calls} 次(「缓存」行不耗配额)· 数据文件 Output/logs/amap_geo.jsonl</div>
+<table><tr><th>时间</th><th>文件</th><th>坐标</th><th>来源</th><th>地名</th><th>完整地址</th></tr>{rows}</table>
+</body></html>"""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(html)
 
 
 @app.get("/api/project/recent")

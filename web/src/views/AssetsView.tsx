@@ -2019,6 +2019,11 @@ export default function AssetsView({
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               扫描
             </Button>
+            <Button variant="outline" className="h-9 gap-1.5 border-white/10 bg-white/[0.04] text-xs"
+              title="高德逆地理解析日志:逆编码了哪些照片、坐标、是否走缓存、解析出的地址"
+              onClick={() => window.open("/api/geo/log?format=html", "_blank")}>
+              📍 地名日志
+            </Button>
             {/* primary CTA follows the workflow state. While a batch runs the
                 button IS the global progress — per-file detail lives on each
                 card's stage strip; the full panel is opt-in (click to expand). */}
