@@ -683,6 +683,17 @@ shot_point.json（多源 clip 各带 video_path）
 
 ---
 
+## 22. 旅程地图(独立工具页)
+
+> 动机(2026-07-11,用户):"专门的页面,选中当天或那几天所有照片视频,地图上看轨迹、点照片"。
+
+- **第五 tab `#/map`**:相簿下拉 → 日期片多选(每天带色点+数量,默认选最后一天)→ Leaflet 交互地图。数据直接复用 Immich 管理页的 zustand 缓存(`_mgmt_slim` 增补 lat/lon 字段),零新增重接口。
+- **地图**:高德栅格瓦片(`webrd0{s}.is.autonavi.com` style=8)+ CSS 滤镜暗色化;瓦片是 GCJ-02,照片 GPS 必须 `web/src/lib/geo.ts` 的 wgs2gcj 转换(与后端同公式,RouteIntroPreview 共用)。
+- **轨迹与照片**:按天彩色 polyline(双线宽做辉光);照片钉密度自适应——每天等距 ≤40 个缩略图钉(hover 放大,视频带 ▶),其余画轨迹色小点;点击任意钉/点开灯箱(preview 大图 + 名称/时间/城市 + Immich 链接)。
+- **⚠ display:none 保活坑**:tab 隐藏时 Leaflet 以 0 尺寸初始化,变可见必须 `invalidateSize()` + 重新 fitBounds(ResizeObserver 监听容器)。
+
+---
+
 ## 附：历史决策否决清单（别再提议）
 
 - ❌ 均匀降帧省 token —— 损失画面信息，被明确否决（"不能在输出质量上妥协"）。

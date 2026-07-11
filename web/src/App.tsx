@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AudioLines, Clapperboard, FolderOpen, Images, PenLine, Plus, Scissors,
+  AudioLines, Clapperboard, FolderOpen, Images, MapIcon, PenLine, Plus, Scissors,
   Settings2, SlidersHorizontal, Sparkles, Video,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -25,6 +25,7 @@ import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
 import RenderView from "./views/RenderView";
 import ImmichAdminView from "./views/ImmichAdminView";
+import JourneyMapView from "./views/JourneyMapView";
 import { useNavStore } from "./store";
 import SettingsModal from "./views/SettingsModal";
 
@@ -82,6 +83,7 @@ const NAV_TABS = [
   { key: "editor", label: "项目编辑", icon: Scissors },
   { key: "render", label: "渲染导出", icon: Video },
   { key: "immich", label: "Immich 管理", icon: Images },
+  { key: "map", label: "旅程地图", icon: MapIcon },
 ];
 
 function toState(p: any): ProjectState {
@@ -364,6 +366,9 @@ export default function App() {
               </div>
               <div style={{ display: tab === "immich" ? "block" : "none" }}>
                 <ImmichAdminView />
+              </div>
+              <div style={{ display: tab === "map" ? "block" : "none" }}>
+                <JourneyMapView />
               </div>
             </>
           )}

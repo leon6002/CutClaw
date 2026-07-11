@@ -806,6 +806,8 @@ def _mgmt_slim(a: dict) -> dict:
         "rating": ex.get("rating"),
         "favorite": bool(a.get("isFavorite")),
         "has_gps": ex.get("latitude") is not None,
+        "lat": (round(float(ex["latitude"]), 6) if ex.get("latitude") is not None else None),
+        "lon": (round(float(ex["longitude"]), 6) if ex.get("longitude") is not None else None),
         "city": ex.get("city"),
         "geo_done": _GEO_MARK in desc,
         "score_done": _PHOTO_MARK in desc,

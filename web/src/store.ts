@@ -9,7 +9,7 @@ import { api } from "./api";
 // ── 导航:tab ↔ location.hash ─────────────────────────────────────────────
 const tabFromHash = () => {
   const t = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0];
-  return ["assets", "editor", "render", "immich"].includes(t) ? t : "assets";
+  return ["assets", "editor", "render", "immich", "map"].includes(t) ? t : "assets";
 };
 
 export const useNavStore = create<{
