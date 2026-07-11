@@ -16,7 +16,13 @@ type Item = {
   city?: string; geo_done?: boolean; score_done?: boolean; size_mb?: number;
 };
 
-const fmtTime = (t?: string) => (t ? t.replace("T", " ").slice(0, 16) : "—");
+// 全部防御式:Immich 字段类型不稳(duration 有时是数字,时间偶见非字符串)
+const fmtTime = (t?: any) => (t ? String(t).replace("T", " ").slice(0, 16) : "—");
+const fmtDur = (d?: any) => {
+  if (d == null || d === "") return "";
+  const s = String(d);
+  return s.includes(":") ? s.slice(s.startsWith("0:") ? 2 : 0, 8).replace(/\.\d+$/, "") : `${d}s`;
+};
 
 /** 局部错误边界:单个脏数据资产不再炸掉整页(白屏)。 */
 class Boundary extends Component<{ children: ReactNode }, { err: string }> {
@@ -186,7 +192,7 @@ function ImmichAdminInner() {
                   <div className="h-24 w-full bg-black/40">
                     <img src={m.thumb} className="h-full w-full object-cover" loading="lazy" />
                   </div>
-                  {m.type === "VIDEO" && <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1 text-[9px] text-slate-200">▶ {m.duration?.slice(3, 8)}</span>}
+                  {m.type === "VIDEO" && <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1 text-[9px] text-slate-200">▶ {fmtDur(m.duration)}</span>}
                   <div className="px-1.5 py-1 text-[10px] leading-tight">
                     <div className="flex items-center gap-1">
                       <span className="text-slate-400">{fmtTime(m.taken_at).slice(5)}</span>
@@ -254,7 +260,7 @@ function ImmichAdminInner() {
                         ["星级", detail.rating > 0 ? "★".repeat(Math.min(5, detail.rating)) : detail.rating === -1 ? "已拒绝" : "—"],
                         ["收藏", detail.favorite ? "❤️" : "—"],
                         ["大小", detail.size_mb ? `${detail.size_mb} MB` : "—"],
-                        ["时长", detail.duration || "—"],
+                        ["时长", fmtDur(detail.duration) || "—"],
                         ["相机", [detail.exif?.make, detail.exif?.model].filter(Boolean).join(" ") || "—"],
                         ["尺寸", detail.exif?.exifImageWidth ? `${detail.exif.exifImageWidth}×${detail.exif.exifImageHeight}` : "—"],
                         ["GPS", detail.exif?.latitude != null ? `${detail.exif.latitude?.toFixed?.(5)}, ${detail.exif.longitude?.toFixed?.(5)}` : "无"],
