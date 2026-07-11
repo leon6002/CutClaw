@@ -63,33 +63,56 @@ export default function JourneyMapView() {
       .map((m) => ({ m, ll: wgs2gcj(m.lat!, m.lon!) as [number, number] }));
   }, [days, selDays]);
 
-  // 轨迹播放引擎:白色进度线 + 发光行进头,地图跟随,经过的照片浮出左下角
+  // 轨迹播放引擎:白色进度线 + 发光行进头,地图跟随,经过的照片浮出左下角。
+  // 进度按**弧长**匀速(按序号平分会在连拍密集点原地卡几十秒,"没在播放");
+  // interval 驱动而非 rAF(rAF 在标签页失焦时被冻结,回来动画就死了)。
   useEffect(() => {
     const map = mapRef.current;
     if (!playing || !map || playSeq.length < 2) return;
+    // 累计弧长(等距圆柱近似,做相对参数化足够)
+    const midCos = Math.cos((playSeq[0].ll[0] * Math.PI) / 180);
+    const cum = [0];
+    for (let i = 1; i < playSeq.length; i++) {
+      const [a, b] = [playSeq[i - 1].ll, playSeq[i].ll];
+      cum.push(cum[i - 1] + Math.hypot(a[0] - b[0], (a[1] - b[1]) * midCos));
+    }
+    const totalLen = cum[cum.length - 1];
+    const kmApprox = totalLen * 111;
+    const total = Math.min(60, Math.max(12, kmApprox * 0.35));   // 整段秒数,随里程自适应
+    let p = 0, last = performance.now(), lastPan = 0, lastIdx = -1, doneAt = 0, j = 0;
+    const step = () => {
+      const now = performance.now();
+      p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
+      last = now;
+      let ll: [number, number];
+      let idx: number;
+      if (totalLen > 1e-9) {
+        const d = p * totalLen;
+        while (j < cum.length - 2 && cum[j + 1] < d) j++;
+        const f = Math.min(1, (d - cum[j]) / Math.max(cum[j + 1] - cum[j], 1e-12));
+        const [a, b] = [playSeq[j].ll, playSeq[j + 1].ll];
+        ll = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+        idx = f > 0.5 ? j + 1 : j;
+        trail.setLatLngs([...playSeq.slice(0, j + 1).map((x) => x.ll), ll]);
+      } else {   // 全在同一地点:退回按序号
+        idx = Math.min(playSeq.length - 1, Math.floor(p * (playSeq.length - 1)));
+        ll = playSeq[idx].ll;
+      }
+      head.setLatLng(ll);
+      if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
+      if (now - lastPan > 400) { map.panTo(ll); lastPan = now; }
+      if (p >= 1) {
+        if (!doneAt) doneAt = now;
+        if (now - doneAt > 1800) setPlaying(false);   // 终点停 1.8s 收尾
+      }
+    };
     const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
     const head = L.marker(playSeq[0].ll, {
       icon: L.divIcon({ className: "", html: '<div class="jm-head"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
       zIndexOffset: 2000, interactive: false,
     }).addTo(map);
-    const total = Math.min(90, Math.max(15, playSeq.length * 0.18));   // 整段秒数
-    let p = 0, last = performance.now(), lastPan = 0, lastIdx = -1, raf = 0, doneAt = 0;
-    const step = (now: number) => {
-      p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
-      last = now;
-      const idx = Math.min(playSeq.length - 1, Math.floor(p * (playSeq.length - 1)));
-      trail.setLatLngs(playSeq.slice(0, idx + 1).map((x) => x.ll));
-      head.setLatLng(playSeq[idx].ll);
-      if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      if (now - lastPan > 400) { map.panTo(playSeq[idx].ll); lastPan = now; }
-      if (p >= 1) {
-        if (!doneAt) doneAt = now;
-        if (now - doneAt > 1800) { setPlaying(false); return; }   // 终点停 1.8s 收尾
-      }
-      raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-    return () => { cancelAnimationFrame(raf); trail.remove(); head.remove(); setPlayPhoto(null); };
+    const timer = window.setInterval(step, 33);
+    return () => { window.clearInterval(timer); trail.remove(); head.remove(); setPlayPhoto(null); };
   }, [playing, playSeq]);
   // 首次载入相簿后默认选最后一天
   useEffect(() => {
