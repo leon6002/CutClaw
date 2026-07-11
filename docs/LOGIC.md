@@ -690,6 +690,7 @@ shot_point.json（多源 clip 各带 video_path）
 - **第五 tab `#/map`**:相簿下拉 → 日期片多选(每天带色点+数量,默认选最后一天)→ Leaflet 交互地图。数据直接复用 Immich 管理页的 zustand 缓存(`_mgmt_slim` 增补 lat/lon 字段),零新增重接口。
 - **地图**:高德栅格瓦片(`webrd0{s}.is.autonavi.com` style=8)+ CSS 滤镜暗色化;瓦片是 GCJ-02,照片 GPS 必须 `web/src/lib/geo.ts` 的 wgs2gcj 转换(与后端同公式,RouteIntroPreview 共用)。
 - **轨迹与照片**:按天彩色 polyline(双线宽做辉光);照片钉密度自适应——每天等距 ≤40 个缩略图钉(hover 放大,视频带 ▶),其余画轨迹色小点;点击任意钉/点开灯箱(preview 大图 + 名称/时间/城市 + Immich 链接)。
+- **轨迹播放**:「▶ 播放轨迹」把选中天全部资产按时间合并成序列,白色进度线+脉冲发光头沿轨迹行进,地图节流跟随(400ms);经过的照片/视频浮出左下角卡片(点开灯箱);1×/2×/4× 倍速,总时长随点数 15–90s 自适应。地图瓦片默认**原色**(压暗滤镜被用户否决,改为 ☀️/🌙 开关)。
 - **⚠ display:none 保活坑**:tab 隐藏时 Leaflet 以 0 尺寸初始化,变可见必须 `invalidateSize()` + 重新 fitBounds(ResizeObserver 监听容器)。
 
 ---
