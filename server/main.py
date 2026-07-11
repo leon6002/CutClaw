@@ -1694,11 +1694,17 @@ _GRADE_STARS = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
 
 _PHOTO_SCORE_PROMPT = """你是一位专业摄影评审(风光/旅拍/人文方向)。从专业摄影角度评价这张照片,诚实、克制,不要客套。
 
+每个维度除了分数,必须给一句 ≤20 字的**评判依据**——指出画面里具体的证据(如"天空过曝无层次""主体居中呆板""侧逆光勾出轮廓"),不许写空话。
+
 只输出 JSON(不要 markdown 代码块):
 {"clarity": <0-10 画质:对焦是否实、噪点、曝光是否准、有无糊>,
+ "clarity_why": "<依据>",
  "lighting": <0-10 光影:光线方向与质感、明暗层次、氛围、是否死黑死白>,
+ "lighting_why": "<依据>",
  "composition": <0-10 构图:主体位置、三分/引导线/框架、平衡、地平线、裁切>,
+ "composition_why": "<依据>",
  "subject": <0-10 主体与瞬间:有没有明确主体、故事感、抓拍时机>,
+ "subject_why": "<依据>",
  "overall": <0-10 综合分,可有小数>,
  "grade": "<S|A|B|C|D — S=作品级(罕见) A=优秀可出片 B=合格记录 C=有明显缺陷 D=废片>",
  "strengths": "<一句话:这张最出色的地方;若乏善可陈就直说>",
@@ -1765,13 +1771,15 @@ def _score_photo_vlm(img_b64: str) -> dict | None:
 
 
 def _photo_block(s: dict) -> str:
-    dims = " · ".join(f"{lab} {s.get(k)}" for k, lab in
-                      (("clarity", "画质"), ("lighting", "光影"),
-                       ("composition", "构图"), ("subject", "主体")) if s.get(k) is not None)
     lines = [_PHOTO_MARK,
              f"评级 {s.get('grade', '?')} · 综合 {s.get('overall', '?')}/10"]
-    if dims:
-        lines.append(dims)
+    # 每维一行:分数 + 评判依据(用户:光给分数没依据无法信任/学习)
+    for k, lab in (("clarity", "画质"), ("lighting", "光影"),
+                   ("composition", "构图"), ("subject", "主体")):
+        if s.get(k) is None:
+            continue
+        why = str(s.get(f"{k}_why") or "").strip()
+        lines.append(f"{lab} {s.get(k)}" + (f" — {why}" if why else ""))
     if s.get("strengths"):
         lines.append(f"亮点: {s['strengths']}")
     if s.get("improve"):
