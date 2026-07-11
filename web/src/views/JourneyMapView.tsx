@@ -22,6 +22,11 @@ export default function JourneyMapView() {
   const [selDays, setSelDays] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<ImItem | null>(null);
   const [darkMap, setDarkMap] = useState(false);   // 默认原色(压暗被用户否决)
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const [playPhoto, setPlayPhoto] = useState<ImItem | null>(null);
+  const speedRef = useRef(1);
+  speedRef.current = speed;
   const mapRef = useRef<L.Map | null>(null);
   const layerRef = useRef<L.LayerGroup | null>(null);
   const boundsRef = useRef<L.LatLngBounds | null>(null);
@@ -46,9 +51,46 @@ export default function JourneyMapView() {
   const noGps = items.length - days.reduce((a, [, v]) => a + v.length, 0);
 
   const pickAlbum = (id: string) => {
-    setAlbumId(id); setSelDays(new Set()); setDetail(null);
+    setAlbumId(id); setSelDays(new Set()); setDetail(null); setPlaying(false);
     if (id) loadItems(id);
   };
+
+  // 播放序列:选中天的全部资产按拍摄时间合并排序
+  const playSeq = useMemo(() => {
+    const chosen = days.filter(([k]) => selDays.has(k)).flatMap(([, v]) => v);
+    return chosen
+      .slice().sort((a, b) => String(a.taken_at).localeCompare(String(b.taken_at)))
+      .map((m) => ({ m, ll: wgs2gcj(m.lat!, m.lon!) as [number, number] }));
+  }, [days, selDays]);
+
+  // 轨迹播放引擎:白色进度线 + 发光行进头,地图跟随,经过的照片浮出左下角
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!playing || !map || playSeq.length < 2) return;
+    const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
+    const head = L.marker(playSeq[0].ll, {
+      icon: L.divIcon({ className: "", html: '<div class="jm-head"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
+      zIndexOffset: 2000, interactive: false,
+    }).addTo(map);
+    const total = Math.min(90, Math.max(15, playSeq.length * 0.18));   // 整段秒数
+    let p = 0, last = performance.now(), lastPan = 0, lastIdx = -1, raf = 0, doneAt = 0;
+    const step = (now: number) => {
+      p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
+      last = now;
+      const idx = Math.min(playSeq.length - 1, Math.floor(p * (playSeq.length - 1)));
+      trail.setLatLngs(playSeq.slice(0, idx + 1).map((x) => x.ll));
+      head.setLatLng(playSeq[idx].ll);
+      if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
+      if (now - lastPan > 400) { map.panTo(playSeq[idx].ll); lastPan = now; }
+      if (p >= 1) {
+        if (!doneAt) doneAt = now;
+        if (now - doneAt > 1800) { setPlaying(false); return; }   // 终点停 1.8s 收尾
+      }
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => { cancelAnimationFrame(raf); trail.remove(); head.remove(); setPlayPhoto(null); };
+  }, [playing, playSeq]);
   // 首次载入相簿后默认选最后一天
   useEffect(() => {
     if (days.length && selDays.size === 0) setSelDays(new Set([days[days.length - 1][0]]));
@@ -158,6 +200,22 @@ export default function JourneyMapView() {
             <button className="text-[11px] text-slate-500 hover:text-cyan-300"
               onClick={() => setSelDays(new Set())}>清空</button>
             {noGps > 0 && <span className="text-[10.5px] text-slate-600">{noGps} 项无 GPS 未显示</span>}
+            {selDays.size > 0 && playSeq.length >= 2 && (
+              <>
+                <button
+                  className={cn("flex h-7 items-center gap-1 rounded-full px-3 text-[11.5px] font-medium transition-colors",
+                    playing ? "bg-rose-500/20 text-rose-300 hover:bg-rose-500/30"
+                      : "bg-cyan-500/20 text-cyan-200 hover:bg-cyan-500/30")}
+                  onClick={() => setPlaying((v) => !v)}>
+                  {playing ? "■ 停止" : "▶ 播放轨迹"}
+                </button>
+                <button
+                  className="h-7 rounded-full bg-white/[0.06] px-2.5 text-[11px] tabular-nums text-slate-300 transition-colors hover:bg-white/10"
+                  title="播放倍速" onClick={() => setSpeed((s) => (s === 1 ? 2 : s === 2 ? 4 : 1))}>
+                  {speed}×
+                </button>
+              </>
+            )}
           </>
         )}
         <button
@@ -170,8 +228,25 @@ export default function JourneyMapView() {
       </div>
 
       {/* 地图 */}
-      <div ref={boxRef} className={cn("min-h-0 flex-1 overflow-hidden rounded-2xl ring-1 ring-white/10",
-        darkMap && "jm-dark")} />
+      <div className="relative min-h-0 flex-1">
+        <div ref={boxRef} className={cn("absolute inset-0 overflow-hidden rounded-2xl ring-1 ring-white/10",
+          darkMap && "jm-dark")} />
+        {/* 播放时:走到哪张照片,哪张浮出(点它看大图) */}
+        {playing && playPhoto && (
+          <button
+            className="absolute bottom-4 left-4 z-[1100] flex items-center gap-2.5 rounded-xl bg-slate-950/88 p-2 pr-3.5 text-left shadow-[0_8px_28px_rgba(0,0,0,0.55)] ring-1 ring-white/15 backdrop-blur-sm"
+            onClick={() => setDetail(playPhoto)}>
+            <img src={playPhoto.thumb} className="h-16 w-16 rounded-lg object-cover" />
+            <div className="text-[11.5px] leading-relaxed text-slate-300">
+              <div className="font-medium text-white">
+                {String(playPhoto.taken_at).replace("T", " ").slice(5, 16)}
+                {playPhoto.type === "VIDEO" && <span className="ml-1 text-[10px] text-slate-400">▶ 视频</span>}
+              </div>
+              {playPhoto.city && <div className="text-slate-400">📍 {playPhoto.city}</div>}
+            </div>
+          </button>
+        )}
+      </div>
 
       {/* 灯箱 */}
       {detail && (
@@ -204,6 +279,10 @@ export default function JourneyMapView() {
         .jm-play { position:absolute; right:2px; bottom:1px; font-size:9px; color:#fff;
                    text-shadow:0 1px 3px rgba(0,0,0,.9); }
         .leaflet-container { background:#0b0f1a; }
+        .jm-head { width:18px; height:18px; border-radius:50%; background:#fff;
+                   box-shadow:0 0 0 4px rgba(255,255,255,.25), 0 0 18px 6px rgba(56,189,248,.8);
+                   animation: jm-pulse 1.2s ease-in-out infinite; }
+        @keyframes jm-pulse { 50% { box-shadow:0 0 0 7px rgba(255,255,255,.15), 0 0 22px 8px rgba(56,189,248,.9); } }
       `}</style>
     </div>
   );
