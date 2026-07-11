@@ -1173,12 +1173,11 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
         # entries cached before the camera field existed refresh once;
         # 裸坐标地名("43.742, 84.420" — Immich 查无此地时代的产物)在配置了
         # 高德 key 后也刷新一次,换成真地名
-        _stale_coords = (cached is not None
-                         and os.environ.get("AMAP_API_KEY")
-                         and (re.fullmatch(r"-?\d+\.\d+, ?-?\d+\.\d+",
-                                           str(cached.get("location") or "x"))
-                              or str(cached.get("location")) in ("China", "中国")))
-        if cached is not None and "camera" in cached and not _stale_coords:
+        # geo!=2 的老条目(Immich 命名时代/裸坐标)在配置高德 key 后惰性刷新一次
+        _stale_geo = (cached is not None
+                      and os.environ.get("AMAP_API_KEY")
+                      and int(cached.get("geo") or 0) < 2)
+        if cached is not None and "camera" in cached and not _stale_geo:
             return cached
 
     meta: dict = {"capture_time": None, "location": None, "camera": None}
@@ -1196,22 +1195,24 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
         if entry and entry.get("id"):
             info = _immich_req(f"/assets/{entry['id']}", timeout=15)
             ex = info.get("exifInfo") or {}
-            parts = [p for p in (ex.get("city"), ex.get("state")) if p]
-            if parts:
-                meta["location"] = " · ".join(dict.fromkeys(parts))
-            elif ex.get("latitude") is not None and ex.get("longitude") is not None:
-                # Immich 本地地名库查无此地(偏远地区 25km 内无入库聚居点,只剩
-                # country)——高德逆地理兜底(网格缓存,同一片区域只调一次),
-                # 独库公路这类旅拍点位从"中国"变成"乌苏市·赛力克提牧场"
+            # 地名优先级(用户定夺 2026-07-10):**高德优先**(区县·乡镇粒度,
+            # 全库命名统一),Immich 本地库兜底,最后才是国家名/裸坐标
+            _geo = None
+            if ex.get("latitude") is not None and ex.get("longitude") is not None:
                 try:
                     from src.utils.amap_geo import reverse_geocode
                     _geo = reverse_geocode(ex["latitude"], ex["longitude"])
                 except Exception:  # noqa: BLE001
                     _geo = None
-                meta["location"] = (_geo or {}).get("label") or ex.get("country") or \
-                    f"{float(ex['latitude']):.3f}, {float(ex['longitude']):.3f}"
+            parts = [p for p in (ex.get("city"), ex.get("state")) if p]
+            if _geo and _geo.get("label"):
+                meta["location"] = _geo["label"]
+            elif parts:
+                meta["location"] = " · ".join(dict.fromkeys(parts))
             elif ex.get("country"):
                 meta["location"] = ex.get("country")
+            elif ex.get("latitude") is not None and ex.get("longitude") is not None:
+                meta["location"] = f"{float(ex['latitude']):.3f}, {float(ex['longitude']):.3f}"
             make = str(ex.get("make") or "").strip()
             model = str(ex.get("model") or "").strip()
             if model:
@@ -1254,6 +1255,7 @@ def _media_meta_for(abs_path: str, file_name: str) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
+    meta["geo"] = 2   # 地名版本:2 = 高德优先(老条目按此标记惰性刷新一次)
     with _MEDIA_META_LOCK:
         _MEDIA_META[file_name] = meta
         try:
