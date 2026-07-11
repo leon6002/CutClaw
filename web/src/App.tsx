@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AudioLines, Clapperboard, FolderOpen, PenLine, Plus, Scissors,
+  AudioLines, Clapperboard, FolderOpen, Images, PenLine, Plus, Scissors,
   Settings2, SlidersHorizontal, Sparkles, Video,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -24,6 +24,7 @@ import JobDock from "./components/JobDock";
 import AssetsView from "./views/AssetsView";
 import EditorView from "./views/EditorView";
 import RenderView from "./views/RenderView";
+import ImmichAdminView from "./views/ImmichAdminView";
 import SettingsModal from "./views/SettingsModal";
 
 export interface ProjectState {
@@ -79,6 +80,7 @@ const NAV_TABS = [
   { key: "assets", label: "素材库", icon: FolderOpen },
   { key: "editor", label: "项目编辑", icon: Scissors },
   { key: "render", label: "渲染导出", icon: Video },
+  { key: "immich", label: "Immich 管理", icon: Images },
 ];
 
 function toState(p: any): ProjectState {
@@ -356,6 +358,9 @@ export default function App() {
                   project={project} setProject={setProject}
                   pipelineStatus={pipelineStatus} onOutputsCount={setOutputsCount}
                 />
+              </div>
+              <div style={{ display: tab === "immich" ? "block" : "none" }}>
+                <ImmichAdminView />
               </div>
             </>
           )}

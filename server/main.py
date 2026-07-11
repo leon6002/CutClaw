@@ -773,6 +773,195 @@ def immich_thumb(asset_id: str):
     return FileResponse(tp, media_type="image/jpeg")
 
 
+# ── Immich 库管理页(§19):地名/评分回填,逐个细看 + 批量操作 ─────────────
+
+_GEO_MARK = "📍 高德定位"
+
+
+def _mgmt_slim(a: dict) -> dict:
+    ex = a.get("exifInfo") or {}
+    desc = str(ex.get("description") or "")
+    return {
+        "id": a.get("id"),
+        "name": a.get("originalFileName", ""),
+        "type": a.get("type", ""),
+        "taken_at": ex.get("dateTimeOriginal") or a.get("fileCreatedAt", ""),
+        "thumb": f"/api/immich/thumb/{a.get('id')}",
+        "duration": a.get("duration", ""),
+        "rating": ex.get("rating"),
+        "favorite": bool(a.get("isFavorite")),
+        "has_gps": ex.get("latitude") is not None,
+        "city": ex.get("city"),
+        "geo_done": _GEO_MARK in desc,
+        "score_done": _PHOTO_MARK in desc,
+        "size_mb": round((ex.get("fileSizeInByte") or 0) / 1e6, 1),
+    }
+
+
+@app.get("/api/immich/mgmt/album/{album_id}")
+def immich_mgmt_album(album_id: str):
+    """相簿全部资产(图片+视频),按拍摄时间排序 — 库管理页的相簿视图。"""
+    safe = "".join(c for c in album_id if c.isalnum() or c == "-")
+    al = _immich_req(f"/albums/{safe}")
+    assets: list = []
+    page = 1
+    while page and len(assets) < 3000:
+        r = _immich_req("/search/metadata", "POST",
+                        {"albumIds": [safe], "size": 500, "page": page, "withExif": True})
+        assets.extend((r.get("assets") or {}).get("items", []))
+        nxt = (r.get("assets") or {}).get("nextPage")
+        page = int(nxt) if nxt else None
+    items = [_mgmt_slim(a) for a in assets]
+    items.sort(key=lambda x: x.get("taken_at") or "")
+    return {"name": al.get("albumName", ""), "items": items}
+
+
+@app.get("/api/immich/mgmt/asset/{asset_id}")
+def immich_mgmt_asset(asset_id: str):
+    """单个资产的全景信息:全部 EXIF + 高德解析 + 所属相簿。"""
+    safe = "".join(c for c in asset_id if c.isalnum() or c == "-")
+    a = _immich_req(f"/assets/{safe}")
+    ex = a.get("exifInfo") or {}
+    geo = None
+    if ex.get("latitude") is not None and ex.get("longitude") is not None:
+        try:
+            from src.utils.amap_geo import reverse_geocode
+            geo = reverse_geocode(ex["latitude"], ex["longitude"],
+                                  context=a.get("originalFileName") or safe)
+        except Exception:  # noqa: BLE001
+            geo = None
+    albums = []
+    try:
+        albums = [{"id": x.get("id"), "name": x.get("albumName")}
+                  for x in _immich_req(f"/albums?assetId={safe}") or []]
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        **_mgmt_slim(a),
+        "exif": {k: v for k, v in ex.items() if v not in (None, "", [])},
+        "description": ex.get("description") or "",
+        "geo": geo,
+        "albums": albums,
+        "checksum": a.get("checksum"),
+        "immich_url": f"{cfg('IMMICH_BASE_URL', 'http://127.0.0.1:2284')}/photos/{safe}",
+    }
+
+
+class MgmtIdsRequest(BaseModel):
+    ids: list[str] = []
+    write_desc: bool = True      # geo_refresh: 是否把地址写进描述
+    write_rating: bool = True    # score: 是否写星级
+    force: bool = False          # score: 已评过的也重评
+
+
+@app.post("/api/immich/mgmt/geo_refresh")
+def immich_mgmt_geo_refresh(body: MgmtIdsRequest):
+    """批量刷新地名:高德逆地理 → 可选把完整地址写进资产描述(📍 标记行,
+    重复执行会替换旧行)。后台跑,/api/workspace/task 轮询进度。"""
+    if not body.ids:
+        raise HTTPException(400, "ids required")
+    if not _ws_start("geo_refresh"):
+        raise HTTPException(409, "已有后台任务在跑(见工作区任务状态)")
+
+    def _run():
+        from src.utils.amap_geo import reverse_geocode
+        done = ok = no_gps = 0
+        _WS_TASK["total"] = len(body.ids)
+        for aid in body.ids:
+            _WS_TASK.update({"done": done, "note": f"地名 {done + 1}/{len(body.ids)}"})
+            done += 1
+            try:
+                a = _immich_req(f"/assets/{aid}")
+                ex = a.get("exifInfo") or {}
+                if ex.get("latitude") is None:
+                    no_gps += 1
+                    continue
+                g = reverse_geocode(ex["latitude"], ex["longitude"],
+                                    context=a.get("originalFileName") or aid)
+                if not g:
+                    continue
+                if body.write_desc:
+                    cur = str(ex.get("description") or "")
+                    # 替换旧的 📍 行(独占一行,保留其他内容)
+                    lines = [l for l in cur.splitlines() if not l.startswith(_GEO_MARK)]
+                    lines.append(f"{_GEO_MARK}: {g.get('formatted') or g.get('label')}")
+                    _immich_req(f"/assets/{aid}", "PUT",
+                                {"description": "\n".join(lines).strip()[:4000]})
+                ok += 1
+            except Exception:  # noqa: BLE001
+                pass
+        _WS_TASK.update({"running": False, "done": done,
+                         "result": {"resolved": ok, "no_gps": no_gps,
+                                    "failed": len(body.ids) - ok - no_gps}})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "total": len(body.ids)}
+
+
+@app.post("/api/immich/mgmt/score")
+def immich_mgmt_score(body: MgmtIdsRequest):
+    """批量 AI 评分(图片+视频封面):专业量表评分 → 星级 + 描述块回填。
+    已评过的(描述带评分块或已有星级)默认跳过,force=true 重评。计费:
+    每资产 1 次视觉调用。后台跑,/api/workspace/task 轮询。"""
+    if not body.ids:
+        raise HTTPException(400, "ids required")
+    if not _ws_start("mgmt_score"):
+        raise HTTPException(409, "已有后台任务在跑(见工作区任务状态)")
+
+    def _run():
+        import base64
+        store = _photo_scores_load()
+        done = scored = skipped = failed = 0
+        _WS_TASK["total"] = len(body.ids)
+        for aid in body.ids:
+            _WS_TASK.update({"done": done, "note": f"评分 {done + 1}/{len(body.ids)}"})
+            done += 1
+            try:
+                if aid in store and not body.force:
+                    skipped += 1
+                    continue
+                img = _immich_req(f"/assets/{aid}/thumbnail?size=preview", raw=True)
+                s = _score_photo_vlm(base64.b64encode(img).decode())
+                if not s:
+                    failed += 1
+                    continue
+                grade = str(s.get("grade", "")).strip().upper()[:1]
+                if grade not in _GRADE_STARS:
+                    ov = float(s.get("overall") or 0)
+                    grade = "S" if ov >= 9 else "A" if ov >= 8 else "B" if ov >= 6.5 \
+                        else "C" if ov >= 5 else "D"
+                    s["grade"] = grade
+                info = _immich_req(f"/assets/{aid}")
+                cur = ((info.get("exifInfo") or {}).get("description") or "")
+                if _PHOTO_MARK in cur:
+                    cur = cur.split(_PHOTO_MARK)[0].rstrip()
+                new_desc = (cur + "\n\n" + _photo_block(s)).strip() if cur else _photo_block(s)
+                upd: dict = {"description": new_desc[:4000]}
+                if body.write_rating:
+                    upd["rating"] = _GRADE_STARS[grade]
+                _immich_req(f"/assets/{aid}", "PUT", upd)
+                s["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                s["name"] = (info.get("originalFileName") or "")
+                store[aid] = s
+                scored += 1
+                if scored % 10 == 0:
+                    with open(_PHOTO_SCORES_PATH, "w", encoding="utf-8") as f:
+                        json.dump(store, f, ensure_ascii=False, indent=1)
+            except Exception:  # noqa: BLE001
+                failed += 1
+        try:
+            os.makedirs(os.path.dirname(_PHOTO_SCORES_PATH), exist_ok=True)
+            with open(_PHOTO_SCORES_PATH, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False, indent=1)
+        except Exception:  # noqa: BLE001
+            pass
+        _WS_TASK.update({"running": False, "done": done,
+                         "result": {"scored": scored, "skipped": skipped, "failed": failed}})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "total": len(body.ids)}
+
+
 class ImmichImport(BaseModel):
     ids: list[str] = []
 
