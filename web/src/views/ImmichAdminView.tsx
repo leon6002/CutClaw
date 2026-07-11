@@ -252,49 +252,110 @@ function ImmichAdminInner() {
             ) : (
               <div className="flex min-h-0 flex-1 flex-wrap gap-4 overflow-hidden p-4">
                 <div className="min-w-[280px] flex-1">
-                  <img src={detail.thumb} className="max-h-[52vh] w-full rounded-lg bg-black object-contain" />
-                  <div className="mt-1 text-[11px] text-slate-500">
-                    {detail.type === "VIDEO" ? "视频封面预览 — 播放请点右上 Immich" : ""}
+                  <div className="flex h-full max-h-[62vh] items-center justify-center rounded-xl bg-black/60">
+                    <img src={detail.thumb} className="max-h-[60vh] max-w-full rounded-xl object-contain" />
                   </div>
-                </div>
-                <ScrollArea className="max-h-[62vh] min-w-[300px] flex-1">
-                  <table className="w-full text-[12px]">
-                    <tbody>
-                      {([
-                        ["拍摄时间", fmtTime(detail.taken_at)],
-                        ["星级", detail.rating > 0 ? "★".repeat(Math.min(5, detail.rating)) : detail.rating === -1 ? "已拒绝" : "—"],
-                        ["收藏", detail.favorite ? "❤️" : "—"],
-                        ["大小", detail.size_mb ? `${detail.size_mb} MB` : "—"],
-                        ["时长", fmtDur(detail.duration) || "—"],
-                        ["相机", [detail.exif?.make, detail.exif?.model].filter(Boolean).join(" ") || "—"],
-                        ["尺寸", detail.exif?.exifImageWidth ? `${detail.exif.exifImageWidth}×${detail.exif.exifImageHeight}` : "—"],
-                        ["GPS", detail.exif?.latitude != null ? `${detail.exif.latitude?.toFixed?.(5)}, ${detail.exif.longitude?.toFixed?.(5)}` : "无"],
-                        ["Immich 地名", [detail.exif?.city, detail.exif?.state].filter(Boolean).join(" · ") || "—"],
-                        ["高德地名", detail.geo?.formatted || detail.geo?.label || "—"],
-                        ["所属相簿", (detail.albums ?? []).map((a: any) => a.name).join("、") || "—"],
-                      ] as const).map(([k, v]) => (
-                        <tr key={k} className="border-b border-white/[0.05]">
-                          <td className="w-24 py-1.5 pr-2 align-top text-slate-500">{k}</td>
-                          <td className={cn("py-1.5 text-slate-300", k === "高德地名" && "text-emerald-300")}>{v}</td>
-                        </tr>
-                      ))}
-                      <tr>
-                        <td className="w-24 py-1.5 pr-2 align-top text-slate-500">资产 ID</td>
-                        <td className="py-1.5">
-                          <button className="font-mono text-[11px] text-cyan-400 hover:underline"
-                            title="点击复制"
-                            onClick={() => navigator.clipboard?.writeText(detail.id)}>
-                            {detail.id} <Copy className="inline h-3 w-3" />
-                          </button>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  {detail.description && (
-                    <div className="mt-2 whitespace-pre-wrap rounded-lg border border-white/[0.06] bg-white/[0.02] p-2.5 text-[11.5px] text-slate-300">
-                      {detail.description}
-                    </div>
+                  {detail.type === "VIDEO" && (
+                    <div className="mt-1.5 text-center text-[11px] text-slate-500">视频封面预览 · 播放请点右上 Immich</div>
                   )}
+                </div>
+                <ScrollArea className="max-h-[62vh] min-w-[320px] flex-1">
+                  <div className="space-y-3 pr-2">
+                    {/* 状态徽章行 */}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {detail.rating > 0 && (
+                        <span className="rounded-md bg-amber-400/15 px-2 py-0.5 text-[11px] text-amber-300">
+                          {"★".repeat(Math.min(5, detail.rating))}
+                        </span>
+                      )}
+                      {detail.rating === -1 && <span className="rounded-md bg-red-500/15 px-2 py-0.5 text-[11px] text-red-300">已拒绝</span>}
+                      {detail.favorite && <span className="rounded-md bg-rose-500/15 px-2 py-0.5 text-[11px] text-rose-300">❤️ 收藏</span>}
+                      {detail.score_done && <span className="rounded-md bg-fuchsia-500/15 px-2 py-0.5 text-[11px] text-fuchsia-300">✨ 已评分</span>}
+                      {detail.geo_done && <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-300">📍 已写地名</span>}
+                    </div>
+
+                    {/* 位置卡:行政层级面包屑 + 详细位置 */}
+                    <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.05] p-3">
+                      <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-emerald-400/80">位置</div>
+                      {detail.geo ? (() => {
+                        const levels = [detail.geo.province, detail.geo.city, detail.geo.district, detail.geo.township]
+                          .filter((x: string, i: number, arr: string[]) => x && arr.indexOf(x) === i);
+                        let poi = String(detail.geo.formatted || "");
+                        for (const l of levels) { if (poi.startsWith(l)) poi = poi.slice(l.length); }
+                        return (
+                          <>
+                            <div className="flex flex-wrap items-center gap-1">
+                              {levels.map((l: string, i: number) => (
+                                <span key={l} className="flex items-center gap-1">
+                                  {i > 0 && <span className="text-[10px] text-emerald-600">›</span>}
+                                  <span className={cn("rounded-md px-2 py-0.5 text-[12px]",
+                                    i === levels.length - 1
+                                      ? "bg-emerald-400/20 font-semibold text-emerald-200"
+                                      : "bg-white/[0.06] text-slate-300")}>
+                                    {l}
+                                  </span>
+                                </span>
+                              ))}
+                            </div>
+                            {poi && <div className="mt-1.5 text-[12px] text-emerald-200/90">{poi}</div>}
+                          </>
+                        );
+                      })() : (
+                        <div className="text-[12px] text-slate-500">{detail.exif?.latitude != null ? "高德未解析(点右上「刷新地名」)" : "无 GPS 信息"}</div>
+                      )}
+                      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-[10.5px] text-slate-500">
+                        {detail.exif?.latitude != null && (
+                          <span className="font-mono">{detail.exif.latitude?.toFixed?.(5)}, {detail.exif.longitude?.toFixed?.(5)}</span>
+                        )}
+                        <span>Immich:{[detail.exif?.city, detail.exif?.state].filter(Boolean).join("·") || "—"}</span>
+                      </div>
+                    </div>
+
+                    {/* 拍摄信息网格 */}
+                    <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3">
+                      <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-slate-500">拍摄</div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px]">
+                        {([
+                          ["时间", fmtTime(detail.taken_at)],
+                          ["相机", [detail.exif?.make, detail.exif?.model].filter(Boolean).join(" ") || "—"],
+                          ["尺寸", detail.exif?.exifImageWidth ? `${detail.exif.exifImageWidth}×${detail.exif.exifImageHeight}` : "—"],
+                          ["大小", detail.size_mb ? `${detail.size_mb} MB` : "—"],
+                          ...(detail.type === "VIDEO" ? [["时长", fmtDur(detail.duration) || "—"]] : []),
+                          ...(detail.exif?.fNumber ? [["光圈", `f/${detail.exif.fNumber}`]] : []),
+                          ...(detail.exif?.iso ? [["ISO", String(detail.exif.iso)]] : []),
+                          ...(detail.exif?.exposureTime ? [["快门", String(detail.exif.exposureTime)]] : []),
+                        ] as [string, string][]).map(([k, v]) => (
+                          <div key={k} className="flex items-baseline gap-2">
+                            <span className="w-8 shrink-0 text-[11px] text-slate-500">{k}</span>
+                            <span className="text-slate-300">{v}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* 归属 */}
+                    <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3">
+                      <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-slate-500">归属</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(detail.albums ?? []).map((a: any) => (
+                          <span key={a.id} className="rounded-md bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-300">{a.name}</span>
+                        ))}
+                        {(detail.albums ?? []).length === 0 && <span className="text-[12px] text-slate-500">不在任何相簿</span>}
+                      </div>
+                      <button className="mt-2 font-mono text-[10.5px] text-slate-500 hover:text-cyan-400"
+                        title="点击复制资产 ID"
+                        onClick={() => navigator.clipboard?.writeText(detail.id)}>
+                        {detail.id} <Copy className="inline h-3 w-3" />
+                      </button>
+                    </div>
+
+                    {detail.description && (
+                      <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] p-3">
+                        <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-slate-500">描述</div>
+                        <div className="whitespace-pre-wrap text-[11.5px] leading-relaxed text-slate-300">{detail.description}</div>
+                      </div>
+                    )}
+                  </div>
                 </ScrollArea>
               </div>
             )}

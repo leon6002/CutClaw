@@ -882,9 +882,21 @@ def immich_mgmt_geo_refresh(body: MgmtIdsRequest):
                     continue
                 if body.write_desc:
                     cur = str(ex.get("description") or "")
+                    # 分级格式(省 · 市 · 区县 · 乡镇 · 详细位置)——连写的
+                    # formatted 看不出地级市(用户反馈)
+                    _lv = []
+                    for _k in ("province", "city", "district", "township"):
+                        _v = g.get(_k)
+                        if _v and _v not in _lv:
+                            _lv.append(_v)
+                    _poi = str(g.get("formatted") or "")
+                    for _v in _lv:
+                        if _poi.startswith(_v):
+                            _poi = _poi[len(_v):]
+                    _addr = " · ".join(_lv + ([_poi] if _poi else []))
                     # 替换旧的 📍 行(独占一行,保留其他内容)
                     lines = [l for l in cur.splitlines() if not l.startswith(_GEO_MARK)]
-                    lines.append(f"{_GEO_MARK}: {g.get('formatted') or g.get('label')}")
+                    lines.append(f"{_GEO_MARK}: {_addr}")
                     _immich_req(f"/assets/{aid}", "PUT",
                                 {"description": "\n".join(lines).strip()[:4000]})
                 ok += 1
