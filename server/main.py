@@ -4581,16 +4581,69 @@ def _route_wall(t):
         return None
 
 
+def _fetch_route_basemap(points: list, out_png: str) -> dict | None:
+    """高德静态地图底图(项目一次调用,随 route json 永久缓存)。
+    返回投影元数据 {center:[gcj_lng,gcj_lat], zoom, px:2048}(1024*1024@scale2);
+    动画器把轨迹点转 GCJ-02 后按 web-mercator 投到这张图上。
+    没配 key / 配额错误返回 None → 回退无底图的抽象风格。"""
+    key = os.environ.get("AMAP_API_KEY", "").strip()
+    if not key or len(points) < 2:
+        return None
+    import math as _m
+    from src.utils.amap_geo import _wgs84_to_gcj02
+    g = [_wgs84_to_gcj02(la, ln) for _t, la, ln in points]
+
+    def _merc(lat: float, lng: float, z: int):
+        n = 256 * (2 ** z) * 2          # scale=2 像素坐标
+        r = _m.radians(lat)
+        return ((lng + 180) / 360 * n,
+                (1 - _m.log(_m.tan(r) + 1 / _m.cos(r)) / _m.pi) / 2 * n)
+
+    clat = (min(x[0] for x in g) + max(x[0] for x in g)) / 2
+    clng = (min(x[1] for x in g) + max(x[1] for x in g)) / 2
+    zoom = 17
+    while zoom > 3:                     # bbox 要在任意比例裁剪后仍装得下
+        xs, ys = zip(*[_merc(la, ln, zoom) for la, ln in g])
+        if max(xs) - min(xs) <= 2048 * 0.45 and max(ys) - min(ys) <= 2048 * 0.45:
+            break
+        zoom -= 1
+    url = (f"https://restapi.amap.com/v3/staticmap?key={key}"
+           f"&location={clng:.6f},{clat:.6f}&zoom={zoom}&size=1024*1024&scale=2")
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = resp.read()
+        ct = str(resp.headers.get("Content-Type", ""))
+    if "json" in ct or data[:1] == b"{":
+        return None                     # 高德返回错误 JSON(配额/参数)
+    with open(out_png, "wb") as f:
+        f.write(data)
+    return {"center": [round(clng, 6), round(clat, 6)], "zoom": zoom, "px": 2048}
+
+
 def _build_route_data(shot_point_path: str) -> str | None:
     """项目源视频反查 Immich → 同行程日期的**全部**带 GPS 资产(照片密度远
-    高于视频,轨迹靠它们)→ 稀化 + 里程 + 高德起终点地名,落盘
+    高于视频,轨迹靠它们)→ 稀化 + 里程 + 高德起终点地名 + 静态底图,落盘
     route_intro.json。1 天内新鲜直接复用;凑不出 2 个点返回 None。"""
     out_path = os.path.join(os.path.dirname(shot_point_path), "route_intro.json")
+    map_png = os.path.join(os.path.dirname(shot_point_path), "route_map.png")
     try:
         if os.path.exists(out_path) and time.time() - os.path.getmtime(out_path) < 86400:
             with open(out_path, encoding="utf-8") as f:
-                if len((json.load(f)).get("points") or []) >= 2:
-                    return out_path
+                d = json.load(f)
+            if len(d.get("points") or []) >= 2:
+                # 老缓存补底图(此前没 key / 版本没这功能)
+                if not (d.get("map") or {}).get("image") \
+                        or not os.path.exists((d.get("map") or {}).get("image", "")):
+                    try:
+                        _pts = [(None, p["lat"], p["lon"]) for p in d["points"]]
+                        mm = _fetch_route_basemap(_pts, map_png)
+                        if mm:
+                            d["map"] = {"image": map_png, **mm}
+                            with open(out_path, "w", encoding="utf-8") as f:
+                                json.dump(d, f, ensure_ascii=False, indent=1)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return out_path
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -4695,6 +4748,12 @@ def _build_route_data(shot_point_path: str) -> str | None:
         "total_km": round(km, 1),
         "days": len(days),
     }
+    try:
+        mm = _fetch_route_basemap(thin, map_png)
+        if mm:
+            data["map"] = {"image": map_png, **mm}
+    except Exception:  # noqa: BLE001
+        pass
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     return out_path
