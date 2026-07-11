@@ -1,7 +1,7 @@
 /** Immich 库管理页(§19):相簿墙 → 时间线网格 → 资产全景弹层。
  *  能力:高德地名刷新(单个/批量,回填描述 📍 行)、AI 评分(单个/批量,
  *  星级 + 描述块回填)。后台任务经 /api/workspace/task 轮询。 */
-import { useEffect, useState } from "react";
+import { Component, useEffect, useState, type ReactNode } from "react";
 import { ArrowLeft, Copy, ExternalLink, Loader2, MapPin, RotateCw, Sparkles, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -18,12 +18,35 @@ type Item = {
 
 const fmtTime = (t?: string) => (t ? t.replace("T", " ").slice(0, 16) : "—");
 
+/** 局部错误边界:单个脏数据资产不再炸掉整页(白屏)。 */
+class Boundary extends Component<{ children: ReactNode }, { err: string }> {
+  state = { err: "" };
+  static getDerivedStateFromError(e: any) { return { err: String(e?.message || e) }; }
+  render() {
+    if (this.state.err) {
+      return (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+          页面渲染出错:{this.state.err}
+          <button className="ml-3 text-xs underline" onClick={() => this.setState({ err: "" })}>重试</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Stars({ n }: { n?: number }) {
-  if (!n) return null;
-  return <span className="text-[10px] text-amber-300">{"★".repeat(Math.min(5, n))}</span>;
+  // Immich 星级可为 -1(拒绝);repeat 负数会抛异常炸整页
+  const k = Math.max(0, Math.min(5, Number(n) || 0));
+  if (!k) return null;
+  return <span className="text-[10px] text-amber-300">{"★".repeat(k)}</span>;
 }
 
 export default function ImmichAdminView() {
+  return <Boundary><ImmichAdminInner /></Boundary>;
+}
+
+function ImmichAdminInner() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [album, setAlbum] = useState<Album | null>(null);
   const [items, setItems] = useState<Item[]>([]);
@@ -228,7 +251,7 @@ export default function ImmichAdminView() {
                     <tbody>
                       {([
                         ["拍摄时间", fmtTime(detail.taken_at)],
-                        ["星级", detail.rating ? "★".repeat(detail.rating) : "—"],
+                        ["星级", detail.rating > 0 ? "★".repeat(Math.min(5, detail.rating)) : detail.rating === -1 ? "已拒绝" : "—"],
                         ["收藏", detail.favorite ? "❤️" : "—"],
                         ["大小", detail.size_mb ? `${detail.size_mb} MB` : "—"],
                         ["时长", detail.duration || "—"],
