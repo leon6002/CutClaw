@@ -179,8 +179,6 @@ export default function JourneyMapView() {
     });
     let total = 0;
     for (const pl of plans) { pl.t0 = total; total += pl.dur; }
-    // 速度自适应缩放目标:停留点推近看细节,长途拉远看全局
-    const legZoom = (km: number) => Math.max(5.5, Math.min(13, 14.8 - 1.15 * Math.log2(km + 2)));
     const STOP_ZOOM = 13.5;
 
     // 绿色尾迹:淡辉光宽线 + 亮主线,走过的地方被点亮
@@ -197,10 +195,11 @@ export default function JourneyMapView() {
 
     let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
     let donePath: [number, number][] = [];
-    // 镜头纪律:段内**锁定缩放**(每帧改缩放会让瓦片永远加载不完→黑屏,
-    // 且全部图层逐帧重算→狂抖);平移用 Leaflet 动画短步(280ms 一段,
-    // 连起来即连续);只在段切换时 flyTo 一次平滑变焦。
-    let lastPan = 0, zoomHoldUntil = 0, lastSi = -1;
+    // 镜头纪律:不逐帧改缩放(瓦片会加载不完→黑屏);平移用 Leaflet 动画
+    // 短步(280ms);缩放按"到本段终点的剩余距离"连续收紧 —— 越接近节点
+    // 越放大(以前到站才瞬间跳,且巡航缩太远看不见路,用户反馈)。
+    // 差值 ≥0.6 级才触发一次 flyTo(0.9s),链式衔接即为渐进推近。
+    let lastPan = 0, zoomHoldUntil = 0;
     const step = () => {
       const now = performance.now();
       p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
@@ -241,12 +240,18 @@ export default function JourneyMapView() {
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      if (si !== lastSi) {
-        lastSi = si;
-        if (autoZoomRef.current) {
-          const zt = s.kind === "stop" ? STOP_ZOOM : legZoom(pl.km);
-          map.flyTo(ll, zt, { duration: 1.3, easeLinearity: 0.4 });
-          zoomHoldUntil = now + 1500;   // flyTo 期间不 pan,别打断它
+      if (autoZoomRef.current && now > zoomHoldUntil) {
+        let zt: number;
+        if (s.kind === "stop") {
+          zt = STOP_ZOOM;
+        } else {
+          const remainKm = Math.max(0, (1 - f) * pl.km);   // 弧长匀速下时间比≈距离比
+          const floor_ = pl.flight ? 5 : 8;                // 自驾下限 8:公路仍清晰可见
+          zt = Math.max(floor_, Math.min(STOP_ZOOM, 15.2 - 1.05 * Math.log2(remainKm + 1.5)));
+        }
+        if (Math.abs(zt - map.getZoom()) >= 0.6) {
+          map.flyTo(ll, zt, { duration: 0.9, easeLinearity: 0.4 });
+          zoomHoldUntil = now + 1000;   // flyTo 期间不 pan,别打断它
         }
       }
       if (now > zoomHoldUntil && now - lastPan > 280) {
