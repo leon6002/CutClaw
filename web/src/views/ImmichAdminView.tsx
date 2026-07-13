@@ -243,11 +243,12 @@ function Inner() {
     return () => window.clearInterval(t);
   }, [task?.running]);
 
-  const startTask = async (path: string, ids: string[], confirmMsg: string) => {
+  const startTask = async (path: string, ids: string[], confirmMsg: string,
+                           extra: Record<string, unknown> = {}) => {
     if (!ids.length || !window.confirm(confirmMsg)) return;
     setErr("");
     try {
-      await api(path, { method: "POST", body: JSON.stringify({ ids }) });
+      await api(path, { method: "POST", body: JSON.stringify({ ids, ...extra }) });
       setTask({ running: true, done: 0, total: ids.length });
     } catch (e: any) { setErr(e.message); }
   };
@@ -256,7 +257,8 @@ function Inner() {
   const aiScore = (ids: string[]) => startTask("/api/immich/mgmt/score", ids,
     `对 ${ids.length} 个资产 AI 评分(星级 + 评语回填)?每资产 1 次视觉调用,已评过自动跳过。`);
   const geoInfer = (ids: string[]) => startTask("/api/immich/mgmt/geo_infer", ids,
-    `对 ${ids.length} 个无 GPS 资产按时间轴推测坐标?\n取前后 90 分钟内带 GPS 的邻居照片插值,写回 Immich;已有 GPS 的自动跳过。`);
+    `对 ${ids.length} 个资产推测坐标?\n· 无 GPS:取前后 90 分钟带 GPS 的邻居,>1km 间隔沿驾车路线插值(不再甩出公路)\n· 之前推测过的(🧭)会用新算法重推;真实拍摄 GPS 永不改动`,
+    { force: true });
 
   const shownAlbums = albums.filter((a) => !wallQuery || a.name.toLowerCase().includes(wallQuery.toLowerCase()));
 

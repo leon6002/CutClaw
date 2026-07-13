@@ -1089,8 +1089,11 @@ def immich_mgmt_geo_infer(body: MgmtIdsRequest):
                 a = _immich_req(f"/assets/{aid}")
                 ex = a.get("exifInfo") or {}
                 if ex.get("latitude") is not None:
-                    skipped += 1          # 已有 GPS,不动
-                    continue
+                    # force 时允许重推"当初由我们推测"的(带 🧭 标记);
+                    # 真实拍摄 GPS 永远不动
+                    if not (body.force and "🧭" in str(ex.get("description") or "")):
+                        skipped += 1
+                        continue
                 t0 = _wall(a.get("localDateTime") or ex.get("dateTimeOriginal")
                            or a.get("fileCreatedAt"))
                 if t0 is None:
@@ -1112,14 +1115,40 @@ def immich_mgmt_geo_infer(body: MgmtIdsRequest):
                     if tn is None or abs((tn - t0).total_seconds()) > _WINDOW_MIN * 60:
                         continue
                     cands.append((tn, float(nex["latitude"]), float(nex["longitude"]),
-                                  n.get("originalFileName", "")))
+                                  n.get("originalFileName", ""),
+                                  "🧭" in str(nex.get("description") or "")))
+                # 排除同样是推测出来的邻居(🧭),别拿推测喂推测
+                cands = [c for c in cands if len(c) < 5 or not c[4]]
                 before = max((c for c in cands if c[0] <= t0), default=None, key=lambda c: c[0])
                 after = min((c for c in cands if c[0] >= t0), default=None, key=lambda c: c[0])
                 if before and after and after[0] != before[0]:
                     w = (t0 - before[0]).total_seconds() / (after[0] - before[0]).total_seconds()
                     lat = before[1] + (after[1] - before[1]) * w
                     lon = before[2] + (after[2] - before[2]) * w
-                    src = f"{before[3]} ←{abs((t0-before[0]).total_seconds())/60:.0f}min·{abs((after[0]-t0).total_seconds())/60:.0f}min→ {after[3]}"
+                    mode = "直线"
+                    # 邻居相距 >1km:直线插值的弦会切弯道、把点甩出公路
+                    # (用户实测截图)→ 改沿驾车路线按时间比例取弧长位置
+                    gap_km = _haversine_km(before[1], before[2], after[1], after[2])
+                    if 1.0 <= gap_km <= 300:
+                        rt = _drive_route_cached([before[1], before[2]], [after[1], after[2]])
+                        poly = (rt or {}).get("polyline") or []
+                        if len(poly) >= 2:
+                            import math as _m
+                            midc = _m.cos(_m.radians(poly[0][0]))
+                            cum = [0.0]
+                            for p1, p2 in zip(poly, poly[1:]):
+                                cum.append(cum[-1] + _m.hypot(p2[0] - p1[0],
+                                                              (p2[1] - p1[1]) * midc))
+                            dtar = cum[-1] * max(0.0, min(1.0, w))
+                            j = 0
+                            while j < len(cum) - 2 and cum[j + 1] < dtar:
+                                j += 1
+                            f2 = (dtar - cum[j]) / max(cum[j + 1] - cum[j], 1e-12)
+                            gla = poly[j][0] + (poly[j + 1][0] - poly[j][0]) * f2
+                            gln = poly[j][1] + (poly[j + 1][1] - poly[j][1]) * f2
+                            lat, lon = _gcj_to_wgs(gla, gln)   # 高德折线是 GCJ,转回 WGS 存
+                            mode = "沿公路"
+                    src = f"{mode}·{before[3]} ←{abs((t0-before[0]).total_seconds())/60:.0f}min·{abs((after[0]-t0).total_seconds())/60:.0f}min→ {after[3]}"
                 elif before or after:
                     c = before or after
                     lat, lon = c[1], c[2]
@@ -4892,20 +4921,23 @@ class DriveRouteRequest(BaseModel):
     waypoints: list[list[float]] = []    # 沿途 GPS 采样(≤6),让路线贴近实际走法
 
 
-@app.post("/api/map/drive_route")
-def map_drive_route(body: DriveRouteRequest):
-    """把一条移动腿吸附到真实道路(高德驾车路径规划,消耗 key 配额:
-    每腿 1 次调用)。结果按 GCJ 坐标(3 位小数 ≈ 100m)签名永久缓存 —— 同一
-    段路全库只调一次,重开页面零成本。返回的折线已是 GCJ-02,前端直接画。"""
-    key = os.environ.get("AMAP_API_KEY", "").strip()
-    if not key:
-        return {"available": False}
-    if len(body.origin) != 2 or len(body.destination) != 2:
-        raise HTTPException(400, "origin/destination 需为 [lat, lon]")
+def _gcj_to_wgs(lat: float, lon: float) -> tuple[float, float]:
+    """GCJ-02 → WGS84 近似逆变换(一次迭代,误差 ~1m,回填 Immich 够用)。"""
     from src.utils.amap_geo import _wgs84_to_gcj02
-    o = _wgs84_to_gcj02(body.origin[0], body.origin[1])
-    d = _wgs84_to_gcj02(body.destination[0], body.destination[1])
-    ways = [_wgs84_to_gcj02(w[0], w[1]) for w in body.waypoints[:6] if len(w) == 2]
+    g_lat, g_lon = _wgs84_to_gcj02(lat, lon)
+    return lat - (g_lat - lat), lon - (g_lon - lon)
+
+
+def _drive_route_cached(origin: list, destination: list, waypoints: list | None = None):
+    """驾车路线(WGS84 入参 → GCJ 折线出参),签名永久缓存;None=不可用。
+    地图页画路和 geo_infer 沿路插值共用。"""
+    key = os.environ.get("AMAP_API_KEY", "").strip()
+    if not key or len(origin) != 2 or len(destination) != 2:
+        return None
+    from src.utils.amap_geo import _wgs84_to_gcj02
+    o = _wgs84_to_gcj02(origin[0], origin[1])
+    d = _wgs84_to_gcj02(destination[0], destination[1])
+    ways = [_wgs84_to_gcj02(w[0], w[1]) for w in (waypoints or [])[:6] if len(w) == 2]
     sig = hashlib.md5(("|".join(f"{la:.3f},{ln:.3f}" for la, ln in [o, *ways, d]))
                       .encode()).hexdigest()[:16]
     with _DRIVE_LOCK:
@@ -4915,7 +4947,7 @@ def map_drive_route(body: DriveRouteRequest):
         except Exception:  # noqa: BLE001
             store = {}
     if sig in store:
-        return {"available": True, "cached": True, **store[sig]}
+        return {"cached": True, **store[sig]}
 
     import urllib.parse as _up
     import urllib.request as _ur
@@ -4927,11 +4959,11 @@ def map_drive_route(body: DriveRouteRequest):
     try:
         with _ur.urlopen(url, timeout=30) as resp:
             r = json.loads(resp.read())
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"高德路径规划失败: {e}")
+    except Exception:  # noqa: BLE001
+        return None
     paths = ((r.get("route") or {}).get("paths") or [])
     if str(r.get("status")) != "1" or not paths:
-        raise HTTPException(502, f"高德路径规划无结果: {r.get('info')}")
+        return None
     pts: list = []
     for step in paths[0].get("steps") or []:
         for pair in str(step.get("polyline") or "").split(";"):
@@ -4956,7 +4988,20 @@ def map_drive_route(body: DriveRouteRequest):
         os.makedirs(os.path.dirname(_DRIVE_ROUTES_PATH), exist_ok=True)
         with open(_DRIVE_ROUTES_PATH, "w", encoding="utf-8") as f:
             json.dump(store, f, ensure_ascii=False)
-    return {"available": True, "cached": False, **entry}
+    return {"cached": False, **entry}
+
+
+@app.post("/api/map/drive_route")
+def map_drive_route(body: DriveRouteRequest):
+    """把一条移动腿吸附到真实道路(高德驾车路径规划,消耗 key 配额:
+    每腿 1 次调用)。结果按 GCJ 坐标(3 位小数 ≈ 100m)签名永久缓存 —— 同一
+    段路全库只调一次,重开页面零成本。返回的折线已是 GCJ-02,前端直接画。"""
+    if not os.environ.get("AMAP_API_KEY", "").strip():
+        return {"available": False}
+    r = _drive_route_cached(body.origin, body.destination, body.waypoints)
+    if r is None:
+        raise HTTPException(502, "高德路径规划失败或无结果")
+    return {"available": True, **r}
 
 
 class RouteStyleRequest(BaseModel):

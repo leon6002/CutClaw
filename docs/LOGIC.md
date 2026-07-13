@@ -650,6 +650,7 @@ shot_point.json（多源 clip 各带 video_path）
 
 - **数据链**:`/api/immich/mgmt/album/{id}`(并行分页 + 60s 内存缓存 `_MGMT_ALBUM_CACHE`,写操作 worker 结束时清)→ `_mgmt_slim` 轻量字段;`/api/immich/mgmt/asset/{id}` 全景(EXIF+高德+相簿)。前端 zustand 缓存(sessionStorage 恢复现场)+ hash 路由。
 - **批量 worker**(全部走 `_ws_start` 单任务队列,前端浮标轮询):`geo_refresh`(高德逆地理→📍 分级地址行)、`score`(VLM 评分→星级+带依据描述块,`photo_scores.json` 幂等)、`geo_infer`(无 GPS 按**墙钟**时间轴向邻居插值——DJI/Pocket 导出无时区被 Immich 当 UTC 存,UTC 轴会漂 8h)。
+- **geo_infer v2(沿公路)**:直线插值的弦会切弯道、把点甩出公路几十公里(用户实测)→ 邻居间隔 1–300km 时改用高德驾车路线(`_drive_route_cached` 与地图页共用缓存),按时间比例取**弧长位置**,GCJ 折线转回 WGS 再写 Immich(`_gcj_to_wgs` 一次迭代逆变换);`force=true` 可重推带 🧭 标记的历史推测(真实拍摄 GPS 永不动),邻居候选排除同为推测的点(防推测喂推测)。实测:弦点重推位移 94.75km 贴回公路。
 - **性能铁律**(2026-07-11 卡顿返工教训):网格缩略图必须用 `?size=thumbnail`(~55KB webp),preview(~850KB)只给灯箱;tile 必须 memo 化+回调 useCallback 稳定;**禁止 per-tile backdrop-blur/transition-all**;日期区块加 `content-visibility:auto`;O(n²) 统计不许写在 render 里。
 
 ## 20. 相似整理(连拍聚类 → 选优 → Immich 堆叠)
