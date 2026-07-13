@@ -195,10 +195,10 @@ export default function JourneyMapView() {
 
     let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
     let donePath: [number, number][] = [];
-    // 阻尼镜头:指数平滑跟车 + 平滑推拉,不再逐帧钉死在车头上
-    // (山路密集拐点会全部变成镜头抖动)
-    let camLat = playSeq[0].ll[0], camLng = playSeq[0].ll[1];
-    let zoomCur = map.getZoom();
+    // 镜头纪律:段内**锁定缩放**(每帧改缩放会让瓦片永远加载不完→黑屏,
+    // 且全部图层逐帧重算→狂抖);平移用 Leaflet 动画短步(280ms 一段,
+    // 连起来即连续);只在段切换时 flyTo 一次平滑变焦。
+    let lastPan = 0, zoomHoldUntil = 0, lastSi = -1;
     const step = () => {
       const now = performance.now();
       p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
@@ -235,14 +235,17 @@ export default function JourneyMapView() {
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      camLat += (ll[0] - camLat) * 0.10;
-      camLng += (ll[1] - camLng) * 0.10;
-      if (autoZoomRef.current) {
-        const zTarget = s.kind === "stop" ? STOP_ZOOM : legZoom(pl.km);
-        zoomCur += (zTarget - zoomCur) * 0.035;
-        map.setView([camLat, camLng], zoomCur, { animate: false });
-      } else {
-        map.panTo([camLat, camLng], { animate: false });
+      if (si !== lastSi) {
+        lastSi = si;
+        if (autoZoomRef.current) {
+          const zt = s.kind === "stop" ? STOP_ZOOM : legZoom(pl.km);
+          map.flyTo(ll, zt, { duration: 1.3, easeLinearity: 0.4 });
+          zoomHoldUntil = now + 1500;   // flyTo 期间不 pan,别打断它
+        }
+      }
+      if (now > zoomHoldUntil && now - lastPan > 280) {
+        map.panTo(ll, { animate: true, duration: 0.3, easeLinearity: 0.5, noMoveStart: true } as any);
+        lastPan = now;
       }
       if (p >= 1) {
         if (!doneAt) doneAt = now;
@@ -308,7 +311,8 @@ export default function JourneyMapView() {
         return [gla, gln] as [number, number];
       });
       pts.forEach((p) => allPts.push(p));
-      if (pts.length >= 2) {
+      // 真实路线模式下不画整天直连线(转场直线弦和道路线重叠,乱)
+      if (!roadMode && pts.length >= 2) {
         L.polyline(pts, { color, weight: 3, opacity: 0.5 }).addTo(layer);
         L.polyline(pts, { color, weight: 1.5, opacity: 0.95 }).addTo(layer);
       }
@@ -333,10 +337,20 @@ export default function JourneyMapView() {
       });
       void di;
     });
-    // 真实路线覆盖层:自驾腿画道路形状(白线+深色描边),航段画虚线
+    // 真实路线覆盖层:停留簇画当天色短线,自驾腿画道路形状(白线+描边),
+    // 航段虚线,还没拉回来的腿画细虚线占位
     if (roadMode) {
+      const colorOf = (i0: number) => {
+        const k = String(playSeq[i0]?.m.taken_at || "").slice(0, 10);
+        return DAY_COLORS[Math.max(0, days.findIndex(([x]) => x === k)) % DAY_COLORS.length];
+      };
       for (const s of segs) {
-        if (s.kind !== "leg") continue;
+        if (s.kind === "stop") {
+          const pts = playSeq.slice(s.i0, s.i1 + 1).map((x) => x.ll);
+          if (pts.length >= 2)
+            L.polyline(pts, { color: colorOf(s.i0), weight: 2.5, opacity: 0.85 }).addTo(layer);
+          continue;
+        }
         const rd = roadsRef.current.get(legKey(s));
         if (rd === "flight") {
           L.polyline([playSeq[s.i0].ll, playSeq[s.i1].ll],
@@ -344,6 +358,9 @@ export default function JourneyMapView() {
         } else if (Array.isArray(rd)) {
           L.polyline(rd, { color: "#0f172a", weight: 6, opacity: 0.4 }).addTo(layer);
           L.polyline(rd, { color: "#ffffff", weight: 3.5, opacity: 0.95 }).addTo(layer);
+        } else {
+          L.polyline([playSeq[s.i0].ll, playSeq[s.i1].ll],
+            { color: "#64748b", weight: 1.5, opacity: 0.5, dashArray: "2 6" }).addTo(layer);
         }
       }
     }
