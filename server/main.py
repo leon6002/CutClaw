@@ -851,14 +851,26 @@ def immich_mgmt_album(album_id: str, force: bool = False):
         nxt = a.get("nextPage")
         return a.get("items", []), (int(nxt) if nxt else None), int(a.get("total") or 0)
 
-    first, nxt, total = _fetch(1)
+    first, nxt, _total = _fetch(1)
     assets: list = list(first)
-    if nxt:
-        n_pages = min(6, (max(total, len(first)) + _PAGE - 1) // _PAGE) if total else 6
+    # ⚠ Immich v3 的 search 响应 total = 本页条数而非相簿总数(实测 1954 张
+    # 的相簿 total=500)→ 按它算页数永远 1 页,大相簿只显示前 500 张。
+    # 页数必须用相簿自己的 assetCount;缺失时按 nextPage 串行兜底。
+    album_total = int(al.get("assetCount") or 0)
+    if album_total > len(assets):
+        n_pages = min(24, (album_total + _PAGE - 1) // _PAGE)
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=5) as ex:
             for chunk, _, _ in ex.map(lambda p: _fetch(p), range(2, n_pages + 1)):
                 assets.extend(chunk)
+    elif nxt:
+        page = 2
+        while page <= 24:
+            chunk, nxt2, _ = _fetch(page)
+            assets.extend(chunk)
+            if not chunk or not nxt2:
+                break
+            page += 1
     items = [_mgmt_slim(a) for a in assets]
     # Immich v3 的 search/metadata 不返回 stack 字段(withStacked 传啥都不带,
     # 实测),堆叠信息必须从 /stacks 列表补 —— 否则子项永远藏不住。
