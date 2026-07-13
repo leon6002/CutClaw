@@ -28,7 +28,7 @@ export default function JourneyMapView() {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [autoZoom, setAutoZoom] = useState(true);   // 播放时随速度丝滑缩放
-  const [playPhoto, setPlayPhoto] = useState<ImItem | null>(null);
+  const [playPhotos, setPlayPhotos] = useState<ImItem[]>([]);   // 放映位:1 张大图或四宫格
   const speedRef = useRef(1);
   speedRef.current = speed;
   const autoZoomRef = useRef(true);
@@ -167,7 +167,9 @@ export default function JourneyMapView() {
     const plans: Plan[] = segs.map((s) => {
       let pts = playSeq.slice(s.i0, s.i1 + 1).map((x) => x.ll);
       if (s.kind === "stop") {
-        return { s, dur: Math.min(8, Math.max(1.4, 1.0 * s.show.length)),
+        // 四宫格分页:每页 ≤4 张 ~1.7s,多图景点快速看完
+        const pages = Math.max(1, Math.ceil(s.show.length / 4));
+        return { s, dur: Math.min(6.5, Math.max(1.6, 1.7 * pages)),
                  t0: 0, pts, cum: [0], flight: false, km: 0 };
       }
       const rd = roadMode ? roadsRef.current.get(legKey(s)) : undefined;
@@ -194,7 +196,7 @@ export default function JourneyMapView() {
       zIndexOffset: 2000, interactive: false,
     }).addTo(map);
 
-    let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
+    let p = 0, last = performance.now(), lastKey = "", doneAt = 0, si = 0;
     let donePath: [number, number][] = [];
     // 镜头纪律:不逐帧改缩放(瓦片会加载不完→黑屏);平移用 Leaflet 动画
     // 短步(280ms);缩放按"到本段终点的剩余距离"连续收紧 —— 越接近节点
@@ -214,10 +216,13 @@ export default function JourneyMapView() {
       const s = pl.s;
       const f = Math.min(1, (tt - pl.t0) / pl.dur);
       let ll: [number, number];
-      let idx: number;
       if (s.kind === "stop") {
         ll = pl.pts[pl.pts.length - 1];
-        idx = s.show[Math.min(s.show.length - 1, Math.floor(f * s.show.length))];
+        const pages = Math.max(1, Math.ceil(s.show.length / 4));
+        const page = Math.min(pages - 1, Math.floor(f * pages));
+        const grp = s.show.slice(page * 4, page * 4 + 4);
+        const key = grp.join(",");
+        if (key !== lastKey) { setPlayPhotos(grp.map((i) => playSeq[i].m)); lastKey = key; }
         const tl = [...donePath, ...pl.pts];
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
@@ -228,7 +233,8 @@ export default function JourneyMapView() {
         const g = Math.min(1, (d - pl.cum[j]) / Math.max(pl.cum[j + 1] - pl.cum[j], 1e-12));
         const [a, b] = [pl.pts[j], pl.pts[j + 1]];
         ll = [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
-        idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * f));
+        const idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * f));
+        if (String(idx) !== lastKey) { setPlayPhotos([playSeq[idx].m]); lastKey = String(idx); }
         const tl = [...donePath, ...pl.pts.slice(0, j + 1), ll];
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
@@ -240,7 +246,6 @@ export default function JourneyMapView() {
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
-      if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
       if (autoZoomRef.current && now > zoomHoldUntil) {
         let zt: number;
         if (s.kind === "stop") {
@@ -271,7 +276,7 @@ export default function JourneyMapView() {
     };
     const timer = window.setInterval(step, 33);
     return () => { window.clearInterval(timer); trail.remove(); trailGlow.remove();
-                   head.remove(); setPlayPhoto(null); };
+                   head.remove(); setPlayPhotos([]); };
   }, [playing, playSeq, segs, roadMode]);
   // 首次载入相簿后默认选最后一天
   useEffect(() => {
@@ -487,19 +492,32 @@ export default function JourneyMapView() {
       <div className="relative min-h-0 flex-1">
         <div ref={boxRef} className={cn("absolute inset-0 overflow-hidden rounded-2xl ring-1 ring-white/10",
           darkMap && "jm-dark")} />
-        {/* 播放时:走到哪儿就"放映"哪儿的照片(大图 + 淡入,点击开灯箱) */}
-        {playing && playPhoto && (
-          <button
-            className="absolute bottom-4 left-4 z-[1100] w-[min(38vw,400px)] overflow-hidden rounded-xl bg-slate-950/90 text-left shadow-[0_10px_36px_rgba(0,0,0,0.6)] ring-1 ring-white/15 backdrop-blur-sm"
-            onClick={() => setDetail(playPhoto)}>
-            <img key={playPhoto.id} src={`/api/immich/thumb/${playPhoto.id}`}
-              className="jm-fade max-h-[42vh] w-full bg-black/40 object-contain" />
-            <div className="flex items-center gap-2.5 px-3 py-2 text-[11.5px] text-slate-300">
-              <span className="font-medium text-white">{String(playPhoto.taken_at).replace("T", " ").slice(5, 16)}</span>
-              {playPhoto.type === "VIDEO" && <span className="text-[10px] text-slate-400">▶ 视频</span>}
-              {playPhoto.city && <span className="text-slate-400">📍 {playPhoto.city}</span>}
+        {/* 播放时:单张大图 / 多张四宫格放映(淡入,点任意一格开灯箱) */}
+        {playing && playPhotos.length > 0 && (
+          <div className="absolute bottom-4 left-4 z-[1100] w-[min(38vw,420px)] overflow-hidden rounded-xl bg-slate-950/90 shadow-[0_10px_36px_rgba(0,0,0,0.6)] ring-1 ring-white/15 backdrop-blur-sm">
+            <div className={cn("grid gap-1 bg-black/40 p-1",
+              playPhotos.length === 1 ? "grid-cols-1" : "grid-cols-2")}>
+              {playPhotos.map((m) => (
+                <button key={m.id} className="relative overflow-hidden rounded-lg"
+                  onClick={() => setDetail(m)}>
+                  <img key={m.id}
+                    src={playPhotos.length === 1
+                      ? `/api/immich/thumb/${m.id}` : m.thumb}
+                    className={cn("jm-fade w-full",
+                      playPhotos.length === 1 ? "max-h-[40vh] object-contain" : "aspect-square object-cover")} />
+                  {m.type === "VIDEO" && (
+                    <span className="absolute bottom-1 right-1.5 text-[10px] text-white/90"
+                      style={{ textShadow: "0 1px 3px rgba(0,0,0,.9)" }}>▶</span>
+                  )}
+                </button>
+              ))}
             </div>
-          </button>
+            <div className="flex items-center gap-2.5 px-3 py-2 text-[11.5px] text-slate-300">
+              <span className="font-medium text-white">{String(playPhotos[0].taken_at).replace("T", " ").slice(5, 16)}</span>
+              {playPhotos[0].city && <span className="text-slate-400">📍 {playPhotos[0].city}</span>}
+              {playPhotos.length > 1 && <span className="text-slate-500">同地 {playPhotos.length} 张</span>}
+            </div>
+          </div>
         )}
       </div>
 
