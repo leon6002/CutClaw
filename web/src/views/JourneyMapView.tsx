@@ -11,6 +11,22 @@ import { wgs2gcj } from "../lib/geo";
 import { useImmichStore, type ImItem } from "../store";
 
 const DAY_COLORS = ["#38bdf8", "#f472b6", "#34d399", "#fbbf24", "#a78bfa", "#fb7185", "#4ade80", "#60a5fa"];
+
+// 播放镜头参数(全部可在 ⚙ 面板调,存 localStorage)
+type CamCfg = {
+  px: number;                                   // 屏幕车速 px/s
+  cruiseLong: number; cruiseMid: number; cruiseShort: number;   // 巡航挡(>60/15-60/<15km)
+  approach: number;                             // 进场挡(剩 15%/6km)
+  stop: number; stopRich: number;               // 停留挡 / 大景点挡(≥12 张)
+  flightCruise: number; flightApproach: number; // 航段巡航/进场
+};
+const DEF_CAM: CamCfg = { px: 55, cruiseLong: 8, cruiseMid: 9.5, cruiseShort: 11,
+  approach: 12.5, stop: 14, stopRich: 14.5, flightCruise: 6, flightApproach: 9 };
+const CAM_FIELDS: [keyof CamCfg, string][] = [
+  ["px", "车速 px/s"], ["cruiseLong", "巡航·长途(>60km)"], ["cruiseMid", "巡航·中途"],
+  ["cruiseShort", "巡航·短途(<15km)"], ["approach", "进场挡"], ["stop", "停留挡"],
+  ["stopRich", "大景点挡(≥12张)"], ["flightCruise", "航段·巡航"], ["flightApproach", "航段·进场"],
+];
 const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 const dayLabel = (k: string) => {
   const d = new Date(k);
@@ -32,6 +48,20 @@ export default function JourneyMapView() {
     Number(localStorage.getItem("jm-zoomgap")) || 8);
   const zoomGapRef = useRef(8);
   zoomGapRef.current = zoomGap;
+  const [cam, setCam] = useState<CamCfg>(() => {
+    try { return { ...DEF_CAM, ...JSON.parse(localStorage.getItem("jm-cam") || "{}") }; }
+    catch { return DEF_CAM; }
+  });
+  const camRef = useRef(cam);
+  camRef.current = cam;
+  const [showCam, setShowCam] = useState(false);
+  const setCamField = (k: keyof CamCfg, v: number) => {
+    setCam((c) => {
+      const n = { ...c, [k]: v };
+      localStorage.setItem("jm-cam", JSON.stringify(n));
+      return n;
+    });
+  };
   const [playPhotos, setPlayPhotos] = useState<ImItem[]>([]);   // 放映位:1 张大图或四宫格
   const speedRef = useRef(1);
   speedRef.current = speed;
@@ -186,8 +216,7 @@ export default function JourneyMapView() {
     });
     // 屏幕恒速模型(用户洞察:固定物理车速 × 不断变大的缩放 = 屏幕上巨快
     // 且忽快忽慢 → 晕):像素速度锁定,物理速度随当前缩放自动换挡。
-    // 120 仍被反馈太快 → 55(悠闲巡航;嫌慢用 2×/4× 倍速)。
-    const PX_PER_SEC = 55;
+    // 车速与各挡位全部可配置(⚙ 面板,localStorage)。
     const STOP_ZOOM = 13.5;
 
     // 绿色尾迹:淡辉光宽线 + 亮主线,走过的地方被点亮
@@ -235,14 +264,14 @@ export default function JourneyMapView() {
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
         const cnt = s.i1 - s.i0 + 1;     // 照片多的重头景点推近半档
-        ztWanted = cnt >= 12 ? 14.5 : 14;
+        ztWanted = cnt >= 12 ? camRef.current.stopRich : camRef.current.stop;
         if (segT >= pl.dur) advance = true;
       } else {
         // 屏幕恒速推进:本帧物理位移 = 像素速度 ÷ 当前缩放比例。
         // 固定物理车速 × 放大的镜头 = 屏幕上巨快(晕的根源,用户洞察);
         // 锁定像素速度后,物理速度随缩放自动换挡,肉眼速率恒定。
         const pxPerDeg = (256 * Math.pow(2, map.getZoom())) / 360;
-        dist += (PX_PER_SEC / pxPerDeg) * dt;
+        dist += (camRef.current.px / pxPerDeg) * dt;
         const totalD = pl.cum[pl.cum.length - 1];
         if (dist >= totalD) { dist = totalD; advance = true; }
         let j = 0;
@@ -263,11 +292,12 @@ export default function JourneyMapView() {
         }
         const remainKm = Math.max(0, (totalD - dist) * 111);
         const approaching = remainKm < Math.max(6, pl.km * 0.15);
+        const c = camRef.current;
         if (pl.flight) {
-          ztWanted = approaching ? 9 : 6;
+          ztWanted = approaching ? c.flightApproach : c.flightCruise;
         } else {
-          const cruise = pl.km > 60 ? 8 : pl.km > 15 ? 9.5 : 11;
-          ztWanted = approaching ? 12.5 : cruise;
+          const cruise = pl.km > 60 ? c.cruiseLong : pl.km > 15 ? c.cruiseMid : c.cruiseShort;
+          ztWanted = approaching ? c.approach : cruise;
         }
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
@@ -488,6 +518,13 @@ export default function JourneyMapView() {
                     {[4, 8, 15, 30].map((v) => <option key={v} value={v}>间隔 ≥{v}s</option>)}
                   </select>
                 )}
+                <button
+                  className={cn("h-7 rounded-full px-2 text-[12px] transition-colors",
+                    showCam ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
+                  title="镜头参数:车速与各挡位缩放倍数"
+                  onClick={() => setShowCam((v) => !v)}>
+                  ⚙
+                </button>
               </>
             )}
           </>
@@ -520,6 +557,33 @@ export default function JourneyMapView() {
 
       {/* 地图 */}
       <div className="relative min-h-0 flex-1">
+        {/* 镜头参数面板(实时生效,存 localStorage) */}
+        {showCam && (
+          <div className="absolute right-3 top-3 z-[1200] w-56 rounded-xl border border-white/10 bg-slate-950/92 p-3 shadow-[0_10px_36px_rgba(0,0,0,0.6)] backdrop-blur-sm">
+            <div className="mb-2 flex items-center justify-between text-[11.5px]">
+              <span className="font-medium text-slate-200">镜头参数</span>
+              <button className="text-[10.5px] text-slate-500 hover:text-cyan-300"
+                onClick={() => { localStorage.removeItem("jm-cam"); setCam(DEF_CAM); }}>
+                恢复默认
+              </button>
+            </div>
+            <div className="space-y-1.5">
+              {CAM_FIELDS.map(([k, label]) => (
+                <label key={k} className="flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                  {label}
+                  <input type="number" step={k === "px" ? 5 : 0.5}
+                    min={k === "px" ? 15 : 3} max={k === "px" ? 300 : 17}
+                    className="w-16 rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-right text-[11px] text-slate-200 focus:border-cyan-500/40 focus:outline-none"
+                    value={cam[k]}
+                    onChange={(e) => setCamField(k, Number(e.target.value))} />
+                </label>
+              ))}
+            </div>
+            <div className="mt-2 text-[10px] leading-relaxed text-slate-600">
+              改动即时生效(含播放中);挡位是 Leaflet 缩放级,越大越近。
+            </div>
+          </div>
+        )}
         <div ref={boxRef} className={cn("absolute inset-0 overflow-hidden rounded-2xl ring-1 ring-white/10",
           darkMap && "jm-dark")} />
         {/* 播放时:单张大图 / 多张四宫格放映(淡入,点任意一格开灯箱) */}
