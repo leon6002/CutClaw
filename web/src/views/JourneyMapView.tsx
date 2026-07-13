@@ -271,7 +271,11 @@ export default function JourneyMapView() {
     // 镜头挡位制(连续追踪目标=永远在变焦,还是晕):每腿最多换 3 次挡 ——
     // 出发定巡航挡(按整腿里程)→ 进场挡(剩 15% / 6km)→ 停留挡(到站)。
     // 每次换挡是一段完整 flyTo(时长随跨度 0.8~2.6s),挡内缩放纹丝不动。
-    let lastPan = 0, zoomHoldUntil = 0, segT = 0, dist = 0, doneWait = 0;
+    // 跟随用**死区**(用户方案):车在屏幕中心 40% 区域内镜头不动,出界后
+    // 每帧只平移"按回边界"的像素量 → 连续丝滑,零跳步。flyTo 动画期间
+    // 暂停跟随(flyUntil);变焦冷却(zoomHoldUntil)只管换挡,不再冻结平移
+    // ——之前俩绑一起,换挡后镜头瘫 8 秒不跟车("有时候不跟随")。
+    let zoomHoldUntil = 0, flyUntil = 0, segT = 0, dist = 0, doneWait = 0;
     let lastGear = NaN;
     const step = () => {
       const now = performance.now();
@@ -345,13 +349,22 @@ export default function JourneyMapView() {
         if (dz >= 0.4) {
           const durS = Math.min(2.6, 0.8 + 0.35 * dz);   // 跨度越大飞得越久,一次到位
           map.flyTo(ll, ztWanted, { duration: durS, easeLinearity: 0.3 });
+          flyUntil = now + durS * 1000 + 150;            // 只在飞行期间暂停跟随
           // 变焦冷却:飞行时长与用户配置的最小间隔取大者(默认 ≥8s)
           zoomHoldUntil = now + Math.max(durS * 1000 + 400, zoomGapRef.current * 1000);
         }
       }
-      if (now > zoomHoldUntil && now - lastPan > 280) {
-        map.panTo(ll, { animate: true, duration: 0.3, easeLinearity: 0.5, noMoveStart: true } as any);
-        lastPan = now;
+      if (now > flyUntil) {
+        // 死区跟随:出界多少平移多少(逐帧微量 panBy,连续无跳步)
+        const pt = map.latLngToContainerPoint(ll as any);
+        const sz = map.getSize();
+        const mx = sz.x * 0.30, my = sz.y * 0.30;
+        let dx = 0, dy = 0;
+        if (pt.x < mx) dx = pt.x - mx;
+        else if (pt.x > sz.x - mx) dx = pt.x - (sz.x - mx);
+        if (pt.y < my) dy = pt.y - my;
+        else if (pt.y > sz.y - my) dy = pt.y - (sz.y - my);
+        if (dx || dy) map.panBy([dx, dy], { animate: false });
       }
       if (advance) {
         donePath = donePath.concat(pl.pts);
