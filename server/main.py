@@ -810,6 +810,7 @@ def _mgmt_slim(a: dict) -> dict:
         "lon": (round(float(ex["longitude"]), 6) if ex.get("longitude") is not None else None),
         "city": ex.get("city"),
         "geo_done": _GEO_MARK in desc,
+        "geo_inferred": "🧭" in desc,   # GPS 是推测的(非拍摄原始),地图上区分显示
         "score_done": _PHOTO_MARK in desc,
         "size_mb": round((ex.get("fileSizeInByte") or 0) / 1e6, 1),
     }

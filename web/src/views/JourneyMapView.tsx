@@ -468,13 +468,20 @@ export default function JourneyMapView() {
         if (i % step === 0) {
           const icon = L.divIcon({
             className: "",
-            html: `<div class="jm-pin" style="border-color:${color}">
+            html: `<div class="jm-pin${m.geo_inferred ? " jm-pin-inferred" : ""}" style="border-color:${color}"
+                     title="${m.geo_inferred ? "GPS 为推测(非拍摄原始)" : ""}">
                      <img src="${m.thumb}" loading="lazy"/>
                      ${m.type === "VIDEO" ? '<span class="jm-play">▶</span>' : ""}
+                     ${m.geo_inferred ? '<span class="jm-inf">🧭</span>' : ""}
                    </div>`,
             iconSize: [44, 44], iconAnchor: [22, 22],
           });
           L.marker(p, { icon }).on("click", () => setDetail(m)).addTo(layer);
+        } else if (m.geo_inferred) {
+          // 推测点:空心虚线圈,和真实拍摄点一眼区分
+          L.circleMarker(p, { radius: 3.5, color, weight: 1.5, dashArray: "2 3",
+                              fillColor: color, fillOpacity: 0.12 })
+            .on("click", () => setDetail(m)).addTo(layer);
         } else {
           L.circleMarker(p, { radius: 3.5, color, weight: 1, fillColor: color, fillOpacity: 0.85 })
             .on("click", () => setDetail(m)).addTo(layer);
@@ -552,6 +559,11 @@ export default function JourneyMapView() {
             <button className="text-[11px] text-slate-500 hover:text-cyan-300"
               onClick={() => setSelDays(new Set())}>清空</button>
             {noGps > 0 && <span className="text-[10.5px] text-slate-600">{noGps} 项无 GPS 未显示</span>}
+            {days.some(([, v]) => v.some((m) => m.geo_inferred)) && (
+              <span className="text-[10.5px] text-slate-600" title="带 🧭 角标/空心虚线圈的点,坐标由相邻照片推测而来">
+                🧭/空心圈 = 推测 GPS
+              </span>
+            )}
             {selDays.size > 0 && playSeq.length >= 2 && (
               <>
                 <button
@@ -736,6 +748,9 @@ export default function JourneyMapView() {
         .jm-pin img { width: 100%; height: 100%; object-fit: cover; display:block; }
         .jm-play { position:absolute; right:2px; bottom:1px; font-size:9px; color:#fff;
                    text-shadow:0 1px 3px rgba(0,0,0,.9); }
+        .jm-pin-inferred { border-style: dashed; opacity: .85; }
+        .jm-inf { position:absolute; left:1px; top:0; font-size:9px;
+                  filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)); }
         .leaflet-container { background:#0b0f1a; }
         .jm-head-wrap { width:34px; height:34px; display:flex; align-items:center; justify-content:center; }
         .jm-head-dot { width:16px; height:16px; border-radius:50%; background:#fff;
