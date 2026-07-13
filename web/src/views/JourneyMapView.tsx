@@ -180,8 +180,9 @@ export default function JourneyMapView() {
       return { s, dur: Math.min(14, Math.max(3, km * 0.5)), t0: 0, pts, cum,
                flight: s.kmh > 180, km };
     });
-    let total = 0;
-    for (const pl of plans) { pl.t0 = total; total += pl.dur; }
+    // 屏幕恒速模型(用户洞察:固定物理车速 × 不断变大的缩放 = 屏幕上巨快
+    // 且忽快忽慢 → 晕):像素速度锁定,物理速度随当前缩放自动换挡。
+    const PX_PER_SEC = 120;
     const STOP_ZOOM = 13.5;
 
     // 绿色尾迹:淡辉光宽线 + 亮主线,走过的地方被点亮
@@ -196,44 +197,54 @@ export default function JourneyMapView() {
       zIndexOffset: 2000, interactive: false,
     }).addTo(map);
 
-    let p = 0, last = performance.now(), lastKey = "", doneAt = 0, si = 0;
+    let last = performance.now(), lastKey = "", si = 0;
     let donePath: [number, number][] = [];
-    // 镜头纪律:不逐帧改缩放(瓦片会加载不完→黑屏);平移用 Leaflet 动画
-    // 短步(280ms);缩放按"到本段终点的剩余距离"连续收紧 —— 越接近节点
-    // 越放大(以前到站才瞬间跳,且巡航缩太远看不见路,用户反馈)。
-    // 差值 ≥0.6 级才触发一次 flyTo(0.9s),链式衔接即为渐进推近。
-    let lastPan = 0, zoomHoldUntil = 0;
+    // 镜头纪律:不逐帧改缩放(瓦片黑屏);平移动画短步(280ms);缩放低频
+    // 台阶式(差 ≥0.8 才动、单步 ±1.2、间隔 ≥2.4s)—— 高频推拉也晕。
+    let lastPan = 0, zoomHoldUntil = 0, segT = 0, dist = 0, doneWait = 0;
     const step = () => {
       const now = performance.now();
-      p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
+      const dt = Math.min(0.2, (now - last) / 1000) * speedRef.current;
       last = now;
-      const tt = p * total;
-      while (si < plans.length - 1 && tt >= plans[si].t0 + plans[si].dur) {
-        donePath = donePath.concat(plans[si].pts);    // 段完成 → 并入尾迹
-        si++;
+      if (si >= plans.length) {          // 全程走完:定格 1.8s 收尾
+        doneWait += dt;
+        if (doneWait > 1.8) setPlaying(false);
+        return;
       }
       const pl = plans[si];
       const s = pl.s;
-      const f = Math.min(1, (tt - pl.t0) / pl.dur);
       let ll: [number, number];
+      let ztWanted: number;
+      let advance = false;
       if (s.kind === "stop") {
+        segT += dt;
         ll = pl.pts[pl.pts.length - 1];
         const pages = Math.max(1, Math.ceil(s.show.length / 4));
-        const page = Math.min(pages - 1, Math.floor(f * pages));
+        const page = Math.min(pages - 1, Math.floor((segT / pl.dur) * pages));
         const grp = s.show.slice(page * 4, page * 4 + 4);
         const key = grp.join(",");
         if (key !== lastKey) { setPlayPhotos(grp.map((i) => playSeq[i].m)); lastKey = key; }
         const tl = [...donePath, ...pl.pts];
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
+        const cnt = s.i1 - s.i0 + 1;     // 照片越多越是重头景点 → 推得越近
+        ztWanted = Math.min(15.5, STOP_ZOOM + 0.8 * Math.log2(1 + cnt / 8));
+        if (segT >= pl.dur) advance = true;
       } else {
-        const d = f * pl.cum[pl.cum.length - 1];
+        // 屏幕恒速推进:本帧物理位移 = 像素速度 ÷ 当前缩放比例。
+        // 固定物理车速 × 放大的镜头 = 屏幕上巨快(晕的根源,用户洞察);
+        // 锁定像素速度后,物理速度随缩放自动换挡,肉眼速率恒定。
+        const pxPerDeg = (256 * Math.pow(2, map.getZoom())) / 360;
+        dist += (PX_PER_SEC / pxPerDeg) * dt;
+        const totalD = pl.cum[pl.cum.length - 1];
+        if (dist >= totalD) { dist = totalD; advance = true; }
         let j = 0;
-        while (j < pl.cum.length - 2 && pl.cum[j + 1] < d) j++;
-        const g = Math.min(1, (d - pl.cum[j]) / Math.max(pl.cum[j + 1] - pl.cum[j], 1e-12));
+        while (j < pl.cum.length - 2 && pl.cum[j + 1] < dist) j++;
+        const g = Math.min(1, (dist - pl.cum[j]) / Math.max(pl.cum[j + 1] - pl.cum[j], 1e-12));
         const [a, b] = [pl.pts[j], pl.pts[j + 1]];
         ll = [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
-        const idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * f));
+        const fD = totalD > 1e-12 ? dist / totalD : 1;
+        const idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * fD));
         if (String(idx) !== lastKey) { setPlayPhotos([playSeq[idx].m]); lastKey = String(idx); }
         const tl = [...donePath, ...pl.pts.slice(0, j + 1), ll];
         trail.setLatLngs(tl);
@@ -243,35 +254,27 @@ export default function JourneyMapView() {
           el.textContent = pl.flight ? "✈️" : "🚗";
           el.style.transform = b[1] < a[1] ? "scaleX(-1)" : "";
         }
+        const remainKm = Math.max(0, (totalD - dist) * 111);
+        const floor_ = pl.flight ? 5 : 8;                // 自驾下限 8:公路仍清晰可见
+        ztWanted = Math.max(floor_, Math.min(STOP_ZOOM, 15.2 - 1.05 * Math.log2(remainKm + 1.5)));
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (autoZoomRef.current && now > zoomHoldUntil) {
-        let zt: number;
-        if (s.kind === "stop") {
-          // 照片越多越是重头景点 → 推得越近(13.5 起步,最深 15.5)
-          const cnt = s.i1 - s.i0 + 1;
-          zt = Math.min(15.5, STOP_ZOOM + 0.8 * Math.log2(1 + cnt / 8));
-        } else {
-          const remainKm = Math.max(0, (1 - f) * pl.km);   // 弧长匀速下时间比≈距离比
-          const floor_ = pl.flight ? 5 : 8;                // 自驾下限 8:公路仍清晰可见
-          zt = Math.max(floor_, Math.min(STOP_ZOOM, 15.2 - 1.05 * Math.log2(remainKm + 1.5)));
-        }
         const cur = map.getZoom();
-        if (Math.abs(zt - cur) >= 0.6) {
-          // 缩放限速:单步最多 ±1.6 级,大跨度拆成台阶渐进,不许一跳到底
-          const stepZ = cur + Math.max(-1.6, Math.min(1.6, zt - cur));
-          map.flyTo(ll, stepZ, { duration: 0.9, easeLinearity: 0.4 });
-          zoomHoldUntil = now + 1000;   // flyTo 期间不 pan,别打断它
+        if (Math.abs(ztWanted - cur) >= 0.8) {
+          const stepZ = cur + Math.max(-1.2, Math.min(1.2, ztWanted - cur));
+          map.flyTo(ll, stepZ, { duration: 1.1, easeLinearity: 0.35 });
+          zoomHoldUntil = now + 2400;    // 低频:一次推拉看完再来下一次
         }
       }
       if (now > zoomHoldUntil && now - lastPan > 280) {
         map.panTo(ll, { animate: true, duration: 0.3, easeLinearity: 0.5, noMoveStart: true } as any);
         lastPan = now;
       }
-      if (p >= 1) {
-        if (!doneAt) doneAt = now;
-        if (now - doneAt > 1800) setPlaying(false);
+      if (advance) {
+        donePath = donePath.concat(pl.pts);
+        si++; segT = 0; dist = 0;
       }
     };
     const timer = window.setInterval(step, 33);
