@@ -265,7 +265,7 @@ export default function App() {
       <div className="flex min-h-screen flex-col">
         {/* ── glass header ── */}
         <header className="sticky top-0 z-40 border-b border-white/[0.07] bg-slate-950/60 backdrop-blur-xl">
-          <div className="mx-auto flex h-14 max-w-[1320px] items-center gap-3 px-5">
+          <div className="mx-auto flex h-14 w-full max-w-[1920px] items-center gap-3 px-6">
             <div className="flex items-center gap-2 whitespace-nowrap text-[17px] font-bold">
               <Clapperboard className="h-5 w-5 text-cyan-400 drop-shadow-[0_0_6px_rgba(34,211,238,0.7)]" />
               <span>Cut<span className="text-cyan-400">Claw</span></span>
@@ -330,7 +330,7 @@ export default function App() {
         </header>
 
         {/* ── content ── */}
-        <main className="mx-auto w-full max-w-[1320px] flex-1 px-5 py-5">
+        <main className="mx-auto w-full max-w-[1920px] flex-1 px-6 py-5">
           {!loaded || !project ? (
             <div className="py-20 text-center text-sm text-slate-500">正在连接 CutClaw 服务…</div>
           ) : (
