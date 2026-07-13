@@ -355,16 +355,17 @@ export default function JourneyMapView() {
         }
       }
       if (now > flyUntil) {
-        // 死区跟随:出界多少平移多少(逐帧微量 panBy,连续无跳步)
+        // 静止优先跟随(用户方案 v2):地图平时完全不动,小车在画面里自己
+        // 跑;跑出中心 ~50% 区域才**一次性**平滑回中(0.7s),然后继续静止。
+        // (逐帧贴边跟随让地图持续蠕动,GPS 点位的不均匀全变成画面卡顿感)
         const pt = map.latLngToContainerPoint(ll as any);
         const sz = map.getSize();
-        const mx = sz.x * 0.30, my = sz.y * 0.30;
-        let dx = 0, dy = 0;
-        if (pt.x < mx) dx = pt.x - mx;
-        else if (pt.x > sz.x - mx) dx = pt.x - (sz.x - mx);
-        if (pt.y < my) dy = pt.y - my;
-        else if (pt.y > sz.y - my) dy = pt.y - (sz.y - my);
-        if (dx || dy) map.panBy([dx, dy], { animate: false });
+        const mx = sz.x * 0.26, my = sz.y * 0.26;
+        const out = pt.x < mx || pt.x > sz.x - mx || pt.y < my || pt.y > sz.y - my;
+        if (out) {
+          map.panTo(ll as any, { animate: true, duration: 0.7, easeLinearity: 0.35 } as any);
+          flyUntil = now + 800;   // 回中动画期间不重复触发
+        }
       }
       if (advance) {
         donePath = donePath.concat(pl.pts);
