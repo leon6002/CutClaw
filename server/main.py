@@ -4880,6 +4880,85 @@ def render_route_map(shot_point: str):
     return FileResponse(mp, media_type="image/png")
 
 
+# ── 自驾路线推测(§22):高德驾车路径规划,按坐标签名永久缓存 ─────────────
+
+_DRIVE_ROUTES_PATH = os.path.join(PROJECT_ROOT, "Output", "asset_index", "amap_routes.json")
+_DRIVE_LOCK = threading.Lock()
+
+
+class DriveRouteRequest(BaseModel):
+    origin: list[float]                  # [lat, lon] WGS84
+    destination: list[float]
+    waypoints: list[list[float]] = []    # 沿途 GPS 采样(≤6),让路线贴近实际走法
+
+
+@app.post("/api/map/drive_route")
+def map_drive_route(body: DriveRouteRequest):
+    """把一条移动腿吸附到真实道路(高德驾车路径规划,消耗 key 配额:
+    每腿 1 次调用)。结果按 GCJ 坐标(3 位小数 ≈ 100m)签名永久缓存 —— 同一
+    段路全库只调一次,重开页面零成本。返回的折线已是 GCJ-02,前端直接画。"""
+    key = os.environ.get("AMAP_API_KEY", "").strip()
+    if not key:
+        return {"available": False}
+    if len(body.origin) != 2 or len(body.destination) != 2:
+        raise HTTPException(400, "origin/destination 需为 [lat, lon]")
+    from src.utils.amap_geo import _wgs84_to_gcj02
+    o = _wgs84_to_gcj02(body.origin[0], body.origin[1])
+    d = _wgs84_to_gcj02(body.destination[0], body.destination[1])
+    ways = [_wgs84_to_gcj02(w[0], w[1]) for w in body.waypoints[:6] if len(w) == 2]
+    sig = hashlib.md5(("|".join(f"{la:.3f},{ln:.3f}" for la, ln in [o, *ways, d]))
+                      .encode()).hexdigest()[:16]
+    with _DRIVE_LOCK:
+        try:
+            with open(_DRIVE_ROUTES_PATH, encoding="utf-8") as f:
+                store = json.load(f)
+        except Exception:  # noqa: BLE001
+            store = {}
+    if sig in store:
+        return {"available": True, "cached": True, **store[sig]}
+
+    import urllib.parse as _up
+    import urllib.request as _ur
+    q = {"key": key, "origin": f"{o[1]:.6f},{o[0]:.6f}",
+         "destination": f"{d[1]:.6f},{d[0]:.6f}", "extensions": "base"}
+    if ways:
+        q["waypoints"] = ";".join(f"{ln:.6f},{la:.6f}" for la, ln in ways)
+    url = "https://restapi.amap.com/v3/direction/driving?" + _up.urlencode(q)
+    try:
+        with _ur.urlopen(url, timeout=30) as resp:
+            r = json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"高德路径规划失败: {e}")
+    paths = ((r.get("route") or {}).get("paths") or [])
+    if str(r.get("status")) != "1" or not paths:
+        raise HTTPException(502, f"高德路径规划无结果: {r.get('info')}")
+    pts: list = []
+    for step in paths[0].get("steps") or []:
+        for pair in str(step.get("polyline") or "").split(";"):
+            try:
+                ln, la = pair.split(",")
+                pts.append([round(float(la), 6), round(float(ln), 6)])
+            except ValueError:
+                continue
+    if len(pts) > 600:                    # 稀化,长途路线动辄几千点
+        step_ = len(pts) / 600.0
+        pts = [pts[int(i * step_)] for i in range(600)] + [pts[-1]]
+    entry = {"polyline": pts,
+             "distance_km": round(float(paths[0].get("distance") or 0) / 1000, 1),
+             "duration_min": round(float(paths[0].get("duration") or 0) / 60)}
+    with _DRIVE_LOCK:
+        try:
+            with open(_DRIVE_ROUTES_PATH, encoding="utf-8") as f:
+                store = json.load(f)
+        except Exception:  # noqa: BLE001
+            store = {}
+        store[sig] = entry
+        os.makedirs(os.path.dirname(_DRIVE_ROUTES_PATH), exist_ok=True)
+        with open(_DRIVE_ROUTES_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+    return {"available": True, "cached": False, **entry}
+
+
 class RouteStyleRequest(BaseModel):
     shot_point: str
     style: dict = {}       # {duration, map_brightness, bubbles}

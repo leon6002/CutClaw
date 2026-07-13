@@ -6,6 +6,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ExternalLink, Loader2, MapIcon, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { api } from "../api";
 import { wgs2gcj } from "../lib/geo";
 import { useImmichStore, type ImItem } from "../store";
 
@@ -65,52 +66,113 @@ export default function JourneyMapView() {
       .map((m) => ({ m, ll: wgs2gcj(m.lat!, m.lon!) as [number, number] }));
   }, [days, selDays]);
 
-  // 轨迹播放引擎(§22):行程切成「停留点」和「移动腿」——
-  //   停留点:驻留 0.6~3s,期间照片卡轮播该处拍的照片;
-  //   移动腿:🚗 小车以人眼能跟的速度开过去(每腿 2.2~9s,随里程),纯弧长
-  //   匀速会让 40km 转场几秒划过("瞬移",用户反馈)。
-  // interval 驱动(rAF 失焦冻结);地图逐帧无动画跟车,不跳。
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!playing || !map || playSeq.length < 2) return;
+  // 行程分段(播放/真实路线共用):停留簇(相邻 <300m)与移动腿,
+  // 腿带均速 kmh(>180 判飞机)与放映采样。
+  type Seg = { kind: "stop" | "leg"; i0: number; i1: number; show: number[]; kmh: number };
+  const segs = useMemo<Seg[]>(() => {
     const n = playSeq.length;
+    if (n < 2) return [];
     const midCos = Math.cos((playSeq[0].ll[0] * Math.PI) / 180);
     const dKm = (a: number, b: number) => {
       const [p1, p2] = [playSeq[a].ll, playSeq[b].ll];
       return Math.hypot(p1[0] - p2[0], (p1[1] - p2[1]) * midCos) * 111;
     };
-    type Seg = { kind: "stop" | "leg"; i0: number; i1: number; dur: number; t0: number;
-                 cum: number[]; show: number[] };
-    const segs: Seg[] = [];
+    const epoch = (i: number) => Date.parse(String(playSeq[i].m.taken_at).replace(" ", "T")) || 0;
+    const out: Seg[] = [];
     let i = 0;
     while (i < n - 1) {
-      if (dKm(i, i + 1) < 0.3) {          // 停留簇:相邻 <300m
+      if (dKm(i, i + 1) < 0.3) {
         let j = i + 1;
         while (j < n - 1 && dKm(j, j + 1) < 0.3) j++;
-        // 该地点采样 ≤8 张代表照,驻留期一张张"放映"(每张 ~1s)
         const span = j - i;
         const cnt = Math.min(8, span + 1);
         const show = [...new Set(Array.from({ length: cnt },
           (_, k) => i + Math.round(span * k / Math.max(1, cnt - 1))))];
-        segs.push({ kind: "stop", i0: i, i1: j, show,
-                    dur: Math.min(8, Math.max(1.4, 1.0 * show.length)), t0: 0, cum: [] });
+        out.push({ kind: "stop", i0: i, i1: j, show, kmh: 0 });
         i = j;
-      } else {                             // 移动腿:连续 >=300m 的跳
-        let j = i;
-        const cum = [0];
-        while (j < n - 1 && dKm(j, j + 1) >= 0.3) {
-          cum.push(cum[cum.length - 1] + dKm(j, j + 1));
-          j++;
-        }
-        const legKm = cum[cum.length - 1];
-        segs.push({ kind: "leg", i0: i, i1: j, show: [],
-                    dur: Math.min(9, Math.max(2.2, legKm * 0.35)), t0: 0, cum });
+      } else {
+        let j = i, km = 0;
+        while (j < n - 1 && dKm(j, j + 1) >= 0.3) { km += dKm(j, j + 1); j++; }
+        const hrs = Math.max(1 / 3600, (epoch(j) - epoch(i)) / 3.6e6);
+        out.push({ kind: "leg", i0: i, i1: j, show: [], kmh: km / hrs });
         i = j;
       }
     }
-    if (!segs.length) return;
+    return out;
+  }, [playSeq]);
+  const legKey = (s: Seg) => `${playSeq[s.i0]?.m.id}_${playSeq[s.i1]?.m.id}`;
+
+  // 真实路线:自驾腿吸附道路(高德驾车规划,每腿 1 次调用,服务端永久缓存;
+  // >180km/h 判为航段画虚线不调 API)。串行请求,礼貌对待配额与 QPS。
+  const [roadMode, setRoadMode] = useState(false);
+  const roadsRef = useRef<Map<string, [number, number][] | "flight" | "pending" | "fail">>(new Map());
+  const [roadsTick, setRoadsTick] = useState(0);
+  useEffect(() => {
+    if (!roadMode || !segs.length) return;
+    let stopped = false;
+    (async () => {
+      for (const s of segs) {
+        if (stopped || s.kind !== "leg") continue;
+        const key = legKey(s);
+        const cur = roadsRef.current.get(key);
+        if (cur && cur !== "fail") continue;
+        if (s.kmh > 180) {
+          roadsRef.current.set(key, "flight");
+          setRoadsTick((t) => t + 1);
+          continue;
+        }
+        roadsRef.current.set(key, "pending");
+        const span = s.i1 - s.i0;
+        const nv = Math.min(6, Math.max(0, span - 1));
+        const vias = [...new Set(Array.from({ length: nv },
+          (_, k) => s.i0 + 1 + Math.round((span - 2) * k / Math.max(1, nv - 1))))];
+        try {
+          const r = await api<any>("/api/map/drive_route", {
+            method: "POST",
+            body: JSON.stringify({
+              origin: [playSeq[s.i0].m.lat, playSeq[s.i0].m.lon],
+              destination: [playSeq[s.i1].m.lat, playSeq[s.i1].m.lon],
+              waypoints: vias.map((v) => [playSeq[v].m.lat, playSeq[v].m.lon]),
+            }),
+          });
+          roadsRef.current.set(key,
+            Array.isArray(r.polyline) && r.polyline.length >= 2 ? r.polyline : "fail");
+        } catch { roadsRef.current.set(key, "fail"); }
+        if (!stopped) setRoadsTick((t) => t + 1);
+      }
+    })();
+    return () => { stopped = true; };
+  }, [roadMode, segs]);
+
+  // 轨迹播放引擎(§22):停留点驻留放映照片;移动腿 🚗 开过去(开了真实
+  // 路线且已缓存时沿道路形状走,航段 ✈️);interval 驱动(rAF 失焦冻结)。
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!playing || !map || !segs.length) return;
+    const midCos = Math.cos((playSeq[0].ll[0] * Math.PI) / 180);
+    const lenOf = (pts: [number, number][]) => {
+      const cum = [0];
+      for (let k = 1; k < pts.length; k++)
+        cum.push(cum[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0],
+                                         (pts[k][1] - pts[k - 1][1]) * midCos));
+      return cum;
+    };
+    type Plan = { s: Seg; dur: number; t0: number; pts: [number, number][]; cum: number[]; flight: boolean };
+    const plans: Plan[] = segs.map((s) => {
+      let pts = playSeq.slice(s.i0, s.i1 + 1).map((x) => x.ll);
+      if (s.kind === "stop") {
+        return { s, dur: Math.min(8, Math.max(1.4, 1.0 * s.show.length)),
+                 t0: 0, pts, cum: [0], flight: false };
+      }
+      const rd = roadMode ? roadsRef.current.get(legKey(s)) : undefined;
+      if (Array.isArray(rd) && rd.length >= 2) pts = rd as [number, number][];
+      const cum = lenOf(pts);
+      const km = cum[cum.length - 1] * 111;
+      return { s, dur: Math.min(9, Math.max(2.2, km * 0.35)), t0: 0, pts, cum,
+               flight: s.kmh > 180 };
+    });
     let total = 0;
-    for (const s of segs) { s.t0 = total; total += s.dur; }
+    for (const pl of plans) { pl.t0 = total; total += pl.dur; }
 
     const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
     const head = L.marker(playSeq[0].ll, {
@@ -123,37 +185,44 @@ export default function JourneyMapView() {
     }).addTo(map);
 
     let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
+    let donePath: [number, number][] = [];
     const step = () => {
       const now = performance.now();
       p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
       last = now;
       const tt = p * total;
-      while (si < segs.length - 1 && tt >= segs[si].t0 + segs[si].dur) si++;
-      const s = segs[si];
-      const f = Math.min(1, (tt - s.t0) / s.dur);
+      while (si < plans.length - 1 && tt >= plans[si].t0 + plans[si].dur) {
+        donePath = donePath.concat(plans[si].pts);    // 段完成 → 并入尾迹
+        si++;
+      }
+      const pl = plans[si];
+      const s = pl.s;
+      const f = Math.min(1, (tt - pl.t0) / pl.dur);
       let ll: [number, number];
       let idx: number;
       if (s.kind === "stop") {
-        ll = playSeq[s.i1].ll;
+        ll = pl.pts[pl.pts.length - 1];
         idx = s.show[Math.min(s.show.length - 1, Math.floor(f * s.show.length))];
-        trail.setLatLngs(playSeq.slice(0, s.i1 + 1).map((x) => x.ll));
+        trail.setLatLngs([...donePath, ...pl.pts]);
       } else {
-        const d = f * s.cum[s.cum.length - 1];
+        const d = f * pl.cum[pl.cum.length - 1];
         let j = 0;
-        while (j < s.cum.length - 2 && s.cum[j + 1] < d) j++;
-        const g = Math.min(1, (d - s.cum[j]) / Math.max(s.cum[j + 1] - s.cum[j], 1e-12));
-        const [a, b] = [playSeq[s.i0 + j].ll, playSeq[s.i0 + j + 1].ll];
+        while (j < pl.cum.length - 2 && pl.cum[j + 1] < d) j++;
+        const g = Math.min(1, (d - pl.cum[j]) / Math.max(pl.cum[j + 1] - pl.cum[j], 1e-12));
+        const [a, b] = [pl.pts[j], pl.pts[j + 1]];
         ll = [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
-        idx = g > 0.5 ? s.i0 + j + 1 : s.i0 + j;
-        trail.setLatLngs([...playSeq.slice(0, s.i0 + j + 1).map((x) => x.ll), ll]);
-        // 小车朝向:向西开就水平翻转
+        idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * f));
+        trail.setLatLngs([...donePath, ...pl.pts.slice(0, j + 1), ll]);
         const el = head.getElement()?.querySelector(".jm-head-car") as HTMLElement | null;
-        if (el) el.style.transform = b[1] < a[1] ? "scaleX(-1)" : "";
+        if (el) {
+          el.textContent = pl.flight ? "✈️" : "🚗";
+          el.style.transform = b[1] < a[1] ? "scaleX(-1)" : "";
+        }
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      map.panTo(ll, { animate: false });   // 逐帧跟随,不跳
+      map.panTo(ll, { animate: false });
       if (p >= 1) {
         if (!doneAt) doneAt = now;
         if (now - doneAt > 1800) setPlaying(false);
@@ -161,7 +230,7 @@ export default function JourneyMapView() {
     };
     const timer = window.setInterval(step, 33);
     return () => { window.clearInterval(timer); trail.remove(); head.remove(); setPlayPhoto(null); };
-  }, [playing, playSeq]);
+  }, [playing, playSeq, segs, roadMode]);
   // 首次载入相簿后默认选最后一天
   useEffect(() => {
     if (days.length && selDays.size === 0) setSelDays(new Set([days[days.length - 1][0]]));
@@ -243,11 +312,25 @@ export default function JourneyMapView() {
       });
       void di;
     });
+    // 真实路线覆盖层:自驾腿画道路形状(白线+深色描边),航段画虚线
+    if (roadMode) {
+      for (const s of segs) {
+        if (s.kind !== "leg") continue;
+        const rd = roadsRef.current.get(legKey(s));
+        if (rd === "flight") {
+          L.polyline([playSeq[s.i0].ll, playSeq[s.i1].ll],
+            { color: "#e2e8f0", weight: 2.5, opacity: 0.85, dashArray: "6 9" }).addTo(layer);
+        } else if (Array.isArray(rd)) {
+          L.polyline(rd, { color: "#0f172a", weight: 6, opacity: 0.4 }).addTo(layer);
+          L.polyline(rd, { color: "#ffffff", weight: 3.5, opacity: 0.95 }).addTo(layer);
+        }
+      }
+    }
     if (allPts.length) {
       boundsRef.current = L.latLngBounds(allPts as any);
       map.fitBounds(boundsRef.current.pad(0.15));
     }
-  }, [days, selDays]);
+  }, [days, selDays, roadMode, roadsTick]);
 
   return (
     <div className="flex h-[calc(100vh-140px)] min-h-[480px] flex-col gap-3">
@@ -302,6 +385,13 @@ export default function JourneyMapView() {
           </>
         )}
         <div className="ml-auto flex items-center gap-1">
+          <button
+            className={cn("h-7 rounded-full px-2.5 text-[11px] transition-colors",
+              roadMode ? "bg-emerald-500/20 text-emerald-300" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
+            title="把自驾转场吸附到真实道路(高德驾车规划,每段路线 1 次调用、永久缓存,再看零成本;均速 >180km/h 判为航段画虚线,不调用)"
+            onClick={() => setRoadMode((v) => !v)}>
+            🛣 真实路线
+          </button>
           <button
             className={cn("h-7 rounded-full px-2.5 text-[11px] transition-colors",
               baseLayer === "sat" ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
