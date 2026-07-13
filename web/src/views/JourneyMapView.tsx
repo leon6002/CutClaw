@@ -174,7 +174,8 @@ export default function JourneyMapView() {
       if (Array.isArray(rd) && rd.length >= 2) pts = rd as [number, number][];
       const cum = lenOf(pts);
       const km = cum[cum.length - 1] * 111;
-      return { s, dur: Math.min(9, Math.max(2.2, km * 0.35)), t0: 0, pts, cum,
+      // 每腿 3~14s(0.5s/km):9s 上限仍被反馈"位移太快"
+      return { s, dur: Math.min(14, Math.max(3, km * 0.5)), t0: 0, pts, cum,
                flight: s.kmh > 180, km };
     });
     let total = 0;
@@ -243,14 +244,19 @@ export default function JourneyMapView() {
       if (autoZoomRef.current && now > zoomHoldUntil) {
         let zt: number;
         if (s.kind === "stop") {
-          zt = STOP_ZOOM;
+          // 照片越多越是重头景点 → 推得越近(13.5 起步,最深 15.5)
+          const cnt = s.i1 - s.i0 + 1;
+          zt = Math.min(15.5, STOP_ZOOM + 0.8 * Math.log2(1 + cnt / 8));
         } else {
           const remainKm = Math.max(0, (1 - f) * pl.km);   // 弧长匀速下时间比≈距离比
           const floor_ = pl.flight ? 5 : 8;                // 自驾下限 8:公路仍清晰可见
           zt = Math.max(floor_, Math.min(STOP_ZOOM, 15.2 - 1.05 * Math.log2(remainKm + 1.5)));
         }
-        if (Math.abs(zt - map.getZoom()) >= 0.6) {
-          map.flyTo(ll, zt, { duration: 0.9, easeLinearity: 0.4 });
+        const cur = map.getZoom();
+        if (Math.abs(zt - cur) >= 0.6) {
+          // 缩放限速:单步最多 ±1.6 级,大跨度拆成台阶渐进,不许一跳到底
+          const stepZ = cur + Math.max(-1.6, Math.min(1.6, zt - cur));
+          map.flyTo(ll, stepZ, { duration: 0.9, easeLinearity: 0.4 });
           zoomHoldUntil = now + 1000;   // flyTo 期间不 pan,别打断它
         }
       }
