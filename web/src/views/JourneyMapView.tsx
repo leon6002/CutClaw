@@ -39,15 +39,17 @@ const dayLabel = (k: string) => {
 
 export default function JourneyMapView() {
   const { albums, itemsByAlbum, loadAlbums, loadItems } = useImmichStore();
-  const [albumId, setAlbumId] = useState<string>("");
+  // 现场恢复:相簿/日期/开关全部 localStorage 持久化(刷新不丢,用户反馈)
+  const [albumId, setAlbumId] = useState<string>(() => localStorage.getItem("jm-album") || "");
   const [selDays, setSelDays] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<ImItem | null>(null);
-  const [darkMap, setDarkMap] = useState(false);   // 默认原色(压暗被用户否决)
-  const [baseLayer, setBaseLayer] = useState<"vector" | "sat">("vector");
+  const [darkMap, setDarkMap] = useState(() => localStorage.getItem("jm-dark") === "1");
+  const [baseLayer, setBaseLayer] = useState<"vector" | "sat">(
+    () => (localStorage.getItem("jm-layer") === "vector" ? "vector" : "sat"));   // 默认卫星
   const tilesRef = useRef<L.TileLayer[]>([]);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
-  const [autoZoom, setAutoZoom] = useState(true);   // 播放时随速度丝滑缩放
+  const [autoZoom, setAutoZoom] = useState(() => localStorage.getItem("jm-autozoom") !== "0");
   const [zoomGap, setZoomGap] = useState(() =>      // 两次变焦最小间隔(秒),可配置
     Number(localStorage.getItem("jm-zoomgap")) || 8);
   const zoomGapRef = useRef(8);
@@ -78,7 +80,19 @@ export default function JourneyMapView() {
   const boundsRef = useRef<L.LatLngBounds | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { loadAlbums(); }, []);
+  useEffect(() => {
+    loadAlbums();
+    if (albumId) loadItems(albumId);   // 恢复上次相簿
+  }, []);
+  // 开关状态持久化(roadMode 声明在下方,它的持久化跟在声明处 —— 放这里
+  // 会 TDZ 白屏,踩过)
+  useEffect(() => { localStorage.setItem("jm-dark", darkMap ? "1" : "0"); }, [darkMap]);
+  useEffect(() => { localStorage.setItem("jm-layer", baseLayer); }, [baseLayer]);
+  useEffect(() => { localStorage.setItem("jm-autozoom", autoZoom ? "1" : "0"); }, [autoZoom]);
+  useEffect(() => {
+    if (albumId && selDays.size)
+      localStorage.setItem("jm-days-" + albumId, JSON.stringify([...selDays]));
+  }, [selDays, albumId]);
   const items = albumId ? (itemsByAlbum[albumId]?.items ?? []) : [];
   const loading = !!albumId && !itemsByAlbum[albumId];
 
@@ -98,6 +112,7 @@ export default function JourneyMapView() {
 
   const pickAlbum = (id: string) => {
     setAlbumId(id); setSelDays(new Set()); setDetail(null); setPlaying(false);
+    localStorage.setItem("jm-album", id);
     if (id) loadItems(id);
   };
 
@@ -147,7 +162,8 @@ export default function JourneyMapView() {
 
   // 真实路线:自驾腿吸附道路(高德驾车规划,每腿 1 次调用,服务端永久缓存;
   // >180km/h 判为航段画虚线不调 API)。串行请求,礼貌对待配额与 QPS。
-  const [roadMode, setRoadMode] = useState(false);
+  const [roadMode, setRoadMode] = useState(() => localStorage.getItem("jm-road") !== "0");   // 默认开
+  useEffect(() => { localStorage.setItem("jm-road", roadMode ? "1" : "0"); }, [roadMode]);
   const roadsRef = useRef<Map<string, [number, number][] | "flight" | "pending" | "fail">>(new Map());
   const [roadsTick, setRoadsTick] = useState(0);
   useEffect(() => {
@@ -331,10 +347,17 @@ export default function JourneyMapView() {
     return () => { window.clearInterval(timer); trail.remove(); trailGlow.remove();
                    head.remove(); setPlayPhotos([]); };
   }, [playing, playSeq, segs, roadMode]);
-  // 首次载入相簿后默认选最后一天
+  // 首次载入相簿:优先恢复上次选过的日期,否则默认最后一天
   useEffect(() => {
-    if (days.length && selDays.size === 0) setSelDays(new Set([days[days.length - 1][0]]));
-  }, [days.length]);
+    if (!days.length || selDays.size > 0) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem("jm-days-" + albumId) || "[]") as string[];
+      const avail = new Set(days.map(([k]) => k));
+      const keep = saved.filter((k) => avail.has(k));
+      if (keep.length) { setSelDays(new Set(keep)); return; }
+    } catch { /* fallthrough */ }
+    setSelDays(new Set([days[days.length - 1][0]]));
+  }, [days.length, albumId]);
 
   // 初始化地图(一次)
   useEffect(() => {
