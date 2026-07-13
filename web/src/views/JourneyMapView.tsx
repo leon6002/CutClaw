@@ -282,6 +282,12 @@ export default function JourneyMapView() {
     L.control.zoom({ position: "bottomright" }).addTo(map);
     mapRef.current = map;
     layerRef.current = L.layerGroup().addTo(map);
+    // canvas 渲染器在缩放动画期间不重绘,矢量线会"停在原地"与底图错位,
+    // 动画结束才贴回(用户反馈)→ 缩放中把矢量层淡出,结束淡入
+    const ovPane = map.getPane("overlayPane");
+    if (ovPane) ovPane.style.transition = "opacity .12s";
+    map.on("zoomstart", () => { if (ovPane) ovPane.style.opacity = "0"; });
+    map.on("zoomend", () => { if (ovPane) ovPane.style.opacity = "1"; });
     // tab 用 display:none 保活,初始化时容器是 0 尺寸 → 变可见时必须
     // invalidateSize 并重新套框,否则瓦片错位/空白
     const ro = new ResizeObserver(() => {
