@@ -183,7 +183,9 @@ export default function JourneyMapView() {
     const legZoom = (km: number) => Math.max(5.5, Math.min(13, 14.8 - 1.15 * Math.log2(km + 2)));
     const STOP_ZOOM = 13.5;
 
-    const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
+    // 绿色尾迹:淡辉光宽线 + 亮主线,走过的地方被点亮
+    const trailGlow = L.polyline([], { color: "#22c55e", weight: 7, opacity: 0.25 }).addTo(map);
+    const trail = L.polyline([], { color: "#4ade80", weight: 3, opacity: 0.95 }).addTo(map);
     const head = L.marker(playSeq[0].ll, {
       icon: L.divIcon({
         className: "",
@@ -216,7 +218,9 @@ export default function JourneyMapView() {
       if (s.kind === "stop") {
         ll = pl.pts[pl.pts.length - 1];
         idx = s.show[Math.min(s.show.length - 1, Math.floor(f * s.show.length))];
-        trail.setLatLngs([...donePath, ...pl.pts]);
+        const tl = [...donePath, ...pl.pts];
+        trail.setLatLngs(tl);
+        trailGlow.setLatLngs(tl);
       } else {
         const d = f * pl.cum[pl.cum.length - 1];
         let j = 0;
@@ -225,7 +229,9 @@ export default function JourneyMapView() {
         const [a, b] = [pl.pts[j], pl.pts[j + 1]];
         ll = [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
         idx = Math.min(s.i1, s.i0 + Math.round((s.i1 - s.i0) * f));
-        trail.setLatLngs([...donePath, ...pl.pts.slice(0, j + 1), ll]);
+        const tl = [...donePath, ...pl.pts.slice(0, j + 1), ll];
+        trail.setLatLngs(tl);
+        trailGlow.setLatLngs(tl);
         const el = head.getElement()?.querySelector(".jm-head-car") as HTMLElement | null;
         if (el) {
           el.textContent = pl.flight ? "✈️" : "🚗";
@@ -253,7 +259,8 @@ export default function JourneyMapView() {
       }
     };
     const timer = window.setInterval(step, 33);
-    return () => { window.clearInterval(timer); trail.remove(); head.remove(); setPlayPhoto(null); };
+    return () => { window.clearInterval(timer); trail.remove(); trailGlow.remove();
+                   head.remove(); setPlayPhoto(null); };
   }, [playing, playSeq, segs, roadMode]);
   // 首次载入相簿后默认选最后一天
   useEffect(() => {
@@ -311,10 +318,11 @@ export default function JourneyMapView() {
         return [gla, gln] as [number, number];
       });
       pts.forEach((p) => allPts.push(p));
-      // 真实路线模式下不画整天直连线(转场直线弦和道路线重叠,乱)
+      // 真实路线模式下不画整天直连线(转场直线弦和道路线重叠,乱);
+      // 播放中一律降为幽灵线 —— 走过的路由绿色尾迹点亮,而不是开局全画
       if (!roadMode && pts.length >= 2) {
-        L.polyline(pts, { color, weight: 3, opacity: 0.5 }).addTo(layer);
-        L.polyline(pts, { color, weight: 1.5, opacity: 0.95 }).addTo(layer);
+        L.polyline(pts, { color, weight: 3, opacity: playing ? 0.08 : 0.5 }).addTo(layer);
+        L.polyline(pts, { color, weight: 1.5, opacity: playing ? 0.15 : 0.95 }).addTo(layer);
       }
       // 缩略图钉:每天等距 ≤40 张,其余小点
       const step = Math.max(1, Math.ceil(sorted.length / 40));
@@ -344,23 +352,24 @@ export default function JourneyMapView() {
         const k = String(playSeq[i0]?.m.taken_at || "").slice(0, 10);
         return DAY_COLORS[Math.max(0, days.findIndex(([x]) => x === k)) % DAY_COLORS.length];
       };
+      const gh = playing;   // 播放中:幽灵化,让绿色尾迹当主角
       for (const s of segs) {
         if (s.kind === "stop") {
           const pts = playSeq.slice(s.i0, s.i1 + 1).map((x) => x.ll);
           if (pts.length >= 2)
-            L.polyline(pts, { color: colorOf(s.i0), weight: 2.5, opacity: 0.85 }).addTo(layer);
+            L.polyline(pts, { color: colorOf(s.i0), weight: 2.5, opacity: gh ? 0.15 : 0.85 }).addTo(layer);
           continue;
         }
         const rd = roadsRef.current.get(legKey(s));
         if (rd === "flight") {
           L.polyline([playSeq[s.i0].ll, playSeq[s.i1].ll],
-            { color: "#e2e8f0", weight: 2.5, opacity: 0.85, dashArray: "6 9" }).addTo(layer);
+            { color: "#e2e8f0", weight: 2.5, opacity: gh ? 0.15 : 0.85, dashArray: "6 9" }).addTo(layer);
         } else if (Array.isArray(rd)) {
-          L.polyline(rd, { color: "#0f172a", weight: 6, opacity: 0.4 }).addTo(layer);
-          L.polyline(rd, { color: "#ffffff", weight: 3.5, opacity: 0.95 }).addTo(layer);
+          if (!gh) L.polyline(rd, { color: "#0f172a", weight: 6, opacity: 0.4 }).addTo(layer);
+          L.polyline(rd, { color: "#ffffff", weight: gh ? 2 : 3.5, opacity: gh ? 0.14 : 0.95 }).addTo(layer);
         } else {
           L.polyline([playSeq[s.i0].ll, playSeq[s.i1].ll],
-            { color: "#64748b", weight: 1.5, opacity: 0.5, dashArray: "2 6" }).addTo(layer);
+            { color: "#64748b", weight: 1.5, opacity: gh ? 0.1 : 0.5, dashArray: "2 6" }).addTo(layer);
         }
       }
     }
@@ -370,7 +379,7 @@ export default function JourneyMapView() {
       // 视野猛拉回全局,和播放跟车互相打架("晃得厉害"的主因)
       if (!playingRef.current) map.fitBounds(boundsRef.current.pad(0.15));
     }
-  }, [days, selDays, roadMode, roadsTick]);
+  }, [days, selDays, roadMode, roadsTick, playing]);
 
   return (
     <div className="flex h-[calc(100vh-140px)] min-h-[480px] flex-col gap-3">
@@ -510,7 +519,7 @@ export default function JourneyMapView() {
         .leaflet-container { background:#0b0f1a; }
         .jm-head-wrap { width:34px; height:34px; display:flex; align-items:center; justify-content:center; }
         .jm-head-dot { width:16px; height:16px; border-radius:50%; background:#fff;
-                       box-shadow:0 0 0 4px rgba(255,255,255,.25), 0 0 18px 6px rgba(56,189,248,.8);
+                       box-shadow:0 0 0 4px rgba(255,255,255,.25), 0 0 18px 6px rgba(74,222,128,.85);
                        animation: jm-pulse 1.2s ease-in-out infinite; }
         .jm-head-car { display:none; font-size:26px; line-height:1;
                        filter: drop-shadow(0 2px 5px rgba(0,0,0,.6)); }
