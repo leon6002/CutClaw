@@ -15,17 +15,21 @@ const DAY_COLORS = ["#38bdf8", "#f472b6", "#34d399", "#fbbf24", "#a78bfa", "#fb7
 // 播放镜头参数(全部可在 ⚙ 面板调,存 localStorage)
 type CamCfg = {
   px: number;                                   // 屏幕车速 px/s
+  photoSec: number;                             // 图片放映:每页(≤4张)驻留秒数
   cruiseLong: number; cruiseMid: number; cruiseShort: number;   // 巡航挡(>60/15-60/<15km)
   approach: number;                             // 进场挡(剩 15%/6km)
   stop: number; stopRich: number;               // 停留挡 / 大景点挡(≥12 张)
   flightCruise: number; flightApproach: number; // 航段巡航/进场
 };
-const DEF_CAM: CamCfg = { px: 55, cruiseLong: 8, cruiseMid: 9.5, cruiseShort: 11,
+const DEF_CAM: CamCfg = { px: 55, photoSec: 1.7, cruiseLong: 8, cruiseMid: 9.5, cruiseShort: 11,
   approach: 12.5, stop: 14, stopRich: 14.5, flightCruise: 6, flightApproach: 9 };
-const CAM_FIELDS: [keyof CamCfg, string][] = [
-  ["px", "车速 px/s"], ["cruiseLong", "巡航·长途(>60km)"], ["cruiseMid", "巡航·中途"],
-  ["cruiseShort", "巡航·短途(<15km)"], ["approach", "进场挡"], ["stop", "停留挡"],
-  ["stopRich", "大景点挡(≥12张)"], ["flightCruise", "航段·巡航"], ["flightApproach", "航段·进场"],
+const CAM_FIELDS: [keyof CamCfg, string, number, number, number][] = [
+  ["px", "车速 px/s", 5, 15, 300],
+  ["photoSec", "图片·每页秒数", 0.1, 0.4, 6],
+  ["cruiseLong", "巡航·长途(>60km)", 0.5, 3, 17], ["cruiseMid", "巡航·中途", 0.5, 3, 17],
+  ["cruiseShort", "巡航·短途(<15km)", 0.5, 3, 17], ["approach", "进场挡", 0.5, 3, 17],
+  ["stop", "停留挡", 0.5, 3, 17], ["stopRich", "大景点挡(≥12张)", 0.5, 3, 17],
+  ["flightCruise", "航段·巡航", 0.5, 3, 17], ["flightApproach", "航段·进场", 0.5, 3, 17],
 ];
 const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 const dayLabel = (k: string) => {
@@ -256,7 +260,9 @@ export default function JourneyMapView() {
         segT += dt;
         ll = pl.pts[pl.pts.length - 1];
         const pages = Math.max(1, Math.ceil(s.show.length / 4));
-        const page = Math.min(pages - 1, Math.floor((segT / pl.dur) * pages));
+        // 驻留时长实时读配置:每页 photoSec 秒(播放中改也立即生效)
+        const stopDur = pages * Math.max(0.4, camRef.current.photoSec);
+        const page = Math.min(pages - 1, Math.floor((segT / stopDur) * pages));
         const grp = s.show.slice(page * 4, page * 4 + 4);
         const key = grp.join(",");
         if (key !== lastKey) { setPlayPhotos(grp.map((i) => playSeq[i].m)); lastKey = key; }
@@ -265,7 +271,7 @@ export default function JourneyMapView() {
         trailGlow.setLatLngs(tl);
         const cnt = s.i1 - s.i0 + 1;     // 照片多的重头景点推近半档
         ztWanted = cnt >= 12 ? camRef.current.stopRich : camRef.current.stop;
-        if (segT >= pl.dur) advance = true;
+        if (segT >= stopDur) advance = true;
       } else {
         // 屏幕恒速推进:本帧物理位移 = 像素速度 ÷ 当前缩放比例。
         // 固定物理车速 × 放大的镜头 = 屏幕上巨快(晕的根源,用户洞察);
@@ -568,11 +574,10 @@ export default function JourneyMapView() {
               </button>
             </div>
             <div className="space-y-1.5">
-              {CAM_FIELDS.map(([k, label]) => (
+              {CAM_FIELDS.map(([k, label, stp, mn, mx]) => (
                 <label key={k} className="flex items-center justify-between gap-2 text-[11px] text-slate-400">
                   {label}
-                  <input type="number" step={k === "px" ? 5 : 0.5}
-                    min={k === "px" ? 15 : 3} max={k === "px" ? 300 : 17}
+                  <input type="number" step={stp} min={mn} max={mx}
                     className="w-16 rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-right text-[11px] text-slate-200 focus:border-cyan-500/40 focus:outline-none"
                     value={cam[k]}
                     onChange={(e) => setCamField(k, Number(e.target.value))} />
