@@ -1089,9 +1089,10 @@ def immich_mgmt_geo_infer(body: MgmtIdsRequest):
                 a = _immich_req(f"/assets/{aid}")
                 ex = a.get("exifInfo") or {}
                 if ex.get("latitude") is not None:
-                    # force 时允许重推"当初由我们推测"的(带 🧭 标记);
-                    # 真实拍摄 GPS 永远不动
-                    if not (body.force and "🧭" in str(ex.get("description") or "")):
+                    # 带 🧭 的是我们自己推的 → 永远允许重推(幂等,路线有缓存,
+                    # 不依赖前端 force 旗;旧 bundle 不发 force 导致整批被跳过,踩过)。
+                    # 真实拍摄 GPS 永远不动。
+                    if "🧭" not in str(ex.get("description") or ""):
                         skipped += 1
                         continue
                 t0 = _wall(a.get("localDateTime") or ex.get("dateTimeOriginal")
