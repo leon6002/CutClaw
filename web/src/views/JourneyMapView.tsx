@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ExternalLink, Loader2, MapIcon, X } from "lucide-react";
+import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
 import { api } from "../api";
 import { wgs2gcj } from "../lib/geo";
@@ -23,13 +24,27 @@ type CamCfg = {
 };
 const DEF_CAM: CamCfg = { px: 55, photoSec: 1.7, cruiseLong: 8, cruiseMid: 9.5, cruiseShort: 11,
   approach: 12.5, stop: 14, stopRich: 14.5, flightCruise: 6, flightApproach: 9 };
-const CAM_FIELDS: [keyof CamCfg, string, number, number, number][] = [
-  ["px", "车速 px/s", 5, 15, 300],
-  ["photoSec", "图片·每页秒数", 0.1, 0.4, 6],
-  ["cruiseLong", "巡航·长途(>60km)", 0.5, 3, 17], ["cruiseMid", "巡航·中途", 0.5, 3, 17],
-  ["cruiseShort", "巡航·短途(<15km)", 0.5, 3, 17], ["approach", "进场挡", 0.5, 3, 17],
-  ["stop", "停留挡", 0.5, 3, 17], ["stopRich", "大景点挡(≥12张)", 0.5, 3, 17],
-  ["flightCruise", "航段·巡航", 0.5, 3, 17], ["flightApproach", "航段·进场", 0.5, 3, 17],
+// [key, 名称, 单位, 步进, 下限, 上限]
+type CamField = [keyof CamCfg, string, string, number, number, number];
+const CAM_GROUPS: { title: string; fields: CamField[] }[] = [
+  { title: "播放节奏", fields: [
+    ["px", "小车屏幕速度", "像素/秒", 5, 15, 300],
+    ["photoSec", "每页照片停留", "秒", 0.1, 0.5, 6],
+  ]},
+  { title: "自驾挡位 · 缩放级,越大越贴地", fields: [
+    ["cruiseLong", "巡航 · 长途 >60km", "级", 0.5, 3, 17],
+    ["cruiseMid", "巡航 · 中途 15–60km", "级", 0.5, 3, 17],
+    ["cruiseShort", "巡航 · 短途 <15km", "级", 0.5, 3, 17],
+    ["approach", "进场(快到目的地)", "级", 0.5, 3, 17],
+  ]},
+  { title: "停留挡位", fields: [
+    ["stop", "普通停留点", "级", 0.5, 8, 17],
+    ["stopRich", "大景点 ≥12 张", "级", 0.5, 8, 17],
+  ]},
+  { title: "航段挡位", fields: [
+    ["flightCruise", "巡航", "级", 0.5, 3, 12],
+    ["flightApproach", "进场", "级", 0.5, 3, 14],
+  ]},
 ];
 const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 const dayLabel = (k: string) => {
@@ -588,27 +603,41 @@ export default function JourneyMapView() {
       <div className="relative min-h-0 flex-1">
         {/* 镜头参数面板(实时生效,存 localStorage) */}
         {showCam && (
-          <div className="absolute right-3 top-3 z-[1200] w-56 rounded-xl border border-white/10 bg-slate-950/92 p-3 shadow-[0_10px_36px_rgba(0,0,0,0.6)] backdrop-blur-sm">
-            <div className="mb-2 flex items-center justify-between text-[11.5px]">
-              <span className="font-medium text-slate-200">镜头参数</span>
-              <button className="text-[10.5px] text-slate-500 hover:text-cyan-300"
+          <div className="absolute right-3 top-3 z-[1200] max-h-[calc(100%-24px)] w-72 overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/92 p-4 shadow-[0_12px_40px_rgba(0,0,0,0.65)] backdrop-blur-md">
+            <div className="mb-3 flex items-center justify-between">
+              <span className="text-[13px] font-semibold text-white">镜头参数</span>
+              <button className="rounded-md bg-white/[0.06] px-2 py-1 text-[10.5px] text-slate-400 transition-colors hover:bg-white/10 hover:text-cyan-300"
                 onClick={() => { localStorage.removeItem("jm-cam"); setCam(DEF_CAM); }}>
                 恢复默认
               </button>
             </div>
-            <div className="space-y-1.5">
-              {CAM_FIELDS.map(([k, label, stp, mn, mx]) => (
-                <label key={k} className="flex items-center justify-between gap-2 text-[11px] text-slate-400">
-                  {label}
-                  <input type="number" step={stp} min={mn} max={mx}
-                    className="w-16 rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-right text-[11px] text-slate-200 focus:border-cyan-500/40 focus:outline-none"
-                    value={cam[k]}
-                    onChange={(e) => setCamField(k, Number(e.target.value))} />
-                </label>
+            <div className="space-y-4">
+              {CAM_GROUPS.map((g) => (
+                <div key={g.title}>
+                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{g.title}</div>
+                  <div className="space-y-3">
+                    {g.fields.map(([k, label, unit, stp, mn, mx]) => (
+                      <div key={k}>
+                        <div className="mb-1 flex items-baseline justify-between">
+                          <span className="text-[11.5px] text-slate-300">{label}</span>
+                          <span className="tabular-nums text-[12.5px] font-medium text-cyan-200">
+                            {cam[k]}<span className="ml-0.5 text-[9.5px] font-normal text-slate-500">{unit}</span>
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="w-6 shrink-0 text-right text-[9px] tabular-nums text-slate-600">{mn}</span>
+                          <Slider value={[cam[k]]} min={mn} max={mx} step={stp}
+                            onValueChange={([v]) => setCamField(k, v)} />
+                          <span className="w-6 shrink-0 text-[9px] tabular-nums text-slate-600">{mx}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
-            <div className="mt-2 text-[10px] leading-relaxed text-slate-600">
-              改动即时生效(含播放中);挡位是 Leaflet 缩放级,越大越近。
+            <div className="mt-3 text-[10px] leading-relaxed text-slate-600">
+              拖动即时生效,播放中也可调;设置自动保存。
             </div>
           </div>
         )}
