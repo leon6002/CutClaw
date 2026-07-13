@@ -199,9 +199,11 @@ export default function JourneyMapView() {
 
     let last = performance.now(), lastKey = "", si = 0;
     let donePath: [number, number][] = [];
-    // 镜头纪律:不逐帧改缩放(瓦片黑屏);平移动画短步(280ms);缩放低频
-    // 台阶式(差 ≥0.8 才动、单步 ±1.2、间隔 ≥2.4s)—— 高频推拉也晕。
+    // 镜头挡位制(连续追踪目标=永远在变焦,还是晕):每腿最多换 3 次挡 ——
+    // 出发定巡航挡(按整腿里程)→ 进场挡(剩 15% / 6km)→ 停留挡(到站)。
+    // 每次换挡是一段完整 flyTo(时长随跨度 0.8~2.6s),挡内缩放纹丝不动。
     let lastPan = 0, zoomHoldUntil = 0, segT = 0, dist = 0, doneWait = 0;
+    let lastGear = NaN;
     const step = () => {
       const now = performance.now();
       const dt = Math.min(0.2, (now - last) / 1000) * speedRef.current;
@@ -227,8 +229,8 @@ export default function JourneyMapView() {
         const tl = [...donePath, ...pl.pts];
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
-        const cnt = s.i1 - s.i0 + 1;     // 照片越多越是重头景点 → 推得越近
-        ztWanted = Math.min(15.5, STOP_ZOOM + 0.8 * Math.log2(1 + cnt / 8));
+        const cnt = s.i1 - s.i0 + 1;     // 照片多的重头景点推近半档
+        ztWanted = cnt >= 12 ? 14.5 : 14;
         if (segT >= pl.dur) advance = true;
       } else {
         // 屏幕恒速推进:本帧物理位移 = 像素速度 ÷ 当前缩放比例。
@@ -255,17 +257,23 @@ export default function JourneyMapView() {
           el.style.transform = b[1] < a[1] ? "scaleX(-1)" : "";
         }
         const remainKm = Math.max(0, (totalD - dist) * 111);
-        const floor_ = pl.flight ? 5 : 8;                // 自驾下限 8:公路仍清晰可见
-        ztWanted = Math.max(floor_, Math.min(STOP_ZOOM, 15.2 - 1.05 * Math.log2(remainKm + 1.5)));
+        const approaching = remainKm < Math.max(6, pl.km * 0.15);
+        if (pl.flight) {
+          ztWanted = approaching ? 9 : 6;
+        } else {
+          const cruise = pl.km > 60 ? 8 : pl.km > 15 ? 9.5 : 11;
+          ztWanted = approaching ? 12.5 : cruise;
+        }
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
-      if (autoZoomRef.current && now > zoomHoldUntil) {
-        const cur = map.getZoom();
-        if (Math.abs(ztWanted - cur) >= 0.8) {
-          const stepZ = cur + Math.max(-1.2, Math.min(1.2, ztWanted - cur));
-          map.flyTo(ll, stepZ, { duration: 1.1, easeLinearity: 0.35 });
-          zoomHoldUntil = now + 2400;    // 低频:一次推拉看完再来下一次
+      if (autoZoomRef.current && ztWanted !== lastGear && now > zoomHoldUntil) {
+        lastGear = ztWanted;
+        const dz = Math.abs(ztWanted - map.getZoom());
+        if (dz >= 0.4) {
+          const durS = Math.min(2.6, 0.8 + 0.35 * dz);   // 跨度越大飞得越久,一次到位
+          map.flyTo(ll, ztWanted, { duration: durS, easeLinearity: 0.3 });
+          zoomHoldUntil = now + durS * 1000 + 400;
         }
       }
       if (now > zoomHoldUntil && now - lastPan > 280) {
