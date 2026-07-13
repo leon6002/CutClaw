@@ -27,9 +27,14 @@ export default function JourneyMapView() {
   const tilesRef = useRef<L.TileLayer[]>([]);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const [autoZoom, setAutoZoom] = useState(true);   // 播放时随速度丝滑缩放
   const [playPhoto, setPlayPhoto] = useState<ImItem | null>(null);
   const speedRef = useRef(1);
   speedRef.current = speed;
+  const autoZoomRef = useRef(true);
+  autoZoomRef.current = autoZoom;
+  const playingRef = useRef(false);
+  playingRef.current = playing;
   const mapRef = useRef<L.Map | null>(null);
   const layerRef = useRef<L.LayerGroup | null>(null);
   const boundsRef = useRef<L.LatLngBounds | null>(null);
@@ -157,22 +162,26 @@ export default function JourneyMapView() {
                                          (pts[k][1] - pts[k - 1][1]) * midCos));
       return cum;
     };
-    type Plan = { s: Seg; dur: number; t0: number; pts: [number, number][]; cum: number[]; flight: boolean };
+    type Plan = { s: Seg; dur: number; t0: number; pts: [number, number][]; cum: number[];
+                  flight: boolean; km: number };
     const plans: Plan[] = segs.map((s) => {
       let pts = playSeq.slice(s.i0, s.i1 + 1).map((x) => x.ll);
       if (s.kind === "stop") {
         return { s, dur: Math.min(8, Math.max(1.4, 1.0 * s.show.length)),
-                 t0: 0, pts, cum: [0], flight: false };
+                 t0: 0, pts, cum: [0], flight: false, km: 0 };
       }
       const rd = roadMode ? roadsRef.current.get(legKey(s)) : undefined;
       if (Array.isArray(rd) && rd.length >= 2) pts = rd as [number, number][];
       const cum = lenOf(pts);
       const km = cum[cum.length - 1] * 111;
       return { s, dur: Math.min(9, Math.max(2.2, km * 0.35)), t0: 0, pts, cum,
-               flight: s.kmh > 180 };
+               flight: s.kmh > 180, km };
     });
     let total = 0;
     for (const pl of plans) { pl.t0 = total; total += pl.dur; }
+    // 速度自适应缩放目标:停留点推近看细节,长途拉远看全局
+    const legZoom = (km: number) => Math.max(5.5, Math.min(13, 14.8 - 1.15 * Math.log2(km + 2)));
+    const STOP_ZOOM = 13.5;
 
     const trail = L.polyline([], { color: "#ffffff", weight: 3, opacity: 0.95 }).addTo(map);
     const head = L.marker(playSeq[0].ll, {
@@ -186,6 +195,10 @@ export default function JourneyMapView() {
 
     let p = 0, last = performance.now(), lastIdx = -1, doneAt = 0, si = 0;
     let donePath: [number, number][] = [];
+    // 阻尼镜头:指数平滑跟车 + 平滑推拉,不再逐帧钉死在车头上
+    // (山路密集拐点会全部变成镜头抖动)
+    let camLat = playSeq[0].ll[0], camLng = playSeq[0].ll[1];
+    let zoomCur = map.getZoom();
     const step = () => {
       const now = performance.now();
       p = Math.min(1, p + ((now - last) / 1000) * speedRef.current / total);
@@ -222,7 +235,15 @@ export default function JourneyMapView() {
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
       if (idx !== lastIdx) { setPlayPhoto(playSeq[idx].m); lastIdx = idx; }
-      map.panTo(ll, { animate: false });
+      camLat += (ll[0] - camLat) * 0.10;
+      camLng += (ll[1] - camLng) * 0.10;
+      if (autoZoomRef.current) {
+        const zTarget = s.kind === "stop" ? STOP_ZOOM : legZoom(pl.km);
+        zoomCur += (zTarget - zoomCur) * 0.035;
+        map.setView([camLat, camLng], zoomCur, { animate: false });
+      } else {
+        map.panTo([camLat, camLng], { animate: false });
+      }
       if (p >= 1) {
         if (!doneAt) doneAt = now;
         if (now - doneAt > 1800) setPlaying(false);
@@ -241,7 +262,7 @@ export default function JourneyMapView() {
     if (!boxRef.current || mapRef.current) return;
     const map = L.map(boxRef.current, {
       center: [35, 105], zoom: 4, zoomControl: false, attributionControl: false,
-      preferCanvas: true,
+      preferCanvas: true, zoomSnap: 0,   // 允许小数级缩放(播放时丝滑推拉镜头)
     });
     L.control.zoom({ position: "bottomright" }).addTo(map);
     mapRef.current = map;
@@ -328,7 +349,9 @@ export default function JourneyMapView() {
     }
     if (allPts.length) {
       boundsRef.current = L.latLngBounds(allPts as any);
-      map.fitBounds(boundsRef.current.pad(0.15));
+      // 播放中禁止 fitBounds 抢镜头 —— 路线异步加载完成触发的重画会把
+      // 视野猛拉回全局,和播放跟车互相打架("晃得厉害"的主因)
+      if (!playingRef.current) map.fitBounds(boundsRef.current.pad(0.15));
     }
   }, [days, selDays, roadMode, roadsTick]);
 
@@ -379,6 +402,13 @@ export default function JourneyMapView() {
                   className="h-7 rounded-full bg-white/[0.06] px-2.5 text-[11px] tabular-nums text-slate-300 transition-colors hover:bg-white/10"
                   title="播放倍速" onClick={() => setSpeed((s) => (s === 1 ? 2 : s === 2 ? 4 : 1))}>
                   {speed}×
+                </button>
+                <button
+                  className={cn("h-7 rounded-full px-2.5 text-[11px] transition-colors",
+                    autoZoom ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
+                  title="播放时随移动速度平滑推拉镜头:停留点推近、长途拉远"
+                  onClick={() => setAutoZoom((v) => !v)}>
+                  🔍 自动缩放
                 </button>
               </>
             )}
