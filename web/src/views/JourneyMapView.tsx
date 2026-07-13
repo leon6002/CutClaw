@@ -22,6 +22,8 @@ export default function JourneyMapView() {
   const [selDays, setSelDays] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<ImItem | null>(null);
   const [darkMap, setDarkMap] = useState(false);   // 默认原色(压暗被用户否决)
+  const [baseLayer, setBaseLayer] = useState<"vector" | "sat">("vector");
+  const tilesRef = useRef<L.TileLayer[]>([]);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [playPhoto, setPlayPhoto] = useState<ImItem | null>(null);
@@ -173,9 +175,6 @@ export default function JourneyMapView() {
       preferCanvas: true,
     });
     L.control.zoom({ position: "bottomright" }).addTo(map);
-    L.tileLayer("https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}", {
-      subdomains: ["1", "2", "3", "4"], maxZoom: 18, className: "amap-dark",
-    }).addTo(map);
     mapRef.current = map;
     layerRef.current = L.layerGroup().addTo(map);
     // tab 用 display:none 保活,初始化时容器是 0 尺寸 → 变可见时必须
@@ -187,6 +186,21 @@ export default function JourneyMapView() {
     ro.observe(boxRef.current);
     return () => { ro.disconnect(); map.remove(); mapRef.current = null; layerRef.current = null; };
   }, []);
+
+  // 底图图层:标准矢量 / 卫星影像(+透明路网标注)。均为高德公开瓦片,
+  // 不走 API key、零配额;浏览器 HTTP 缓存生效。坐标系同为 GCJ-02。
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    tilesRef.current.forEach((t) => t.remove());
+    const mk = (url: string, cls: string) =>
+      L.tileLayer(url, { subdomains: ["1", "2", "3", "4"], maxZoom: 18, className: cls });
+    tilesRef.current = baseLayer === "sat"
+      ? [mk("https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}", "amap-sat"),
+         mk("https://webst0{s}.is.autonavi.com/appmaptile?style=8&x={x}&y={y}&z={z}", "amap-anno")]
+      : [mk("https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}", "amap-dark")];
+    tilesRef.current.forEach((t) => t.addTo(map));
+  }, [baseLayer]);
 
   // 选择变化 → 重画轨迹与照片钉
   useEffect(() => {
@@ -287,13 +301,23 @@ export default function JourneyMapView() {
             )}
           </>
         )}
-        <button
-          className={cn("ml-auto h-7 rounded-full px-2.5 text-[11px] transition-colors",
-            darkMap ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
-          title="暗色氛围模式(默认原色地图)"
-          onClick={() => setDarkMap((v) => !v)}>
-          {darkMap ? "🌙 暗色" : "☀️ 原色"}
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            className={cn("h-7 rounded-full px-2.5 text-[11px] transition-colors",
+              baseLayer === "sat" ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300")}
+            title="卫星影像 + 路网标注(高德公开瓦片,零配额)"
+            onClick={() => setBaseLayer((v) => (v === "sat" ? "vector" : "sat"))}>
+            {baseLayer === "sat" ? "🛰 卫星" : "🗺 标准"}
+          </button>
+          <button
+            className={cn("h-7 rounded-full px-2.5 text-[11px] transition-colors",
+              darkMap ? "bg-white/[0.1] text-slate-200" : "bg-white/[0.04] text-slate-500 hover:text-slate-300",
+              baseLayer === "sat" && "pointer-events-none opacity-30")}
+            title="暗色氛围模式(仅标准图层)"
+            onClick={() => setDarkMap((v) => !v)}>
+            {darkMap ? "🌙 暗色" : "☀️ 原色"}
+          </button>
+        </div>
       </div>
 
       {/* 地图 */}
