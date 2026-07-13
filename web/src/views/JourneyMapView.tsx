@@ -186,7 +186,8 @@ export default function JourneyMapView() {
     });
     // 屏幕恒速模型(用户洞察:固定物理车速 × 不断变大的缩放 = 屏幕上巨快
     // 且忽快忽慢 → 晕):像素速度锁定,物理速度随当前缩放自动换挡。
-    const PX_PER_SEC = 120;
+    // 120 仍被反馈太快 → 55(悠闲巡航;嫌慢用 2×/4× 倍速)。
+    const PX_PER_SEC = 55;
     const STOP_ZOOM = 13.5;
 
     // 绿色尾迹:淡辉光宽线 + 亮主线,走过的地方被点亮
