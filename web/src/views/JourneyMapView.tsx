@@ -28,6 +28,10 @@ export default function JourneyMapView() {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [autoZoom, setAutoZoom] = useState(true);   // 播放时随速度丝滑缩放
+  const [zoomGap, setZoomGap] = useState(() =>      // 两次变焦最小间隔(秒),可配置
+    Number(localStorage.getItem("jm-zoomgap")) || 8);
+  const zoomGapRef = useRef(8);
+  zoomGapRef.current = zoomGap;
   const [playPhotos, setPlayPhotos] = useState<ImItem[]>([]);   // 放映位:1 张大图或四宫格
   const speedRef = useRef(1);
   speedRef.current = speed;
@@ -273,7 +277,8 @@ export default function JourneyMapView() {
         if (dz >= 0.4) {
           const durS = Math.min(2.6, 0.8 + 0.35 * dz);   // 跨度越大飞得越久,一次到位
           map.flyTo(ll, ztWanted, { duration: durS, easeLinearity: 0.3 });
-          zoomHoldUntil = now + durS * 1000 + 400;
+          // 变焦冷却:飞行时长与用户配置的最小间隔取大者(默认 ≥8s)
+          zoomHoldUntil = now + Math.max(durS * 1000 + 400, zoomGapRef.current * 1000);
         }
       }
       if (now > zoomHoldUntil && now - lastPan > 280) {
@@ -469,6 +474,19 @@ export default function JourneyMapView() {
                   onClick={() => setAutoZoom((v) => !v)}>
                   🔍 自动缩放
                 </button>
+                {autoZoom && (
+                  <select
+                    className="h-7 rounded-full border-0 bg-white/[0.06] px-2 text-[11px] text-slate-300 focus:outline-none"
+                    title="两次变焦之间的最小间隔(防晕)"
+                    value={zoomGap}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setZoomGap(v);
+                      localStorage.setItem("jm-zoomgap", String(v));
+                    }}>
+                    {[4, 8, 15, 30].map((v) => <option key={v} value={v}>间隔 ≥{v}s</option>)}
+                  </select>
+                )}
               </>
             )}
           </>
