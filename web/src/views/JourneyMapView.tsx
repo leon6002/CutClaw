@@ -76,6 +76,8 @@ export default function JourneyMapView() {
   const camRef = useRef(cam);
   camRef.current = cam;
   const [showCam, setShowCam] = useState(false);
+  const [activeCam, setActiveCam] = useState("");   // 播放中正在生效的参数键(逗号分隔)
+  const activeCamRef = useRef("");
   const setCamField = (k: keyof CamCfg, v: number) => {
     setCam((c) => {
       const n = { ...c, [k]: v };
@@ -305,7 +307,10 @@ export default function JourneyMapView() {
         trail.setLatLngs(tl);
         trailGlow.setLatLngs(tl);
         const cnt = s.i1 - s.i0 + 1;     // 照片多的重头景点推近半档
-        ztWanted = cnt >= 12 ? camRef.current.stopRich : camRef.current.stop;
+        const gearKey = cnt >= 12 ? "stopRich" : "stop";
+        ztWanted = camRef.current[gearKey];
+        const act = "photoSec," + gearKey;
+        if (act !== activeCamRef.current) { activeCamRef.current = act; setActiveCam(act); }
         if (segT >= stopDur) advance = true;
       } else {
         // 屏幕恒速推进:本帧物理位移 = 像素速度 ÷ 当前缩放比例。
@@ -334,12 +339,16 @@ export default function JourneyMapView() {
         const remainKm = Math.max(0, (totalD - dist) * 111);
         const approaching = remainKm < Math.max(6, pl.km * 0.15);
         const c = camRef.current;
+        let gearKey: keyof CamCfg;
         if (pl.flight) {
-          ztWanted = approaching ? c.flightApproach : c.flightCruise;
+          gearKey = approaching ? "flightApproach" : "flightCruise";
         } else {
-          const cruise = pl.km > 60 ? c.cruiseLong : pl.km > 15 ? c.cruiseMid : c.cruiseShort;
-          ztWanted = approaching ? c.approach : cruise;
+          gearKey = approaching ? "approach"
+            : pl.km > 60 ? "cruiseLong" : pl.km > 15 ? "cruiseMid" : "cruiseShort";
         }
+        ztWanted = c[gearKey];
+        const act = "px," + gearKey;
+        if (act !== activeCamRef.current) { activeCamRef.current = act; setActiveCam(act); }
       }
       head.getElement()?.querySelector(".jm-head-wrap")?.classList.toggle("is-leg", s.kind === "leg");
       head.setLatLng(ll);
@@ -374,7 +383,8 @@ export default function JourneyMapView() {
     };
     const timer = window.setInterval(step, 33);
     return () => { window.clearInterval(timer); trail.remove(); trailGlow.remove();
-                   head.remove(); setPlayPhotos([]); };
+                   head.remove(); setPlayPhotos([]);
+                   activeCamRef.current = ""; setActiveCam(""); };
   }, [playing, playSeq, segs, roadMode]);
   // 首次载入相簿:优先恢复上次选过的日期,否则默认最后一天
   useEffect(() => {
@@ -630,22 +640,32 @@ export default function JourneyMapView() {
                 <div key={g.title}>
                   <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{g.title}</div>
                   <div className="space-y-3">
-                    {g.fields.map(([k, label, unit, stp, mn, mx]) => (
-                      <div key={k}>
-                        <div className="mb-1 flex items-baseline justify-between">
-                          <span className="text-[11.5px] text-slate-300">{label}</span>
-                          <span className="tabular-nums text-[12.5px] font-medium text-cyan-200">
-                            {cam[k]}<span className="ml-0.5 text-[9.5px] font-normal text-slate-500">{unit}</span>
-                          </span>
+                    {g.fields.map(([k, label, unit, stp, mn, mx]) => {
+                      const live = playing && activeCam.split(",").includes(k);
+                      return (
+                        <div key={k}
+                          className={cn("-mx-2 rounded-lg px-2 py-1 transition-colors",
+                            live && "bg-emerald-500/[0.1] ring-1 ring-emerald-400/40")}>
+                          <div className="mb-1 flex items-baseline justify-between">
+                            <span className={cn("text-[11.5px]", live ? "text-emerald-200" : "text-slate-300")}>
+                              {live && <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400 align-middle" />}
+                              {label}
+                              {live && <span className="ml-1.5 text-[9px] text-emerald-400/90">正在生效</span>}
+                            </span>
+                            <span className={cn("tabular-nums text-[12.5px] font-medium",
+                              live ? "text-emerald-200" : "text-cyan-200")}>
+                              {cam[k]}<span className="ml-0.5 text-[9.5px] font-normal text-slate-500">{unit}</span>
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="w-6 shrink-0 text-right text-[9px] tabular-nums text-slate-600">{mn}</span>
+                            <Slider value={[cam[k]]} min={mn} max={mx} step={stp}
+                              onValueChange={([v]) => setCamField(k, v)} />
+                            <span className="w-6 shrink-0 text-[9px] tabular-nums text-slate-600">{mx}</span>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="w-6 shrink-0 text-right text-[9px] tabular-nums text-slate-600">{mn}</span>
-                          <Slider value={[cam[k]]} min={mn} max={mx} step={stp}
-                            onValueChange={([v]) => setCamField(k, v)} />
-                          <span className="w-6 shrink-0 text-[9px] tabular-nums text-slate-600">{mx}</span>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               ))}
